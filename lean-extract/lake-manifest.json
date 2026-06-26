@@ -1,0 +1,13 @@
+{"version": "1.2.0",
+ "packagesDir": ".lake/packages",
+ "packages":
+ [{"type": "path",
+   "scope": "",
+   "name": "workers",
+   "manifestFile": "lake-manifest.json",
+   "inherited": false,
+   "dir": "../workers",
+   "configFile": "lakefile.lean"}],
+ "name": "LeanExtract",
+ "lakeDir": ".lake",
+ "fixedToolchain": false}
