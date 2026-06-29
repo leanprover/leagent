@@ -39,9 +39,10 @@ def resolvePluginArgs : IO (Array String) := do
       let self ← IO.appPath
       let binDir := self.parent.getD "."
       pure (binDir / ".." / ".." / ".." / ".." / "workers" / ".lake" / "build" / "lib" / "lean")
-  let common  := dir / "workers_WorkerPlugins_Common.so"
-  let reverse := dir / "workers_WorkerPlugins_ReverseElab.so"
-  let plugin  := dir / "workers_WorkerPlugins_CorpusManifest.so"
+  let ext := if System.Platform.isOSX then "dylib" else "so"
+  let common  := dir / s!"workers_WorkerPlugins_Common.{ext}"
+  let reverse := dir / s!"workers_WorkerPlugins_ReverseElab.{ext}"
+  let plugin  := dir / s!"workers_WorkerPlugins_CorpusManifest.{ext}"
   for p in #[common, reverse, plugin] do
     unless (← p.pathExists) do
       throw <| .userError s!"plugin .so not found: {p}\n\
