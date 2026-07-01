@@ -87,6 +87,8 @@ def entryToRecord (e : CorpusManifestEntry) (relFile : String) (tagConfig : TagC
     value       := e.value?
     proofScript := e.proofScript
     proofMethod := e.proofMethod
+    proofTrace  := e.proofTrace
+    proofStructTree := e.proofStructTree
     doc         := e.doc?
     deps        := e.deps.toList
     premises    := e.premises.toList
@@ -100,11 +102,11 @@ wait by `timeoutMs`. The worker is assumed already elaborated (`waitForDiagnosti
 done). Pure plumbing shared by the baseline and reverse-elab passes. -/
 private def requestManifest (w : Worker) (uri : DocumentUri) (reqId : String)
     (includeInternal includePrivate reverseElab : Bool) (timeoutMs : Nat)
-    (closers : Bool := false) (reverseDeadlineMs : Nat := 0)
+    (closers : Bool := false) (traceReverseElab : Bool := false) (reverseDeadlineMs : Nat := 0)
     : IO (Except String (Array CorpusManifestEntry)) := do
   let slot ← w.sendRequest reqId "$/lean/corpusManifest"
     ({ textDocument := { uri }, includeInternal, includePrivate, reverseElab, closers,
-       reverseDeadlineMs }
+       traceReverseElab, reverseDeadlineMs }
       : CorpusManifestParams)
   let resp : Except String JsonRpc.Message ←
     try
@@ -158,6 +160,7 @@ process boundary — it is the recommended route when scripts matter most. -/
 def extractFileEntries (pool : WorkerPool) (df : Discover.DiscoveredFile)
     (includeInternal includePrivate reverseElab : Bool) (timeoutMs : Nat := 300000)
     (manifestTimeoutMs : Nat := 60000) (closers : Bool := false)
+    (traceReverseElab : Bool := false)
     : IO (Except String (Array CorpusManifestEntry)) := do
   let text ← IO.FS.readFile df.absPath
   let uri : DocumentUri := s!"file://{df.absPath}"
@@ -181,7 +184,8 @@ def extractFileEntries (pool : WorkerPool) (df : Discover.DiscoveredFile)
     let reverseDeadlineMs := manifestTimeoutMs * 4 / 5
     match (← requestManifest w uri "corpus/rev"
         includeInternal includePrivate (reverseElab := true) manifestTimeoutMs
-        (closers := closers) (reverseDeadlineMs := reverseDeadlineMs)) with
+        (closers := closers) (traceReverseElab := traceReverseElab)
+        (reverseDeadlineMs := reverseDeadlineMs)) with
     | .ok entries => return .ok entries
     | .error e =>
       pool.close uri  -- worker is wedged on a pathological proof; drop it
@@ -189,6 +193,14 @@ def extractFileEntries (pool : WorkerPool) (df : Discover.DiscoveredFile)
       | .ok base =>
         IO.eprintln s!"corpus-extract: reverse-elab timed out for {df.relPath} \
           ({e}); kept {base.size} records without proof scripts"
+        -- When tracing, annotate theorem entries so the trace shows why they lack scripts.
+        if traceReverseElab then
+          let timeoutTrace : Array WorkerPlugins.ReverseElab.TraceEntry :=
+            #[{ rung := "file_timeout", result := "reverse-elab pass timed out for file" }]
+          let annotated := base.map fun entry =>
+            if entry.kind == "theorem" then { entry with proofTrace := some timeoutTrace }
+            else entry
+          return .ok annotated
         return .ok base
       | .error _ => return .error s!"manifest for {df.relPath}: {e}"
 
@@ -205,7 +217,7 @@ Per-file errors are logged to stderr and skipped (one bad file never aborts the
 run). Records keep the `file` field from discovery and `tags` from `tagConfig`. -/
 def extractViaWorkers (projectRoot : System.FilePath) (files : Array Discover.DiscoveredFile)
     (tagConfig : TagConfig) (includeInternal includePrivate reverseElab : Bool)
-    (reverseClosers : Bool := false)
+    (reverseClosers : Bool := false) (traceReverseElab : Bool := false)
     : IO (Array ConstRecord × WorkerRunStats) := do
   let forwardArgs ← resolvePluginArgs
   -- `setsidWorkers := false`: this is a batch tool, so its workers should die with it. Without
@@ -219,7 +231,7 @@ def extractViaWorkers (projectRoot : System.FilePath) (files : Array Discover.Di
   try
     for df in files do
       match (← extractFileEntries pool df includeInternal includePrivate reverseElab
-              (closers := reverseClosers)) with
+              (closers := reverseClosers) (traceReverseElab := traceReverseElab)) with
       | .ok entries =>
         if entries.isEmpty then
           stats := { stats with filesEmpty := stats.filesEmpty + 1 }

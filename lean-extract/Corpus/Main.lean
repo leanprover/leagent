@@ -64,6 +64,7 @@ structure CliArgs where
   includePrivate     : Bool := true
   reverseElab        : Bool := false
   reverseClosers     : Bool := false
+  traceReverseElab   : Bool := false
   splitByTag         : Option String := none
   seed               : Nat := 0
   datasetCardConfig  : Option System.FilePath := none
@@ -77,6 +78,7 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
                      [--reverse-elab] [--closers]
+                     [--trace-reverse-elab]
                      [--split-by-tag <key>] [--seed <n>]
                      [--dataset-card-config <path>]
                      [--help]
@@ -119,6 +121,8 @@ where
         go xs { acc with reverseElab := true }
     | "--closers" :: xs, acc =>
         go xs { acc with reverseElab := true, reverseClosers := true }
+    | "--trace-reverse-elab" :: xs, acc =>
+        go xs { acc with reverseElab := true, traceReverseElab := true }
     | "--split-by-tag" :: v :: xs, acc =>
         if v.startsWith "--" then .error "--split-by-tag expects a tag key"
         else go xs { acc with splitByTag := some v }
@@ -412,7 +416,7 @@ unsafe def runCli (args : List String) : IO UInt32 := do
           IO.println s!"corpus-extract: discovered {files.size} source file(s); driving workers…"
           let (recs, wstats) ← Corpus.extractViaWorkers projectRoot files tagConfig
                                  cli.includeInternal cli.includePrivate cli.reverseElab
-                                 cli.reverseClosers
+                                 cli.reverseClosers cli.traceReverseElab
           IO.println s!"corpus-extract: {wstats.filesOk} ok, {wstats.filesEmpty} empty, \
             {wstats.filesError} error (of {wstats.filesTotal})"
           pure recs

@@ -69,6 +69,9 @@ structure CorpusManifestParams where
   fold returns a complete response instead of being killed mid-flight (which
   discards ALL of the file's proof scripts). Has a default so older callers decode. -/
   reverseDeadlineMs : Nat := 0
+  /-- Collect per-theorem trace info showing which reverse-elab rungs were tried
+  and why they failed. Emitted in `proofTrace`. Mirrors `--trace-reverse-elab`. -/
+  traceReverseElab : Bool := false
   deriving FromJson, ToJson
 
 instance : FileSource CorpusManifestParams where
@@ -131,6 +134,14 @@ structure CorpusManifestEntry where
   exceeded `reverseNodeCeiling`, so reverse-elaboration was not attempted — it
   would risk pinning the worker for no expected gain). `none` for non-theorems. -/
   proofMethod : Option String
+  /-- Trace log from reverse-elaboration: each entry records which rung was
+  tried and whether it passed/failed. Populated only with `--trace-reverse-elab`. -/
+  proofTrace  : Option (Array WorkerPlugins.ReverseElab.TraceEntry) := none
+  /-- Structural decomposition tree, shared across the (delaborator-variant)
+  `structural` attempts in `proofTrace` (see `ReverseElab.ScriptResult.structTree`).
+  Populated only with `--trace-reverse-elab`, and only when a structural candidate
+  was built. -/
+  proofStructTree : Option (Array WorkerPlugins.ReverseElab.StructNode) := none
   /-- `true` iff the constant's name is `private`. The client cannot compute
   this (no `Environment`), and it drives the `private def`/`private theorem`
   kind labels in the corpus schema. -/
@@ -194,17 +205,25 @@ pins the worker. The skip is the bound that matters; see `reverseNodeCeiling`
 for why a size pre-filter beats a time/heartbeat budget here. The aggregate
 heartbeat budget inside `reverseProof` still bounds work for the in-range case. -/
 def reverseProofGuarded (ty v : Expr) (enableClosers : Bool)
-    (extraClosers : Array String := #[])
+    (extraClosers : Array String := #[]) (enableTrace : Bool := false)
     : CoreM ReverseElab.ScriptResult := do
-  if ReverseElab.distinctNodes v > reverseNodeCeiling then
-    return { script := "", method := "skipped_large" }
+  let nodes := ReverseElab.distinctNodes v
+  if nodes > reverseNodeCeiling then
+    let traceLog := if enableTrace then
+        #[{ rung := "pre_filter", result := s!"skipped: {nodes} nodes > ceiling {reverseNodeCeiling}" : WorkerPlugins.ReverseElab.TraceEntry }]
+      else #[]
+    return { script := "", method := "skipped_large", trace := traceLog }
   -- `tryCatchRuntimeEx` swallows a heartbeat/recursion blowup on an in-range
   -- proof to a null script (rather than aborting the whole request); genuine
   -- interrupts (worker shutdown) still propagate.
   withTheReader Core.Context (fun c => { c with maxHeartbeats := 0 }) <|
     tryCatchRuntimeEx
-      (Lean.Meta.MetaM.run' (ReverseElab.reverseProof ty v enableClosers extraClosers))
-      (fun _ => pure { script := "", method := "error" })
+      (Lean.Meta.MetaM.run' (ReverseElab.reverseProof ty v enableClosers extraClosers enableTrace))
+      (fun _ => do
+        let traceLog := if enableTrace then
+            #[{ rung := "runtime", result := "error (heartbeat/recursion blowup)" : WorkerPlugins.ReverseElab.TraceEntry }]
+          else #[]
+        pure { script := "", method := "error", trace := traceLog })
 
 /-- Sorted, deduped fully-qualified names (excluding `self`). -/
 private def fmtNames (self : Name) (ns : Array Name) : Array String :=
@@ -502,7 +521,7 @@ private def buildSimpArgMap (src : String) (snaps : Array Snapshots.Snapshot)
 
 private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
-    (reverseElab closers : Bool) (info : ConstantInfo)
+    (reverseElab closers traceReverseElab : Bool) (info : ConstantInfo)
     (attemptReverse : Bool := true) : CoreM Lsp.CorpusManifestEntry := do
   let env ← getEnv
   let typeStr ← ppExpr120 info.type
@@ -557,7 +576,7 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
   -- the file's records. When `closers`, we also pass the `simp [..]` calls
   -- harvested verbatim from THIS proof's source as argument-bearing closer
   -- candidates (keyed, like sig/body, by the decl's selection position).
-  let (proofScript, proofMethod) ← match info with
+  let (proofScript, proofMethod, proofTrace, proofStructTree) ← match info with
     | .thmInfo _ =>
         if reverseElab then
           -- Once the fold's wall-clock deadline has passed, `attemptReverse` is
@@ -565,7 +584,7 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
           -- running the expensive reverse-elab, so the theorem's record still
           -- survives (only its proof script is forgone).
           if !attemptReverse then
-            pure (none, some "deadline_skipped")
+            pure (none, some "deadline_skipped", none, none)
           else match info.value? (allowOpaque := true) with
           | some v =>
               let extraClosers := if closers then
@@ -573,11 +592,13 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
                   | some r => simpArgMap.getD (r.selectionRange.pos.line, r.selectionRange.pos.column) #[]
                   | none   => #[]
                 else #[]
-              let r ← reverseProofGuarded info.type v closers extraClosers
-              pure (if r.script.isEmpty then none else some r.script, some r.method)
-          | none => pure (none, none)
-        else pure (none, none)
-    | _ => pure (none, none)
+              let r ← reverseProofGuarded info.type v closers extraClosers traceReverseElab
+              let trace? := if traceReverseElab && !r.trace.isEmpty then some r.trace else none
+              let tree? := if traceReverseElab then r.structTree else none
+              pure (if r.script.isEmpty then none else some r.script, some r.method, trace?, tree?)
+          | none => pure (none, none, none, none)
+        else pure (none, none, none, none)
+    | _ => pure (none, none, none, none)
   return {
     name := info.name.toString
     kind := Common.kindToString info
@@ -593,6 +614,8 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
     premises
     proofScript
     proofMethod
+    proofTrace
+    proofStructTree
     isPrivate
     isProtected
     isStructure
@@ -630,7 +653,8 @@ theorems get a script depends on the schedule. `deadlineMs = 0` disables all of
 this (process in name order, always attempt — the historical behavior). -/
 private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
-    (includeInternal includePrivate reverseElab closers : Bool) (deadlineMs : Nat := 0)
+    (includeInternal includePrivate reverseElab closers traceReverseElab : Bool)
+    (deadlineMs : Nat := 0)
     : CoreM (Array Lsp.CorpusManifestEntry) := do
   let env ← getEnv
   -- Collect the eligible constants first so we can order them before building.
@@ -650,7 +674,7 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
   for (_, info) in scheduled do
     -- Past the budget, keep emitting records but stop attempting reverse-elab.
     let attemptReverse := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
-    out := out.push (← buildEntry srcMap simpArgMap reverseElab closers info attemptReverse)
+    out := out.push (← buildEntry srcMap simpArgMap reverseElab closers traceReverseElab info attemptReverse)
   return out.qsort (fun a b => a.name < b.name)
 
 open RequestM in
@@ -663,7 +687,8 @@ def handleCorpusManifest (p : Lsp.CorpusManifestParams)
       -- syntax); otherwise it is unused.
       let simpArgMap ← if p.closers then buildSimpArgMap src snaps else pure {}
       let entries ← foldCorpusEntries srcMap simpArgMap
-        p.includeInternal p.includePrivate p.reverseElab p.closers p.reverseDeadlineMs
+        p.includeInternal p.includePrivate p.reverseElab p.closers p.traceReverseElab
+        p.reverseDeadlineMs
       return { entries })
     (empty := { entries := #[] })
 
