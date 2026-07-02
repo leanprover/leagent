@@ -29,4 +29,4 @@ that WOULD double-fire their `initialize` blocks. -/
 lean_lib WorkerPlugins where
   roots := #[`WorkerPlugins.Common, `WorkerPlugins.ReverseElab,
              `WorkerPlugins.DeclManifest, `WorkerPlugins.CorpusManifest,
-             `WorkerPlugins.GrindManifest]
+             `WorkerPlugins.GrindManifest, `WorkerPlugins.GrindInProof]

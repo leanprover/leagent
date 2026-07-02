@@ -235,8 +235,10 @@ against the DEFAULT strategy: build a fresh goal from the theorem type, enter
 `GrindM` on it, run the finish strategy under a trace config, read the result. -/
 
 /-- Config for data-collection grind runs: trace on (log the seq), no sorry
-(stuck stays stuck), mark instances (recover used origins), quiet. -/
-private def mkGrindConfig : Grind.Config :=
+(stuck stays stuck), mark instances (recover used origins), quiet. Public so the
+sibling in-proof plugin (`WorkerPlugins.GrindInProof`) builds params against the
+same instrumented flags. -/
+def mkGrindConfig : Grind.Config :=
   { trace := true, useSorry := false, markInstances := true, verbose := false }
 
 /-- `grind`'s default finish strategy, but WITHOUT the leading
@@ -253,20 +255,30 @@ private def mkFinishNoCheck (maxIterations : Nat := Action.maxIterationsDefault)
   let step : Action := solvers <|> Action.instantiate <|> Action.splitNext <|> Action.mbtc
   return Action.intros 0 >> Action.assertAll >> step.loop maxIterations
 
-/-- Run grind on one theorem `type`. Returns the entry payload sans the
-name/module/range fields (filled by the caller). On any grind exception, returns
-an `error` outcome rather than propagating (one bad theorem never aborts the
-fold). -/
-private def runGrindOn (type : Expr) : MetaM Lsp.GrindManifestEntry := do
-  let goalTypeStr := ((← (Meta.ppExpr type)).pretty 100).trimAsciiEnd.copy
+/-- The goal- and param-agnostic core of a data-collection grind run. Given a
+pretty-printed `goalTypeStr`, a goal mvar `goalMVar`, and fully-built `params`
+(whose `config` carries the instrumentation flags — see `mkGrindConfig`), drive
+grind's default finish strategy on the goal and extract the entry payload (sans
+the name/module/range fields, filled by the caller). On any grind exception,
+returns an `error` outcome rather than propagating (one bad goal never aborts the
+fold).
+
+This works for BOTH the whole-statement mode (a fresh `mkFreshExprSyntheticOpaqueMVar`
+goal + default-extension params) AND the in-proof mode (a captured mid-proof mvar
+living in a restored `mctx`, its lctx carrying the real hypotheses, + author-hint
+params). `withProtectedMCtx` reads the passed mvar's type/lctx (via `withContext`)
+and re-solves through its own fresh mvar, assigning the assembled proof back to
+`goalMVar` — so the used-origin walk over `mkMVar goalMVar` works either way. The
+CALLER is responsible for restoring the mctx and building params before calling
+this. -/
+def runGrindCore (goalTypeStr : String) (goalMVar : MVarId)
+    (params : Grind.Params) : MetaM Lsp.GrindManifestEntry := do
   let base : Lsp.GrindManifestEntry := {
     name := "", module := "", goalType := goalTypeStr, outcome := "error",
     interactive := none, grindOnly := none, hasSorry := false,
     activated := #[], used := #[], coverageGap := 0, startLine := none,
     isPrivate := false }
-  let config := mkGrindConfig
-  let ext ← getDefaultExtensionState
-  let params ← mkParams config #[ext]
+  let config := params.config
   -- `withProtectedMCtx` runs grind on a fresh goal mvar and, ON SUCCESS, assigns
   -- the assembled proof to it — which lets us walk that term for used-origins.
   -- BUT when grind does NOT close the goal (a genuine `.stuck`), the mvar stays
@@ -279,7 +291,7 @@ private def runGrindOn (type : Expr) : MetaM Lsp.GrindManifestEntry := do
   -- should be `stuck` — from tooling errors was the whole point). -/
   let out ← IO.mkRef (none : Option Lsp.GrindManifestEntry)
   try
-    withProtectedMCtx config (← mkFreshGoal type) fun mvarId => do
+    withProtectedMCtx config goalMVar fun mvarId => do
       GrindM.runAtGoal mvarId params fun goal => do
         let a ← mkFinishNoCheck
         match (← a.run goal) with
@@ -302,6 +314,10 @@ private def runGrindOn (type : Expr) : MetaM Lsp.GrindManifestEntry := do
           let activated := result.counters.thm.toList.toArray.map
             (fun (o, c) => s!"{originLabel o}:{c}")
           let instMap := (← getThe Grind.State).instanceMap
+          -- Walk the INNER mvar grind assigned during `k` (the lambda param),
+          -- NOT `goalMVar`: `withProtectedMCtx` only assigns the outer `goalMVar`
+          -- AFTER this continuation returns, so at this point it is still
+          -- unassigned. `mvarId` here is grind's fresh working mvar, now solved.
           let proof ← instantiateMVars (mkMVar mvarId)
           let usedOrigins := collectUsedOrigins proof instMap
           let mut used : Array String := #[]
@@ -322,15 +338,21 @@ private def runGrindOn (type : Expr) : MetaM Lsp.GrindManifestEntry := do
     return (← out.get).getD base
   catch _ =>
     -- Either our `.stuck` sentinel (ref already holds the stuck record) or a
-    -- genuine grind exception (ref unset → `error`). One theorem throwing never
+    -- genuine grind exception (ref unset → `error`). One goal throwing never
     -- aborts the fold.
     match (← out.get) with
     | some e => return e
     | none   => return { base with outcome := "error" }
-where
-  /-- A fresh synthetic-opaque goal mvar whose target is `type`. -/
-  mkFreshGoal (type : Expr) : MetaM MVarId := do
-    return (← mkFreshExprSyntheticOpaqueMVar type).mvarId!
+
+/-- Run grind on one theorem `type` (whole-statement mode). Builds a fresh goal
+from the type and default-extension params, then delegates to `runGrindCore`. -/
+private def runGrindOn (type : Expr) : MetaM Lsp.GrindManifestEntry := do
+  let goalTypeStr := ((← (Meta.ppExpr type)).pretty 100).trimAsciiEnd.copy
+  let config := mkGrindConfig
+  let ext ← getDefaultExtensionState
+  let params ← mkParams config #[ext]
+  let goalMVar := (← mkFreshExprSyntheticOpaqueMVar type).mvarId!
+  runGrindCore goalTypeStr goalMVar params
 
 /-! ## The file-level fold -/
 

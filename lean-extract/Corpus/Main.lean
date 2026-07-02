@@ -6,6 +6,7 @@ import Corpus.Extract
 import Corpus.Discover
 import Corpus.WorkerExtract
 import Corpus.GrindExtract
+import Corpus.GrindInProofExtract
 
 /-!
 CLI entry for `corpus-extract`.
@@ -75,6 +76,12 @@ structure CliArgs where
   worker path only. When set, this REPLACES the corpus extraction (the tool runs
   grind collection instead of writing definitions/theorems). -/
   grindManifest      : Bool := false
+  /-- Emit the in-proof grind dataset (`data/grind-in-proof/train.jsonl`):
+  capture grind data at grind CALL SITES inside existing proofs (one record per
+  VC), rather than re-proving whole statements. Uses the worker path only. When
+  set, this REPLACES the corpus extraction. Mutually exclusive with
+  `--grind-manifest`. -/
+  grindInProof       : Bool := false
   deriving Inhabited
 
 private def usage : String := "\
@@ -83,7 +90,7 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
                      [--reverse-elab] [--closers]
-                     [--grind-manifest]
+                     [--grind-manifest] [--grind-in-proof]
                      [--split-by-tag <key>] [--seed <n>]
                      [--dataset-card-config <path>]
                      [--help]
@@ -101,6 +108,13 @@ disk that are not in the import closure of the --modules roots, then exits.
 writes data/grind/train.jsonl (the interactive script, the `grind only`
 reconstruction, and the activated/used lemma triple per theorem), plus the
 env-wide available-hint set into metadata.json. This REPLACES corpus extraction.
+
+--grind-in-proof instead captures grind data at the grind CALL SITES inside
+existing proofs: it walks each proof, re-runs instrumented grind on every
+subgoal a source `grind` was applied to (using the author's hints), and writes
+one record per call site to data/grind-in-proof/train.jsonl. Use this for
+tactic-heavy corpora where grind only discharges subgoals mid-proof (e.g.
+mvcgen). REPLACES corpus extraction; mutually exclusive with --grind-manifest.
 "
 
 private def parseNat? (s : String) : Option Nat :=
@@ -149,6 +163,8 @@ where
         go xs { acc with listOrphans := true }
     | "--grind-manifest" :: xs, acc =>
         go xs { acc with grindManifest := true }
+    | "--grind-in-proof" :: xs, acc =>
+        go xs { acc with grindInProof := true }
     | x :: _, _ => .error s!"unknown argument: {x}"
 
 /-- Render the extractor's own `metadata.json` payload. -/
@@ -262,6 +278,15 @@ private def writeJsonl (path : System.FilePath)
 /-- Write grind goal records as JSONL to `path`, one per line. -/
 private def writeGrindJsonl (path : System.FilePath)
     (records : Array GrindGoalRecord) : IO Unit := do
+  IO.FS.writeFile path ""
+  let h ← IO.FS.Handle.mk path IO.FS.Mode.write
+  for r in records do
+    h.putStrLn (Lean.toJson r).compress
+  h.flush
+
+/-- Write in-proof grind records as JSONL to `path`, one per line. -/
+private def writeGrindInProofJsonl (path : System.FilePath)
+    (records : Array GrindInProofRecord) : IO Unit := do
   IO.FS.writeFile path ""
   let h ← IO.FS.Handle.mk path IO.FS.Mode.write
   for r in records do
@@ -415,6 +440,13 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       IO.eprintln "corpus-extract: --output is required"
       IO.eprintln usage
       return 1
+    -- The two grind modes are distinct extractions with distinct plugins/outputs;
+    -- since each is an early-return guard, setting both would silently run only
+    -- one. Reject the combination explicitly.
+    if cli.grindManifest && cli.grindInProof then
+      IO.eprintln "corpus-extract: --grind-manifest and --grind-in-proof are mutually exclusive"
+      IO.eprintln usage
+      return 1
     -- `--grind-manifest`: re-prove every theorem with grind and write the grind
     -- dataset. This REPLACES corpus extraction (its own worker plugin + output).
     if cli.grindManifest then
@@ -444,6 +476,38 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       ]
       IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
       IO.println s!"corpus-extract: wrote {recs.size} grind records to {grindDir}/train.jsonl \
+        ({available.size} available hints)"
+      return 0
+    -- `--grind-in-proof`: capture grind data at grind call sites inside existing
+    -- proofs (one record per VC). REPLACES corpus extraction (its own plugin +
+    -- output dir), parallel to the grind-manifest branch above.
+    if cli.grindInProof then
+      let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
+      let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
+      IO.println s!"corpus-extract: discovered {files.size} source file(s); running in-proof grind…"
+      let (recs, available, gstats) ←
+        Corpus.extractGrindInProofViaWorkers projectRoot files cli.includePrivate
+      IO.println s!"corpus-extract: {gstats.filesOk} ok, {gstats.filesEmpty} empty, \
+        {gstats.filesError} error (of {gstats.filesTotal}); \
+        call sites: {gstats.closed} closed, {gstats.stuck} stuck, \
+        {gstats.errored} error, {gstats.skipped} skipped"
+      let grindDir : System.FilePath := outDir / "data" / "grind-in-proof"
+      IO.FS.createDirAll grindDir
+      writeGrindInProofJsonl (grindDir / "train.jsonl") recs
+      -- metadata.json: run summary + the env-wide available-hint set.
+      let metaJson := Json.mkObj [
+        ("toolVersion",    Json.str toolVersion),
+        ("mode",           Json.str "grind-in-proof"),
+        ("totalRecords",   Json.num (Lean.JsonNumber.fromNat recs.size)),
+        ("callsClosed",    Json.num (Lean.JsonNumber.fromNat gstats.closed)),
+        ("callsStuck",     Json.num (Lean.JsonNumber.fromNat gstats.stuck)),
+        ("callsError",     Json.num (Lean.JsonNumber.fromNat gstats.errored)),
+        ("callsSkipped",   Json.num (Lean.JsonNumber.fromNat gstats.skipped)),
+        ("rootModules",    Json.arr (cli.modules.map (fun n => Json.str n.toString))),
+        ("availableHints", Json.arr (available.map Json.str))
+      ]
+      IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
+      IO.println s!"corpus-extract: wrote {recs.size} in-proof grind records to {grindDir}/train.jsonl \
         ({available.size} available hints)"
       return 0
     -- Ensure output + data subdirs exist.

@@ -231,4 +231,79 @@ instance : ToJson GrindGoalRecord := ⟨toJson⟩
 
 end GrindGoalRecord
 
+/-! ## In-proof grind records (AlphaGrind data, observation mode)
+
+A `GrindInProofRecord` is one grind CALL SITE inside an existing proof — a
+verification condition on which the source author invoked `grind` (e.g.
+`all_goals mleave <;> grind`, `grind [lemmas]`). Unlike `GrindGoalRecord` (which
+re-proves whole statements), this captures grind where it actually runs: the
+restored subgoal, the author's hint set, and — from re-running instrumented grind
+with those hints — the same triple + interactive/`grind only` artifacts. One
+theorem yields MANY of these rows (one per grind call site). Emitted to
+`data/grind-in-proof/*.jsonl`, a config separate from the whole-statement grind
+data so both schemas stay stable. -/
+
+structure GrindInProofRecord where
+  /-- Fully-qualified enclosing theorem/def name (one theorem → many VC rows). -/
+  enclosingTheorem : String
+  /-- The module that elaborated the enclosing declaration. -/
+  module      : String
+  /-- Source path relative to `--source-root`, from discovery. -/
+  file        : Option String
+  /-- 1-based source line of the `grind` call. -/
+  startLine   : Option Nat
+  /-- 0-based source column of the `grind` call. -/
+  startCol    : Option Nat
+  /-- Pretty-printed restored VC grind was re-run on. -/
+  goalType    : String
+  /-- The author's hint clause rendered as written, e.g. `"[List.nodup_cons]"`;
+  `null` if the source `grind` had no `[..]` clause. -/
+  authorHints : Option String
+  /-- `true` iff the source call was `grind only …`. -/
+  authorOnly  : Bool
+  /-- `closed` / `stuck` / `error` / `deadline_skipped`. -/
+  outcome     : String
+  /-- Interactive `grind => <seq>` script (primary label); null unless closed. -/
+  interactive : Option String
+  /-- `grind only [...]` reconstruction (secondary label); null unless closed. -/
+  grindOnly   : Option String
+  /-- `true` iff grind's generated seq contained `sorry` (artifacts suppressed). -/
+  hasSorry    : Bool
+  /-- Origins grind ACTIVATED, `"<name>:<count>"` (local origins prefixed). -/
+  activated   : List String
+  /-- Global-lemma names that appear in the final proof term (the winning line). -/
+  used        : List String
+  /-- Count of used origins that were NOT global decls (non-portable reliance). -/
+  coverageGap : Nat
+  /-- `true` iff the enclosing declaration is `private`. -/
+  isPrivate   : Bool
+  deriving Inhabited
+
+namespace GrindInProofRecord
+
+/-- Manual JSON encoder, snake_case keys (mirrors `GrindGoalRecord.toJson`). -/
+def toJson (r : GrindInProofRecord) : Json :=
+  Json.mkObj [
+    ("enclosing_theorem", Json.str r.enclosingTheorem),
+    ("module",            Json.str r.module),
+    ("file",              Lean.toJson r.file),
+    ("start_line",        Lean.toJson r.startLine),
+    ("start_col",         Lean.toJson r.startCol),
+    ("goal_type",         Json.str r.goalType),
+    ("author_hints",      Lean.toJson r.authorHints),
+    ("author_only",       Json.bool r.authorOnly),
+    ("outcome",           Json.str r.outcome),
+    ("interactive",       Lean.toJson r.interactive),
+    ("grind_only",        Lean.toJson r.grindOnly),
+    ("has_sorry",         Json.bool r.hasSorry),
+    ("activated",         Lean.toJson r.activated),
+    ("used",              Lean.toJson r.used),
+    ("coverage_gap",      Json.num (Lean.JsonNumber.fromNat r.coverageGap)),
+    ("is_private",        Json.bool r.isPrivate)
+  ]
+
+instance : ToJson GrindInProofRecord := ⟨toJson⟩
+
+end GrindInProofRecord
+
 end Corpus
