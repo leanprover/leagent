@@ -60,6 +60,15 @@ structure CorpusManifestParams where
   first that verifies. Pushes more proofs into the restricted, argument-bounded
   tactic vocabulary. Mirrors the extractor's `--closers`. Requires `reverseElab`. -/
   closers         : Bool := false
+  /-- Wall-clock budget (ms) for the WHOLE reverse-elab fold, measured INSIDE the
+  worker. `0` = unbounded (the historical behavior). When >0, the plugin processes
+  theorems CHEAP-FIRST (ascending proof-term node count) and, once this many ms
+  have elapsed, stops *attempting* reverse-elab for the remaining (expensive)
+  theorems — emitting their records with `proofMethod := "deadline_skipped"` rather
+  than losing them. The client sets this below its own request timeout so the whole
+  fold returns a complete response instead of being killed mid-flight (which
+  discards ALL of the file's proof scripts). Has a default so older callers decode. -/
+  reverseDeadlineMs : Nat := 0
   deriving FromJson, ToJson
 
 instance : FileSource CorpusManifestParams where
@@ -493,7 +502,8 @@ private def buildSimpArgMap (src : String) (snaps : Array Snapshots.Snapshot)
 
 private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
-    (reverseElab closers : Bool) (info : ConstantInfo) : CoreM Lsp.CorpusManifestEntry := do
+    (reverseElab closers : Bool) (info : ConstantInfo)
+    (attemptReverse : Bool := true) : CoreM Lsp.CorpusManifestEntry := do
   let env ← getEnv
   let typeStr ← ppExpr120 info.type
   let value? ← match info.value? (allowOpaque := true) with
@@ -550,7 +560,13 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
   let (proofScript, proofMethod) ← match info with
     | .thmInfo _ =>
         if reverseElab then
-          match info.value? (allowOpaque := true) with
+          -- Once the fold's wall-clock deadline has passed, `attemptReverse` is
+          -- false: emit the record with a `deadline_skipped` marker instead of
+          -- running the expensive reverse-elab, so the theorem's record still
+          -- survives (only its proof script is forgone).
+          if !attemptReverse then
+            pure (none, some "deadline_skipped")
+          else match info.value? (allowOpaque := true) with
           | some v =>
               let extraClosers := if closers then
                   match ranges? with
@@ -586,21 +602,55 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
     endCol
   }
 
+/-- Reverse-elab cost proxy for scheduling: a theorem's proof-term node count
+(`distinctNodes`, the same measure `reverseProofGuarded` pre-filters on), else 0.
+Non-theorems never reverse-elaborate, so they cost nothing and sort first. -/
+private def reverseCost (info : ConstantInfo) : Nat :=
+  match info with
+  | .thmInfo _ =>
+      match info.value? (allowOpaque := true) with
+      | some v => ReverseElab.distinctNodes v
+      | none   => 0
+  | _ => 0
+
 /-- Fold `buildEntry` over the module-local user constants that also pass the
 corpus-eligibility filter (`corpusEligible`), so the manifest matches the
 import-based extractor's record set. Unlike `Common.foldUserConstants`, this
 applies the extra parity filter and threads the params' `includeInternal` /
-`includePrivate` knobs. -/
+`includePrivate` knobs.
+
+When `reverseElab` and `deadlineMs > 0`, entries are processed CHEAP-FIRST (by
+`reverseCost`) under a wall-clock budget: once `deadlineMs` ms have elapsed, the
+remaining (most expensive) theorems are built WITHOUT attempting reverse-elab
+(`proofMethod := "deadline_skipped"`). This turns a per-file timeout — which
+would otherwise kill the whole request and lose EVERY script for the file — into
+the loss of only the expensive tail, while the many cheap proofs land their
+scripts. The output is re-sorted by name, so ordering is unchanged; only WHICH
+theorems get a script depends on the schedule. `deadlineMs = 0` disables all of
+this (process in name order, always attempt — the historical behavior). -/
 private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
-    (includeInternal includePrivate reverseElab closers : Bool)
+    (includeInternal includePrivate reverseElab closers : Bool) (deadlineMs : Nat := 0)
     : CoreM (Array Lsp.CorpusManifestEntry) := do
   let env ← getEnv
-  let mut out : Array Lsp.CorpusManifestEntry := #[]
+  -- Collect the eligible constants first so we can order them before building.
+  let mut eligible : Array (Name × ConstantInfo) := #[]
   for (name, info) in env.constants.toList do
     if Common.isUserConstant env name then
       if (← corpusEligible env includeInternal includePrivate name info) then
-        out := out.push (← buildEntry srcMap simpArgMap reverseElab closers info)
+        eligible := eligible.push (name, info)
+  -- Cheap-first scheduling only matters when we actually reverse-elaborate under a
+  -- deadline; otherwise keep the original (name) order to minimize behavior change.
+  let scheduled :=
+    if reverseElab && deadlineMs > 0 then
+      eligible.qsort (fun a b => reverseCost a.2 < reverseCost b.2)
+    else eligible
+  let startMs ← IO.monoMsNow
+  let mut out : Array Lsp.CorpusManifestEntry := #[]
+  for (_, info) in scheduled do
+    -- Past the budget, keep emitting records but stop attempting reverse-elab.
+    let attemptReverse := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
+    out := out.push (← buildEntry srcMap simpArgMap reverseElab closers info attemptReverse)
   return out.qsort (fun a b => a.name < b.name)
 
 open RequestM in
@@ -613,7 +663,7 @@ def handleCorpusManifest (p : Lsp.CorpusManifestParams)
       -- syntax); otherwise it is unused.
       let simpArgMap ← if p.closers then buildSimpArgMap src snaps else pure {}
       let entries ← foldCorpusEntries srcMap simpArgMap
-        p.includeInternal p.includePrivate p.reverseElab p.closers
+        p.includeInternal p.includePrivate p.reverseElab p.closers p.reverseDeadlineMs
       return { entries })
     (empty := { entries := #[] })
 
