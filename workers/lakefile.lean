@@ -28,4 +28,5 @@ roots; do NOT add an umbrella module that imports several plugins at once, as
 that WOULD double-fire their `initialize` blocks. -/
 lean_lib WorkerPlugins where
   roots := #[`WorkerPlugins.Common, `WorkerPlugins.ReverseElab,
-             `WorkerPlugins.DeclManifest, `WorkerPlugins.CorpusManifest]
+             `WorkerPlugins.DeclManifest, `WorkerPlugins.CorpusManifest,
+             `WorkerPlugins.GrindManifest]

@@ -164,4 +164,71 @@ instance : FromJson ConstRecord := ⟨fromJson?⟩
 
 end ConstRecord
 
+/-! ## Grind manifest records (AlphaGrind data)
+
+A `GrindGoalRecord` is one theorem re-proved by `grind`'s default strategy,
+capturing what grind did: the interactive `grind => <seq>` script and the
+`grind only [...]` reconstruction (both replayable artifacts), plus the
+AlphaGo-style triple — the E-matching lemmas grind's search *activated* (with
+counts) and those actually *used* in the final proof term. The env-level
+"available" hint set (every `@[grind]` theorem in scope) is written once to
+`metadata.json`, not per record. Emitted to `data/grind/*.jsonl`, a config
+separate from `theorems`/`definitions` so the corpus schema is unperturbed. -/
+
+structure GrindGoalRecord where
+  /-- Fully-qualified theorem name (joins to the `theorems` config by `name`). -/
+  name        : String
+  /-- The module that elaborated the theorem. -/
+  module      : String
+  /-- Source path relative to `--source-root`, from discovery. -/
+  file        : Option String
+  /-- 1-based start line of the theorem's source range. -/
+  startLine   : Option Nat
+  /-- Pretty-printed goal grind was run on. -/
+  goalType    : String
+  /-- `closed` / `stuck` / `error` / `deadline_skipped`. -/
+  outcome     : String
+  /-- Interactive `grind => <seq>` script (primary label); null unless closed. -/
+  interactive : Option String
+  /-- `grind only [...]` reconstruction (secondary label); null unless closed. -/
+  grindOnly   : Option String
+  /-- `true` iff grind's generated seq contained `sorry` (artifacts suppressed). -/
+  hasSorry    : Bool
+  /-- Theorems grind ACTIVATED, `"<name>:<count>"` (local origins prefixed). -/
+  activated   : List String
+  /-- Global-lemma names that appear in the final proof term (the winning line). -/
+  used        : List String
+  /-- Count of used origins that were NOT global decls (non-portable reliance). -/
+  coverageGap : Nat
+  /-- `true` iff the theorem is `private`. -/
+  isPrivate   : Bool
+  /-- `true` iff the theorem's SOURCE proof already used `grind` (mined seed). -/
+  sourceUsesGrind : Bool
+  deriving Inhabited
+
+namespace GrindGoalRecord
+
+/-- Manual JSON encoder, snake_case keys (mirrors `ConstRecord.toJson`). -/
+def toJson (r : GrindGoalRecord) : Json :=
+  Json.mkObj [
+    ("name",              Json.str r.name),
+    ("module",            Json.str r.module),
+    ("file",              Lean.toJson r.file),
+    ("start_line",        Lean.toJson r.startLine),
+    ("goal_type",         Json.str r.goalType),
+    ("outcome",           Json.str r.outcome),
+    ("interactive",       Lean.toJson r.interactive),
+    ("grind_only",        Lean.toJson r.grindOnly),
+    ("has_sorry",         Json.bool r.hasSorry),
+    ("activated",         Lean.toJson r.activated),
+    ("used",              Lean.toJson r.used),
+    ("coverage_gap",      Json.num (Lean.JsonNumber.fromNat r.coverageGap)),
+    ("is_private",        Json.bool r.isPrivate),
+    ("source_uses_grind", Json.bool r.sourceUsesGrind)
+  ]
+
+instance : ToJson GrindGoalRecord := ⟨toJson⟩
+
+end GrindGoalRecord
+
 end Corpus

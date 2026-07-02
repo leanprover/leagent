@@ -5,6 +5,7 @@ import Corpus.Card
 import Corpus.Extract
 import Corpus.Discover
 import Corpus.WorkerExtract
+import Corpus.GrindExtract
 
 /-!
 CLI entry for `corpus-extract`.
@@ -69,6 +70,11 @@ structure CliArgs where
   datasetCardConfig  : Option System.FilePath := none
   enumerate          : EnumerateMode := .glob
   listOrphans        : Bool := false
+  /-- Emit the AlphaGrind grind manifest (`data/grind/train.jsonl`): re-prove
+  every theorem with `grind`'s default strategy and record what it did. Uses the
+  worker path only. When set, this REPLACES the corpus extraction (the tool runs
+  grind collection instead of writing definitions/theorems). -/
+  grindManifest      : Bool := false
   deriving Inhabited
 
 private def usage : String := "\
@@ -77,6 +83,7 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
                      [--reverse-elab] [--closers]
+                     [--grind-manifest]
                      [--split-by-tag <key>] [--seed <n>]
                      [--dataset-card-config <path>]
                      [--help]
@@ -89,6 +96,11 @@ from that directory so LEAN_PATH resolves to the project's built .oleans.
 on disk under the --modules roots (orphan-safe). --enumerate import uses the
 legacy importModules + Environment walk. --list-orphans prints the modules on
 disk that are not in the import closure of the --modules roots, then exits.
+
+--grind-manifest re-proves every theorem with `grind`'s default strategy and
+writes data/grind/train.jsonl (the interactive script, the `grind only`
+reconstruction, and the activated/used lemma triple per theorem), plus the
+env-wide available-hint set into metadata.json. This REPLACES corpus extraction.
 "
 
 private def parseNat? (s : String) : Option Nat :=
@@ -135,6 +147,8 @@ where
         | _        => .error s!"--enumerate expects glob|import, got: {v}"
     | "--list-orphans" :: xs, acc =>
         go xs { acc with listOrphans := true }
+    | "--grind-manifest" :: xs, acc =>
+        go xs { acc with grindManifest := true }
     | x :: _, _ => .error s!"unknown argument: {x}"
 
 /-- Render the extractor's own `metadata.json` payload. -/
@@ -240,6 +254,15 @@ private def stratifiedSplit (rs : Array ConstRecord) (key : String)
 private def writeJsonl (path : System.FilePath)
     (records : Array ConstRecord) : IO Unit := do
   IO.FS.writeFile path ""  -- truncate or create
+  let h ← IO.FS.Handle.mk path IO.FS.Mode.write
+  for r in records do
+    h.putStrLn (Lean.toJson r).compress
+  h.flush
+
+/-- Write grind goal records as JSONL to `path`, one per line. -/
+private def writeGrindJsonl (path : System.FilePath)
+    (records : Array GrindGoalRecord) : IO Unit := do
+  IO.FS.writeFile path ""
   let h ← IO.FS.Handle.mk path IO.FS.Mode.write
   for r in records do
     h.putStrLn (Lean.toJson r).compress
@@ -392,6 +415,37 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       IO.eprintln "corpus-extract: --output is required"
       IO.eprintln usage
       return 1
+    -- `--grind-manifest`: re-prove every theorem with grind and write the grind
+    -- dataset. This REPLACES corpus extraction (its own worker plugin + output).
+    if cli.grindManifest then
+      let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
+      let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
+      IO.println s!"corpus-extract: discovered {files.size} source file(s); running grind…"
+      let (recs, available, gstats) ←
+        Corpus.extractGrindViaWorkers projectRoot files cli.includePrivate
+      IO.println s!"corpus-extract: {gstats.filesOk} ok, {gstats.filesEmpty} empty, \
+        {gstats.filesError} error (of {gstats.filesTotal}); \
+        theorems: {gstats.closed} closed, {gstats.stuck} stuck, \
+        {gstats.errored} error, {gstats.skipped} skipped"
+      let grindDir : System.FilePath := outDir / "data" / "grind"
+      IO.FS.createDirAll grindDir
+      writeGrindJsonl (grindDir / "train.jsonl") recs
+      -- metadata.json: run summary + the env-wide available-hint set.
+      let metaJson := Json.mkObj [
+        ("toolVersion",     Json.str toolVersion),
+        ("mode",            Json.str "grind-manifest"),
+        ("totalRecords",    Json.num (Lean.JsonNumber.fromNat recs.size)),
+        ("theoremsClosed",  Json.num (Lean.JsonNumber.fromNat gstats.closed)),
+        ("theoremsStuck",   Json.num (Lean.JsonNumber.fromNat gstats.stuck)),
+        ("theoremsError",   Json.num (Lean.JsonNumber.fromNat gstats.errored)),
+        ("theoremsSkipped", Json.num (Lean.JsonNumber.fromNat gstats.skipped)),
+        ("rootModules",     Json.arr (cli.modules.map (fun n => Json.str n.toString))),
+        ("availableHints",  Json.arr (available.map Json.str))
+      ]
+      IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
+      IO.println s!"corpus-extract: wrote {recs.size} grind records to {grindDir}/train.jsonl \
+        ({available.size} available hints)"
+      return 0
     -- Ensure output + data subdirs exist.
     IO.FS.createDirAll outDir
     let dataDir     : System.FilePath := outDir / "data"
