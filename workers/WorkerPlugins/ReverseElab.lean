@@ -46,6 +46,66 @@ namespace WorkerPlugins.ReverseElab
 
 open Lean Lean.Meta Lean.Elab Lean.PrettyPrinter
 
+/-- A node in the STRUCTURAL decomposition tree of a `structural` candidate. Mirrors
+one recursion point of `buildStructured`/`buildTail`: the branching tactic emitted
+(`cases`/`induction`/`by_cases`/`have`/`refine`) with its child subtrees, or an
+`exact`/closer `leaf`. `shape` is the recognized head (`casesOn`/`rec`/`dite`/`have`/
+`ctor`/`leaf`/`intro`, plus `alt`/`branch` wrappers for per-constructor / per-hole
+sub-sequences); `depth` is the nesting level (0 at the candidate root).
+
+IMPORTANT: this tree records WHAT decomposition was produced and WHERE, not a
+per-node verdict — the builder assembles the whole script in one pass and only the
+assembled result is verified, so no node here is independently "passed"/"failed". -/
+structure StructNode where
+  tactic   : String
+  shape    : String
+  depth    : Nat
+  children : Array StructNode := #[]
+  deriving Inhabited
+
+partial def StructNode.toJson : StructNode → Lean.Json
+  | { tactic, shape, depth, children } =>
+    Lean.Json.mkObj [
+      ("tactic",   Lean.Json.str tactic),
+      ("shape",    Lean.Json.str shape),
+      ("depth",    Lean.Json.num (Lean.JsonNumber.fromNat depth)),
+      ("children", Lean.Json.arr (children.map StructNode.toJson)) ]
+
+instance : Lean.ToJson StructNode := ⟨StructNode.toJson⟩
+
+partial def StructNode.fromJson? (j : Lean.Json) : Except String StructNode := do
+  let tactic ← (← j.getObjVal? "tactic").getStr?
+  let shape  ← (← j.getObjVal? "shape").getStr?
+  let depth  ← (Lean.fromJson? (← j.getObjVal? "depth") : Except String Nat)
+  let children ← match j.getObjVal? "children" with
+    | .ok (.arr arr) => arr.mapM StructNode.fromJson?
+    | _              => .ok #[]
+  return { tactic, shape, depth, children }
+
+instance : Lean.FromJson StructNode := ⟨StructNode.fromJson?⟩
+
+/-- One entry in the reverse-elaboration trace log: which rung was tried, what
+happened (passed/failed tryElab, passed/failed verifyRendered), and the parameters
+that attempt ran with. `script` is the rendered candidate tactic text actually tried
+(so a `tryElab_fail` shows the exact `by intro …; exact …` that failed to reproduce
+the proof); `heartbeats` is the work this one attempt consumed; `budget` is the
+heartbeat cap it ran under; `isCloser` records whether it was budgeted as a closer
+(tight cap) vs. a normal candidate. All but `rung`/`result` are `none`/`0` for
+non-attempt entries (`pre_filter`, `file_timeout`, `runtime`).
+
+The structural decomposition TREE is NOT here: it depends only on the proof term
+`v` (not on which delaborator rendered the leaves), so it is identical across all
+`structural` attempts and is stored ONCE on `ScriptResult.structTree` instead of
+being duplicated per entry. -/
+structure TraceEntry where
+  rung       : String
+  result     : String
+  script     : Option String := none
+  heartbeats : Nat := 0
+  budget     : Nat := 0
+  isCloser   : Bool := false
+  deriving Inhabited, Lean.FromJson, Lean.ToJson
+
 /-- Outcome of reverse-elaborating one proof term. `method` records which rung
 of the ladder won, so a consumer can judge decomposition quality honestly:
   * `structural`                      — `cases`/`have`/`by_cases` decomposition,
@@ -63,6 +123,13 @@ not count an opaque blob as a genuine decomposition. -/
 structure ScriptResult where
   script : String
   method : String
+  trace  : Array TraceEntry := #[]
+  /-- The structural decomposition tree (`--trace-reverse-elab` only), computed
+  once from the proof term when a `structural` candidate was built. `none` when
+  no structural candidate applied (non-structural proofs) or tracing is off. It
+  is shared across the (delaborator-variant) structural attempts in `trace`
+  rather than duplicated per entry — see `TraceEntry`. -/
+  structTree : Option (Array StructNode) := none
   deriving Inhabited
 
 /-- Delaborate with explicit args / universes / full names / proofs forced on,
@@ -627,6 +694,102 @@ def topIsStructural (v : Expr) : MetaM Bool :=
           return true
     return false
 
+/-! ### Structural decomposition TREE (trace-only)
+
+A read-only mirror of `buildStructured`/`buildTail` that emits a `StructNode` tree
+instead of tactic syntax. It re-runs the SAME recognizers (`recognizeCasesOn`,
+`recognizeRec`, `letFun?`, `dite`, ctor-with-proof-field), so the tree's SHAPE
+exactly matches the emitted `structural` script's branch points — the recognizer
+that fires at each node is a property of the proof `Expr`, independent of which
+delaborator rendered the leaves. Built only under `--trace-reverse-elab`, only for
+the `structural` rung, and bounded by `structMaxDepth`. The `tactic` summaries are
+keyword-level (`cases X` / `induction X` / `by_cases` / `have h` / `refine C⟨…⟩` /
+`exact head`); it does NOT delaborate, so it costs no verification budget. -/
+
+/-- Cheap head-symbol string for a term, for `tactic` summaries (no delaboration). -/
+private def headStr (e : Expr) : String :=
+  match e.consumeMData.getAppFn with
+  | .const n _ => toString n
+  | .fvar _    => "‹local›"
+  | _          => "…"
+
+/-- Detect a constructor application with ≥1 proof-typed field (the `refine ⟨…⟩`
+shape), returning the ctor short name and its proof-field subterms. Mirrors the
+detection in `recognizeCtor`/`topIsStructural` without building syntax. -/
+private def ctorProofFields? (e : Expr) : MetaM (Option (String × Array Expr)) := do
+  let e := e.consumeMData
+  let .const cname _ := e.getAppFn | return none
+  let some (.ctorInfo cval) := (← getEnv).find? cname | return none
+  let args := e.getAppArgs
+  if args.size != cval.numParams + cval.numFields then return none
+  if cval.numFields == 0 then return none
+  let fields := args[cval.numParams : args.size].toArray
+  let mut proofs : Array Expr := #[]
+  for f in fields do
+    if (← Meta.isProof f) then proofs := proofs.push f
+  if proofs.isEmpty then return none
+  return some (cname.getString!, proofs)
+
+mutual
+/-- Peel the `intro` spine, then decompose the body into a `StructNode` array
+(one node per emitted tactic at this level). Mirrors `buildStructured`. -/
+partial def structTree (level : Nat) (e : Expr) : MetaM (Array StructNode) :=
+  peelLambdas e #[] fun names body => do
+    let intro : Array StructNode :=
+      if names.isEmpty then #[]
+      else #[{ tactic := s!"intro ({names.size})", shape := "intro", depth := level }]
+    return intro ++ (← structTail level (peelIdAll body))
+
+/-- Decompose an already-`id`-peeled body into `StructNode`s. Mirrors `buildTail`'s
+head dispatch, recursing with `level + 1` at each branch point; bottoms out at a
+`leaf` when `level ≥ structMaxDepth` or no recognizer matches. -/
+partial def structTail (level : Nat) (e : Expr) : MetaM (Array StructNode) := do
+  if level ≥ structMaxDepth then
+    return #[{ tactic := s!"exact {headStr e}", shape := "leaf", depth := level }]
+  match letFun? e with
+  | some (n, ty, val, body) =>
+      let valKids ← structTree (level + 1) val
+      let rest ← withLocalDeclD (← freshBinder n) ty fun x =>
+        structTail level (peelIdAll (body.instantiate1 x))
+      return #[{ tactic := s!"have {n}", shape := "have", depth := level, children := valKids }] ++ rest
+  | none =>
+    match e.consumeMData with
+    | .letE n ty val body _ =>
+        let valKids ← structTree (level + 1) val
+        let rest ← withLocalDeclD (← freshBinder n) ty fun x =>
+          structTail level (peelIdAll (body.instantiate1 x))
+        return #[{ tactic := s!"have {n}", shape := "let", depth := level, children := valKids }] ++ rest
+    | b =>
+      if b.isAppOf ``dite && b.getAppNumArgs == 5 then
+        let args := b.getAppArgs
+        let posKids ← peelLambdasN args[3]! 1 #[] fun _ t => structTree (level + 1) (peelIdAll t)
+        let negKids ← peelLambdasN args[4]! 1 #[] fun _ t => structTree (level + 1) (peelIdAll t)
+        return #[{ tactic := "by_cases", shape := "dite", depth := level,
+                   children := #[{ tactic := "pos", shape := "branch", depth := level + 1, children := posKids },
+                                 { tactic := "neg", shape := "branch", depth := level + 1, children := negKids }] }]
+      else if let some (major, branches) ← recognizeCasesOn b then
+        let alts ← branches.mapM fun (ctor, nfields, minor) =>
+          peelLambdasN minor nfields #[] fun _ bbody => do
+            let kids ← structTree (level + 1) bbody
+            pure ({ tactic := s!"| {ctor}", shape := "alt", depth := level + 1, children := kids } : StructNode)
+        return #[{ tactic := s!"cases {headStr major}", shape := "casesOn", depth := level, children := alts }]
+      else if let some (major, branches) ← recognizeRec b then
+        let alts ← branches.mapM fun (ctor, nbind, minor) =>
+          peelLambdasN minor nbind #[] fun _ bbody => do
+            let kids ← structTree (level + 1) bbody
+            pure ({ tactic := s!"| {ctor}", shape := "alt", depth := level + 1, children := kids } : StructNode)
+        return #[{ tactic := s!"induction {headStr major}", shape := "rec", depth := level, children := alts }]
+      else
+        match ← ctorProofFields? b with
+        | some (cname, proofFields) =>
+            let kids ← proofFields.mapM fun pf => do
+              let c ← structTree (level + 1) (peelIdAll pf)
+              pure ({ tactic := "?_", shape := "hole", depth := level + 1, children := c } : StructNode)
+            return #[{ tactic := s!"refine {cname}⟨…⟩", shape := "ctor", depth := level, children := kids }]
+        | none =>
+            return #[{ tactic := s!"exact {headStr b}", shape := "leaf", depth := level }]
+end
+
 /-- Build candidate tactic sequences (pure syntax) in priority order: most
 decomposed / most readable first, whole-term `exact` last. Delaboration happens
 here, inside the peeled local context, so body fvars are in scope. Verification
@@ -765,7 +928,8 @@ that passes the first but fails the second (e.g. a script using inaccessible
 hygienic names that don't round-trip through the printer) is correctly
 rejected, so we never emit a string that isn't a real proof. -/
 def reverseProof (ty v : Expr) (enableClosers : Bool := false)
-    (extraClosers : Array String := #[]) : MetaM ScriptResult := do
+    (extraClosers : Array String := #[]) (enableTrace : Bool := false)
+    : MetaM ScriptResult := do
   -- Closer candidates (`intro_simp`, `simp`, …) are bulk guesses, so verify
   -- them under the tight `closerHeartbeats` budget — a closer that needs the
   -- full budget to fire is not the intended fast proof, and letting every
@@ -782,11 +946,22 @@ def reverseProof (ty v : Expr) (enableClosers : Bool := false)
   -- aggregate ceiling is what makes a hard proof fail in bounded time.
   let hbStart ← IO.getNumHeartbeats
   let candidates ← buildCandidates v enableClosers extraClosers hbStart
+  let mut traceLog : Array TraceEntry := #[]
+  -- The structural decomposition tree depends only on `v` (not on the delaborator
+  -- that renders leaves), so it is identical across every `structural` candidate.
+  -- We build it AT MOST ONCE — on the first structural candidate encountered — and
+  -- return it on `ScriptResult.structTree`, rather than duplicating it per attempt.
+  -- `boundedConstruct` (fresh heartbeat baseline + per-step cap + runtime-exception
+  -- guard) keeps tracing from turning a bounded proof into a worker hang.
+  let mut structTree? : Option (Array StructNode) := none
   for (seq, label) in candidates do
     -- Stop as soon as the per-theorem budget is spent: remaining candidates are
     -- lower-priority fallbacks, and a `fail` proof has nothing left worth trying.
     let remaining ← budgetRemaining hbStart
-    if remaining ≤ 1 then break
+    if remaining ≤ 1 then
+      if enableTrace then
+        traceLog := traceLog.push { rung := label, result := "budget_exhausted" }
+      break
     let isCloser :=
       closerNames.contains label ||
       (label.startsWith "intro_" && closerNames.contains (label.drop 6).toString)
@@ -794,10 +969,28 @@ def reverseProof (ty v : Expr) (enableClosers : Bool := false)
     -- still available to this theorem.
     let stepCap := if isCloser then closerHeartbeats else verifyHeartbeats
     let budget := Nat.min stepCap remaining
+    -- Under tracing, render the candidate up front so a FAILED attempt can also
+    -- report the exact script it tried (not just the winner), and stamp the
+    -- heartbeats this one attempt burned. `hbAttempt` brackets tryElab+verify.
+    let attemptScript? ← if enableTrace then (some <$> renderBy seq) else pure none
+    if enableTrace && label == "structural" && structTree?.isNone then
+      structTree? ← boundedConstruct (structTree 0 v) (← budgetRemaining hbStart)
+    let hbAttempt ← IO.getNumHeartbeats
+    let mkEntry (result : String) : MetaM TraceEntry := do
+      return { rung := label, result, script := attemptScript?,
+               heartbeats := (← IO.getNumHeartbeats) - hbAttempt, budget, isCloser }
     if (← tryElab ty v seq.raw budget) then
-      let script ← renderBy seq
+      let script := attemptScript?.getD (← renderBy seq)
       if (← verifyRendered ty v script (Nat.min stepCap (← budgetRemaining hbStart))) then
-        return { script, method := label }
-  return { script := "", method := "fail" }
+        if enableTrace then
+          traceLog := traceLog.push (← mkEntry "success")
+        return { script, method := label, trace := traceLog, structTree := structTree? }
+      else
+        if enableTrace then
+          traceLog := traceLog.push (← mkEntry "tryElab_pass_verifyRendered_fail")
+    else
+      if enableTrace then
+        traceLog := traceLog.push (← mkEntry "tryElab_fail")
+  return { script := "", method := "fail", trace := traceLog, structTree := structTree? }
 
 end WorkerPlugins.ReverseElab

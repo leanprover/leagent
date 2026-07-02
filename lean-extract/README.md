@@ -84,6 +84,7 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 | `--config <path>` | no | Tags-config JSON (see [Tags](#tags-config)). Default: no tags. |
 | `--reverse-elab` | no | Reverse-elaborate each theorem's proof term into a verified tactic `proof_script`. **Off by default** — it re-elaborates every proof (slower). |
 | `--closers` | no | With `--reverse-elab`, also try goal-closing tactics (`simp`/`omega`/…) to recover high-level proofs for automation-heavy bodies. ~20× slower; off by default. |
+| `--trace-reverse-elab` | no | Emit a per-theorem `proof_trace` field recording which reverse-elaboration rungs were tried and why each failed/succeeded (diagnostic for `null` `proof_script`s). Implies `--reverse-elab`. |
 | `--include-internal` | no | Emit compiler-internal names (`_aux.*`, `match_*`, constructors, recursors). Default: false. |
 | `--no-private` | no | Skip `private` declarations. Default: include them. |
 | `--split-by-tag <key>` | no | Stratified 80/10/10 train/valid/test split of theorems keyed on a tag value. Definitions are always one split. |
@@ -141,6 +142,9 @@ is used for both configs; fields not applicable to a record are `null`/`[]`.
 | `value` | string\|null | Pretty-printed term value for defs/theorems. |
 | `proof_script` | string\|null | Verified reverse-elaborated tactic script (`--reverse-elab` only; theorems). See the [proof-simplification doc](../workers/docs/proof-simplification.md). |
 | `proof_method` | string\|null | Which reverse-elaboration rung produced the script (`structural`/`rfl`/`exact`/`*_opaque`/…). |
+| `proof_trace` | object[]\|absent | Per-theorem reverse-elab diagnostic (`--trace-reverse-elab` only): a list of per-attempt entries `{rung, result, script, heartbeats, budget, is_closer}` — `result` is e.g. `pre_filter`/`file_timeout`/`tryElab_fail`/`success`; `script` is the exact candidate tactic text tried (even on failure), `heartbeats`/`budget` the work spent vs. its cap. Non-attempt entries (`pre_filter`/`file_timeout`) leave `script` null and counters 0. Field is omitted entirely without the flag. |
+| `proof_trace_summary` | object\|absent | Companion to `proof_trace` (same flag): `{last_status, attempts}` where `last_status` is a stable category (`success`/`verify_failed`/`skipped_large`/`file_timeout`/`runtime_error`) and `attempts` counts ladder rungs actually tried. Lets you bucket outcomes without walking the array. |
+| `proof_struct_tree` | object[]\|absent | The structural decomposition tree (`--trace-reverse-elab` only), present when a `structural` candidate was built. A single nested `{tactic, shape, depth, children[]}` forest mirroring the `cases`/`induction`/`by_cases`/`have`/`refine` branch points — this is where the *choices* are made. Stored ONCE per theorem (not per attempt): it depends only on the proof term, so it is identical across the delaborator-variant structural attempts in `proof_trace`. Records *what was produced and where*, not a per-node verdict (only the assembled script is verified). |
 | `doc` | string\|null | Docstring, if any. |
 | `deps` | string[] | Direct dependencies (constants in `type ∪ value`), sorted, self excluded. |
 | `premises` | string[] | Transitive cone of **owned** constants reachable through the value. Sorted. Non-empty for theorems/defs. |

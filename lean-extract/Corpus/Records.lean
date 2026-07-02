@@ -1,4 +1,5 @@
 import Lean
+import WorkerPlugins.ReverseElab
 
 /-!
 The on-wire record schema emitted by the corpus extractor.
@@ -41,6 +42,8 @@ structure ConstRecord where
   `exact`), or `fail` (nothing verified). Null when reverse elaboration was not
   run. -/
   proofMethod : Option String
+  proofTrace  : Option (Array WorkerPlugins.ReverseElab.TraceEntry) := none
+  proofStructTree : Option (Array WorkerPlugins.ReverseElab.StructNode) := none
   doc         : Option String
   deps        : List String
   premises    : List String
@@ -51,6 +54,30 @@ structure ConstRecord where
   deriving Inhabited
 
 namespace ConstRecord
+
+/-- Summarize a `proof_trace` into `{last_status, attempts}`: a STABLE categorical
+label for the terminal state of reverse-elaboration and how many ladder rungs were
+actually tried. `last_status` is one of `success`, `verify_failed` (all rungs tried,
+none verified), `skipped_large` (pre-filtered), `file_timeout`, `runtime_error`, or
+`none` — deliberately free of embedded numbers (node counts) so consumers can bucket
+by it directly; the detail stays in `proof_trace`. A `pre_filter`/`file_timeout`/
+`runtime` entry counts as 0 real attempts (no rung ran); every other entry is one. -/
+private def summarizeTrace (entries : Array WorkerPlugins.ReverseElab.TraceEntry) : Json :=
+  let lastStatus := match entries.back? with
+    | none   => "none"
+    | some e =>
+      if e.result == "success" then "success"
+      else if e.rung == "pre_filter" then "skipped_large"
+      else if e.rung == "file_timeout" then "file_timeout"
+      else if e.rung == "runtime" then "runtime_error"
+      else "verify_failed"
+  let attempts := entries.foldl (init := 0) fun n e =>
+    if e.rung == "pre_filter" || e.rung == "file_timeout" || e.rung == "runtime"
+    then n else n + 1
+  Json.mkObj [
+    ("last_status", Json.str lastStatus),
+    ("attempts",    Json.num (JsonNumber.fromNat attempts))
+  ]
 
 /-- Manual JSON encoder. We don't derive `ToJson` because:
   * Field keys need to be snake_case (HF convention) — derived `ToJson`
@@ -67,7 +94,7 @@ keys we emit and what they map to. -/
 def toJson (r : ConstRecord) : Json :=
   let tagsJson : Json :=
     Json.mkObj (r.tags.map (fun (k, v) => (k, Json.str v)))
-  Json.mkObj [
+  let base := [
     ("name",         Json.str r.name),
     ("kind",         Json.str r.kind),
     ("module",       Json.str r.module),
@@ -90,6 +117,15 @@ def toJson (r : ConstRecord) : Json :=
     ("is_private",   Json.bool r.isPrivate),
     ("tags",         tagsJson)
   ]
+  let withTrace := match r.proofTrace with
+    | some entries => base ++ [
+        ("proof_trace",         Lean.toJson entries),
+        ("proof_trace_summary", summarizeTrace entries)]
+    | none         => base
+  let fields := match r.proofStructTree with
+    | some tree => withTrace ++ [("proof_struct_tree", Lean.toJson tree)]
+    | none      => withTrace
+  Json.mkObj fields
 
 instance : ToJson ConstRecord := ⟨toJson⟩
 
@@ -151,6 +187,16 @@ def fromJson? (j : Json) : Except String ConstRecord := do
     value       := ← getOptStr "value"
     proofScript := ← getOptStr "proof_script"
     proofMethod := ← getOptStr "proof_method"
+    proofTrace  := match j.getObjVal? "proof_trace" with
+      | .ok v => match v with
+        | .null => none
+        | _     => (Lean.fromJson? v).toOption
+      | .error _ => none
+    proofStructTree := match j.getObjVal? "proof_struct_tree" with
+      | .ok v => match v with
+        | .null => none
+        | _     => (Lean.fromJson? v).toOption
+      | .error _ => none
     doc         := ← getOptStr "doc"
     deps        := ← getStrList "deps"
     premises    := ← getOptStrList "premises"
