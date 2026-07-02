@@ -100,10 +100,11 @@ wait by `timeoutMs`. The worker is assumed already elaborated (`waitForDiagnosti
 done). Pure plumbing shared by the baseline and reverse-elab passes. -/
 private def requestManifest (w : Worker) (uri : DocumentUri) (reqId : String)
     (includeInternal includePrivate reverseElab : Bool) (timeoutMs : Nat)
-    (closers : Bool := false)
+    (closers : Bool := false) (reverseDeadlineMs : Nat := 0)
     : IO (Except String (Array CorpusManifestEntry)) := do
   let slot ← w.sendRequest reqId "$/lean/corpusManifest"
-    ({ textDocument := { uri }, includeInternal, includePrivate, reverseElab, closers }
+    ({ textDocument := { uri }, includeInternal, includePrivate, reverseElab, closers,
+       reverseDeadlineMs }
       : CorpusManifestParams)
   let resp : Except String JsonRpc.Message ←
     try
@@ -171,10 +172,16 @@ def extractFileEntries (pool : WorkerPool) (df : Discover.DiscoveredFile)
     if !reverseElab then
       return baseline
     -- Enrich pass (reverse-elab, optionally with closers) under the tight
-    -- deadline. On timeout/error, fall back to the baseline so records survive.
+    -- deadline. We give the plugin an INTERNAL wall-clock budget (80% of the LSP
+    -- timeout) so it processes proofs cheap-first and stops attempting reverse-elab
+    -- before the request timeout would kill the whole response — recovering the many
+    -- cheap proofs' scripts instead of losing every script in the file. The 20%
+    -- headroom covers response serialization + transport so the plugin returns in
+    -- time. On timeout/error we still fall back to the baseline so records survive.
+    let reverseDeadlineMs := manifestTimeoutMs * 4 / 5
     match (← requestManifest w uri "corpus/rev"
         includeInternal includePrivate (reverseElab := true) manifestTimeoutMs
-        (closers := closers)) with
+        (closers := closers) (reverseDeadlineMs := reverseDeadlineMs)) with
     | .ok entries => return .ok entries
     | .error e =>
       pool.close uri  -- worker is wedged on a pathological proof; drop it
