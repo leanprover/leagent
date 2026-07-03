@@ -4,10 +4,10 @@ open Lake DSL
 
 package LeanExtract where
 
--- `WorkerPlugins.ReverseElab` (the verified proof-term → tactic-script reverse
--- elaborator) lives in the sibling `workers` package so the worker plugin and
--- this import-based extractor share ONE copy of the soundness-critical code.
-require workers from "../workers"
+-- The extractor now drives Lean's frontend directly, in-process, so it no longer
+-- depends on the sibling `workers` package (the `lean --worker` driver + LSP
+-- plugins). The extraction logic that used to live in `WorkerPlugins`
+-- (reverse-elaboration, the corpus/grind collectors) was absorbed into `Corpus.*`.
 
 lean_lib Corpus where
   globs := #[.submodules `Corpus]

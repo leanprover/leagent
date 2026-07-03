@@ -1,7 +1,7 @@
 import Lean
 import Corpus.Records
 import Corpus.Tags
-import WorkerPlugins.ReverseElab
+import Corpus.ReverseElab
 
 /-!
 Core extraction: walk an `Environment` (built by `importModules`) and emit
@@ -197,7 +197,7 @@ private def buildRecord (env : Environment) (opts : ExtractOptions)
     match ci with
     | .thmInfo _ =>
         if let some v := ci.value? (allowOpaque := true) then
-          let r ← (try WorkerPlugins.ReverseElab.reverseProof ci.type v opts.reverseClosers
+          let r ← (try Corpus.ReverseElab.reverseProof ci.type v opts.reverseClosers
                    catch _ => pure { script := "", method := "error" })
           proofMethod? := some r.method
           proofScript? := if r.script.isEmpty then none else some r.script

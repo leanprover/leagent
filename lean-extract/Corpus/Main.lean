@@ -47,11 +47,12 @@ open Lean
 def toolVersion : String := "0.2.0"
 
 /-- How to enumerate the declarations to extract.
-  * `glob`   — drive `lean --worker` over the source files discovered on disk
-               under the `--modules` roots (orphan-safe; the default).
+  * `glob`   — drive Lean's frontend, in-process, over the source files discovered
+               on disk under the `--modules` roots: each file is elaborated in its
+               TRUE context and a collector folds the resulting environment
+               (orphan-safe; the default). Files run in parallel.
   * `import` — the legacy path: `importModules` the `--modules` roots and walk
-               the resulting `Environment`. Misses orphan files but needs no
-               worker/plugin. -/
+               the resulting `Environment`. Misses orphan files. -/
 inductive EnumerateMode where
   | glob
   | import

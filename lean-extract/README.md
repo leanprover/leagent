@@ -14,52 +14,52 @@ any tagging rules are all supplied on the command line.
 
 `lean-extract` has two extraction backends, selected with `--enumerate`:
 
-- **`glob` (default)** — the **worker/frontend** path. The tool discovers the
-  project's source files on disk, drives a pool of `lean --worker` subprocesses
-  (one real frontend elaboration per file), and pulls structured per-declaration
-  data back over LSP from a Lean **plugin**. This sees each file in its *true
-  elaboration context* (section variables, `open`s, `set_option`s, registered
-  tactics) and finds **orphan** declarations in files that no other module
-  imports.
+- **`glob` (default)** — the **frontend** path. The tool discovers the project's
+  source files on disk and drives Lean's frontend **directly, in-process** — one
+  real frontend elaboration per file, run in parallel across files on dedicated
+  threads — then folds a collector over each file's post-elaboration environment.
+  This sees each file in its *true elaboration context* (section variables,
+  `open`s, `set_option`s, registered tactics) and finds **orphan** declarations
+  in files that no other module imports.
 - **`import` (fallback)** — the legacy path: `importModules` the root modules
-  and walk the resulting `Environment`. Needs no worker/plugin, but cannot
-  reconstruct source signatures/bodies (its byte-slicer was removed in the 4.31
-  port) and misses orphan files.
+  and walk the resulting `Environment`. Cannot reconstruct source
+  signatures/bodies (its byte-slicer was removed in the 4.31 port) and misses
+  orphan files.
 
 Both backends write the **same JSONL schema**, so datasets stay comparable.
 
-> The extraction logic lives in a sibling package, `workers` (the Lean plugin
-> `WorkerPlugins.CorpusManifest` and the reverse-elaborator
-> `WorkerPlugins.ReverseElab`). `lean-extract` `require`s it. See
-> [Architecture](#architecture) below.
+> The extraction logic lives in `Corpus.*`: the corpus/grind collectors
+> (`Corpus.CorpusManifest`, `Corpus.GrindManifest`, `Corpus.GrindInProof`), the
+> reverse-elaborator (`Corpus.ReverseElab`), and the frontend driver
+> (`Corpus.Frontend`). See [Architecture](#architecture) below.
+
+> **History.** The `glob` path formerly drove a pool of `lean --worker`
+> subprocesses and pulled per-declaration data back over LSP from a Lean plugin
+> (in a sibling `workers` package). It now drives the frontend in-process; the
+> plugin logic was absorbed into `Corpus.*` and the `workers` dependency dropped.
+> The output is unchanged except that compiler-generated auxiliary names
+> (`match_*`, `_proof_*`) may be attributed differently — the worker elaborated
+> with `Elab.async := true` (the LSP default) while the in-process path uses the
+> synchronous default; no real declaration, statement, or proof differs.
 
 ## Build
 
 ```bash
-# 1. Build the worker-side plugin .so files (the glob path loads these).
-cd ../workers
-lake build WorkerPlugins.CorpusManifest:dynlib \
-           WorkerPlugins.ReverseElab:dynlib \
-           WorkerPlugins.Common:dynlib
-
-# 2. Build the extractor binary.
-cd ../lean-extract
 lake build
 ```
 
-The binary lands at `.lake/build/bin/lean_extract`. The plugin `.so`s land at
-`../workers/.lake/build/lib/lean/workers_WorkerPlugins_*.so`; the extractor
-locates them automatically (override with `LEAN_EXTRACT_PLUGIN_DIR`).
+The binary lands at `.lake/build/bin/lean_extract`. No plugin `.so`s or sibling
+package build are needed — the extraction logic is in-process now.
 
-Toolchain: both packages pin Lean **4.31.0** via `lean-toolchain`.
+Toolchain: the package pins Lean **4.31.0** via `lean-toolchain`.
 
 ## Run
 
-The workers (glob mode) and the importer (import mode) both need `LEAN_PATH`
-pointing at the project-under-study's built `.olean`s. The tool handles this: if
-`--source-root` (or the current directory) is a Lake project, it re-execs itself
-under `lake env` from there, so spawned workers inherit the right search path.
-You never need to wrap the call in `lake env` yourself.
+Both backends need `LEAN_PATH` pointing at the project-under-study's built
+`.olean`s (the frontend imports each file's dependencies). The tool handles this:
+if `--source-root` (or the current directory) is a Lake project, it re-execs
+itself under `lake env` from there, so the in-process elaboration inherits the
+right search path. You never need to wrap the call in `lake env` yourself.
 
 ```bash
 ./.lake/build/bin/lean_extract \
@@ -78,7 +78,7 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 |------|----------|-------|
 | `--modules <Name>` | yes | Root module to extract. Repeat for several. Also defines the **owned prefix tree** — constants outside it (Mathlib/Init/Std) are filtered out, and premises follow only owned constants. |
 | `--output <dir>` | yes* | Output directory (HF Hub-ready layout). *Not required with `--list-orphans`. |
-| `--enumerate glob\|import` | no | Extraction backend. Default `glob` (worker path). `import` is the legacy Environment walk. |
+| `--enumerate glob\|import` | no | Extraction backend. Default `glob` (frontend path). `import` is the legacy Environment walk. |
 | `--list-orphans` | no | Print the modules on disk (under `--modules`) that are **not** in the import closure of the roots, then exit. A diagnostic — writes no dataset. |
 | `--source-root <dir>` | no | Project root: resolves module↔file paths and triggers the `lake env` re-exec. Defaults to `.`. |
 | `--config <path>` | no | Tags-config JSON (see [Tags](#tags-config)). Default: no tags. |
@@ -94,7 +94,7 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 ### Examples
 
 ```bash
-# Default worker-driven extraction.
+# Default frontend-driven extraction.
 lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out
 
 # With verified proof scripts (slower).
@@ -103,7 +103,7 @@ lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out --rever
 # Find files no imported module pulls in.
 lean_extract --modules LeanSQLite --source-root ../sqlite --list-orphans
 
-# Legacy import-based path (no workers; signature/body will be null).
+# Legacy import-based path (signature/body will be null).
 lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out --enumerate import
 ```
 
@@ -174,75 +174,71 @@ the project — look them up in the `theorems` config if you need the full cone.
 
 ## Architecture
 
-The system spans two Lake packages:
+Everything is one package — `lean-extract` drives Lean's frontend in-process:
 
 ```
- lean-extract  (this package — the CLI / dataset writer)
- ├─ Corpus/Main.lean          CLI parsing; --enumerate branch; JSONL pipeline
- ├─ Corpus/Discover.lean      orphan-safe file discovery (walk, prune .lake/, path↔Name)
- ├─ Corpus/WorkerExtract.lean the worker-pool driver + CorpusManifestEntry → ConstRecord
- ├─ Corpus/Extract.lean       the legacy import-and-walk backend (--enumerate=import)
- ├─ Corpus/Records.lean       the ConstRecord JSONL schema + encoder
- ├─ Corpus/Tags.lean          tag-rule matching
- └─ Corpus/Card.lean          HF dataset-card rendering
-        │  require workers from "../workers"
-        ▼
- workers  (the worker/plugin infrastructure — the extraction logic)
- ├─ Workers/Worker.lean       drive one `lean --worker`: spawn, LSP send/await, shutdown
- ├─ Workers/WorkerPool.lean   LRU pool of workers keyed by file URI
- ├─ WorkerPlugins/Common.lean shared plugin scaffolding (snapshot/CoreM plumbing)
- ├─ WorkerPlugins/CorpusManifest.lean  the corpus plugin ($/lean/corpusManifest)
- └─ WorkerPlugins/ReverseElab.lean     proof-term → verified tactic script
+ lean-extract
+ ├─ Corpus/Main.lean            CLI parsing; --enumerate branch; JSONL pipeline
+ ├─ Corpus/Discover.lean        orphan-safe file discovery (walk, prune .lake/, path↔Name)
+ ├─ Corpus/Frontend.lean        the in-process frontend driver: elaborate a file
+ │                              (parseHeader→processHeader→IO.processCommands), run a
+ │                              CoreM collector on it, parallel over files (import-locked)
+ ├─ Corpus/CollectCommon.lean   shared collector helpers (kindToString, isUserConstant)
+ ├─ Corpus/CorpusManifest.lean  the corpus collector (corpusManifestCore)
+ ├─ Corpus/GrindManifest.lean   the grind-manifest collector (grindManifestCore)
+ ├─ Corpus/GrindInProof.lean    the in-proof grind collector (grindInProofCore)
+ ├─ Corpus/ReverseElab.lean     proof-term → verified tactic script
+ ├─ Corpus/WorkerExtract.lean   the corpus driver + CorpusManifestEntry → ConstRecord
+ ├─ Corpus/GrindExtract.lean    the grind-manifest driver
+ ├─ Corpus/GrindInProofExtract.lean  the in-proof grind driver
+ ├─ Corpus/Extract.lean         the legacy import-and-walk backend (--enumerate=import)
+ ├─ Corpus/Records.lean         the ConstRecord / grind JSONL schema + encoders
+ ├─ Corpus/Tags.lean            tag-rule matching
+ └─ Corpus/Card.lean            HF dataset-card rendering
 ```
 
-### The worker/frontend path (default)
+### The frontend path (default)
 
 1. **Discover** (`Discover.lean`): walk the project tree, prune `.lake/`, map each
    `.lean` file to its module `Name`, keep those under the `--modules` roots.
-2. **Drive** (`WorkerExtract.lean`): build a `WorkerPool`. For each file:
-   `acquire` a worker (spawns `lean --worker` with the plugin loaded, sends
-   `initialize` + `didOpen`), `waitForDiagnostics` (elaboration done), then send
-   the custom LSP request `$/lean/corpusManifest` and decode the response.
-3. **Extract** (`CorpusManifest.lean`, *inside the worker*): after the file's
-   command snapshots finish, fold over the module-local user constants in the
-   post-elaboration environment. Per constant it computes the type/value
-   (pretty-printed), `deps`, `axioms`, `premises` (transitive owned cone),
-   `signature`/`body` (by navigating the parsed command `Syntax`), and — when
-   requested — the reverse-elaborated `proof_script`. A server-side
+2. **Drive** (`WorkerExtract.lean` → `Frontend.lean`): `elaborateFiles` runs each
+   file on its own dedicated thread (bounded concurrency). Per file,
+   `elaborateFile` does `parseHeader` → `processHeader` (imports the file's deps)
+   → `IO.processCommands`, yielding the post-elaboration `Environment`, the
+   per-command `Syntax`, and the `InfoTree`s. The header/import phase is serialized
+   behind one process-wide lock (imports touch unsynchronized Lean globals); the
+   per-command elaboration runs fully parallel.
+3. **Collect** (`CorpusManifest.lean` via `Frontend.runCollectorOn`): fold over the
+   module-local user constants in the post-elaboration environment. Per constant it
+   computes the type/value (pretty-printed), `deps`, `axioms`, `premises`
+   (transitive owned cone), `signature`/`body` (by navigating the parsed command
+   `Syntax`), and — when requested — the reverse-elaborated `proof_script`. An
    eligibility filter matches the dataset's record set.
 4. **Map & write** (`WorkerExtract.lean` → `Main.lean`): each
    `CorpusManifestEntry` becomes a `ConstRecord`; the shared pipeline splits and
    writes the JSONL.
 
-**Why this design.** The LSP boundary quarantines version-fragile InfoTree/Core
-code inside the plugin, while the driver consumes stable JSON. Crucially, the
-worker is a *real frontend* — tactics are registered and the elaboration context
-is authentic — which is what makes in-context source reconstruction and
-`proof_script` re-elaboration possible. The import-based path cannot reproduce
-that context, so it is kept only as a `--enumerate=import` fallback.
+**Why this design.** Driving the frontend in-process runs each file as a *real
+frontend* — tactics are registered and the elaboration context is authentic —
+which is what makes in-context source reconstruction and `proof_script`
+re-elaboration possible, and finds orphan files the import graph misses. The
+import-based path cannot reproduce that context, so it is kept only as a
+`--enumerate=import` fallback. (This replaced an earlier `lean --worker` +
+LSP-plugin design; the collector logic is unchanged, only its host.)
 
-#### Plugin `.so` loading (gotcha)
+#### Timeouts (cooperative)
 
-Each plugin `.so` references the `initialize` symbols of the shared helpers it
-imports (`Common`, `ReverseElab`) as *undefined* — they are not statically
-bundled. The worker must therefore `--load-dynlib` **every helper** before
-`--plugin`-loading the handler:
-
-```
-lean --worker \
-  --load-dynlib=…workers_WorkerPlugins_Common.so \
-  --load-dynlib=…workers_WorkerPlugins_ReverseElab.so \
-  --plugin=…workers_WorkerPlugins_CorpusManifest.so \
-  file://…
-```
-
-(`--plugin` loads *and runs* the `initialize` block that registers the LSP
-handler; `--load-dynlib` only exposes symbols.) `WorkerExtract.resolvePluginArgs`
-assembles these flags.
+There is no subprocess to kill, so all bounds are cooperative: the
+`reverseNodeCeiling` size pre-filter skips pathological proof terms before any
+reverse-elab work; per-theorem heartbeat budgets bound the in-range ones; a finite
+per-goal `maxHeartbeats` backstop (`grindHeartbeats`) bounds each grind run; and a
+per-file wall-clock deadline sheds the expensive tail *between* theorems/sites.
+Parallelism means a proof that spins in a single uninterruptible call ties up one
+file thread, not the whole run.
 
 ### Reverse-elaboration / proof simplification
 
-The `proof_script` field is produced by `WorkerPlugins.ReverseElab`, which turns
+The `proof_script` field is produced by `Corpus.ReverseElab`, which turns
 a proof *term* (`Expr`) into a short, **verified** tactic script. Its algorithm
 — the candidate ladder, the two-stage verification, and the soundness guards
 that keep `sorry`-laced scripts out — is documented separately in
