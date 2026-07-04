@@ -72,6 +72,13 @@ structure CorpusManifestEntry where
   term; for equations/`where`, the whole `declVal`). `none` when there is no
   source command or no value (e.g. `axiom`). -/
   body        : Option String
+  /-- FULL SOURCE of the declaration command: doc comment + modifiers + signature
+  + body, verbatim and re-elaboratable. Captured for EVERY kind (including
+  `inductive`/`structure`, whose `signature`/`body` are `none`). This is what a
+  self-contained record inlines for its owned `def`/`inductive`/`structure`
+  dependencies. `none` only for constants with no source command (companions,
+  projections, recursors, anonymous instances). -/
+  declSource  : Option String
   /-- Transitive premise cone: every PROJECT-OWNED constant reachable through the
   term of this declaration (BFS over `getUsedConstantsAsSet`, expanding only
   owned bodies so core/Std/Mathlib is never dragged in), sorted and excluding
@@ -371,6 +378,29 @@ private def buildSourceMap (src : String) (commands : Array Syntax)
           m := m.insert (p.line, p.column) (sigBodyOf cmdStx src)
   return m
 
+/-- Build a map from each declaration's name-token `(line, column)` to the FULL
+SOURCE of its command — the entire `declaration` node's range, which begins at
+`declModifiers` (so the leading doc comment and any `@[...]`/`private`/`noncomputable`
+modifiers are included) and runs through the whole body. Unlike `buildSourceMap`
+(which isolates the sig and the value/proof separately, and returns `(none,none)`
+for inductives/structures whose layout it does not decompose), this captures the
+verbatim, re-elaboratable text of the WHOLE declaration for EVERY kind — exactly
+what a self-contained record inlines for its owned `def`/`inductive`/`structure`
+dependencies. Keyed identically to `buildSourceMap` (the name-token position, via
+`findDeclarationRanges?.selectionRange` on the constant side). -/
+private def buildDeclSourceMap (src : String) (commands : Array Syntax)
+    : Std.HashMap (Nat × Nat) String := Id.run do
+  let fileMap := src.toFileMap
+  let mut m : Std.HashMap (Nat × Nat) String := {}
+  for cmdStx in commands do
+    if cmdStx.getKind == ``Lean.Parser.Command.declaration then
+      if let some declId := findByKind cmdStx [``Lean.Parser.Command.declId] then
+        if let some idPos := declId[0].getPos? then
+          if let some src? := sliceTrimmed cmdStx src then
+            let p := fileMap.toPosition idPos
+            m := m.insert (p.line, p.column) src?
+  return m
+
 /-- Syntax kinds of the simp-family tactics whose argument-lists we harvest from
 the source proof to use as reverse-elaboration closer candidates. `simp only` is
 the `simp` kind with an `only` child, so both forms are covered by these two. -/
@@ -466,6 +496,7 @@ private def buildSimpArgMap (src : String) (commands : Array Syntax)
   return m
 
 private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
+    (declSrcMap : Std.HashMap (Nat × Nat) String)
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
     (reverseElab closers : Bool) (info : ConstantInfo)
     (attemptReverse : Bool := true) : CoreM CorpusManifestEntry := do
@@ -496,6 +527,10 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
     match ranges? with
     | some r => srcMap.getD (r.selectionRange.pos.line, r.selectionRange.pos.column) (none, none)
     | none   => (none, none)
+  let declSource :=
+    match ranges? with
+    | some r => declSrcMap[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
+    | none   => none
   let (startLine, startCol, endLine, endCol) :=
     match ranges? with
     | some r => (some r.range.pos.line, some r.range.pos.column,
@@ -557,6 +592,7 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
     hasSorry
     signature
     body
+    declSource
     premises
     proofScript
     proofMethod
@@ -596,6 +632,7 @@ scripts. The output is re-sorted by name, so ordering is unchanged; only WHICH
 theorems get a script depends on the schedule. `deadlineMs = 0` disables all of
 this (process in name order, always attempt — the historical behavior). -/
 private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
+    (declSrcMap : Std.HashMap (Nat × Nat) String)
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
     (includeInternal includePrivate reverseElab closers : Bool) (deadlineMs : Nat := 0)
     : CoreM (Array CorpusManifestEntry) := do
@@ -627,7 +664,7 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
   for vc in scheduled do
     -- Past the budget, keep emitting records but stop attempting reverse-elab.
     let attemptReverse := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
-    out := out.push (← buildEntry srcMap simpArgMap reverseElab closers vc.info attemptReverse)
+    out := out.push (← buildEntry srcMap declSrcMap simpArgMap reverseElab closers vc.info attemptReverse)
   return out.qsort (fun a b => a.name < b.name)
 
 /-- The in-process corpus-collector entry point: build the corpus manifest entries
@@ -644,10 +681,11 @@ def corpusManifestCore (r : Frontend.ElabResult)
     (reverseDeadlineMs : Nat := 0) : IO (Array CorpusManifestEntry) :=
   Frontend.runCollectorOn r do
     let srcMap := buildSourceMap r.source r.commands
+    let declSrcMap := buildDeclSourceMap r.source r.commands
     -- Only build the simp-arg map when closers are on (it walks every proof's
     -- syntax); otherwise it is unused.
     let simpArgMap ← if closers then buildSimpArgMap r.source r.commands else pure {}
-    foldCorpusEntries srcMap simpArgMap
+    foldCorpusEntries srcMap declSrcMap simpArgMap
       includeInternal includePrivate reverseElab closers reverseDeadlineMs
 
 end Corpus

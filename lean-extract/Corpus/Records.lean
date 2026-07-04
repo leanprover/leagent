@@ -27,6 +27,12 @@ structure ConstRecord where
   endCol      : Option Nat
   signature   : Option String
   body        : Option String
+  /-- FULL source of the declaration command (doc + modifiers + signature + body),
+  verbatim and re-elaboratable. Captured for every kind — including
+  `inductive`/`structure`, whose `signature`/`body` are null. This is the text a
+  self-contained record inlines for its owned `def`/`inductive`/`structure`
+  dependencies. Null for constants with no source command. -/
+  declSource  : Option String
   type        : String
   value       : Option String
   /-- Mechanically reverse-elaborated tactic script (from the proof `Expr`),
@@ -78,6 +84,7 @@ def toJson (r : ConstRecord) : Json :=
     ("end_col",      Lean.toJson r.endCol),
     ("signature",    Lean.toJson r.signature),
     ("body",         Lean.toJson r.body),
+    ("decl_source",  Lean.toJson r.declSource),
     ("type",         Json.str r.type),
     ("value",        Lean.toJson r.value),
     ("proof_script", Lean.toJson r.proofScript),
@@ -147,6 +154,7 @@ def fromJson? (j : Json) : Except String ConstRecord := do
     endCol      := ← getOptNat "end_col"
     signature   := ← getOptStr "signature"
     body        := ← getOptStr "body"
+    declSource  := ← getOptStr "decl_source"
     type        := ← getStr "type"
     value       := ← getOptStr "value"
     proofScript := ← getOptStr "proof_script"

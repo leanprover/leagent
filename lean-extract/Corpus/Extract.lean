@@ -269,6 +269,8 @@ private def buildRecord (env : Environment) (opts : ExtractOptions)
     endCol      := endCol?
     signature   := signature?
     body        := body?
+    -- The legacy import path cannot reconstruct source (no command `Syntax`).
+    declSource  := none
     type        := typeStr
     value       := valueStr
     proofScript := proofScript?

@@ -63,6 +63,7 @@ def entryToRecord (e : CorpusManifestEntry) (relFile : String) (tagConfig : TagC
     endCol      := e.endCol
     signature   := e.signature
     body        := e.body
+    declSource  := e.declSource
     type        := e.type
     value       := e.value?
     proofScript := e.proofScript
