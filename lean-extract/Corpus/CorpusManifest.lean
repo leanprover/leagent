@@ -168,6 +168,28 @@ def reverseProofGuarded (ty v : Expr) (enableClosers : Bool)
       (Lean.Meta.MetaM.run' (ReverseElab.reverseProof ty v enableClosers extraClosers))
       (fun _ => pure { script := "", method := "error" })
 
+/-- The constants an inductive/structure DEPENDS ON, including its field/argument
+types. A structure's own `type` is just `Type u` (`getUsedConstantsAsSet = #[]`) —
+the field types live in the CONSTRUCTOR's type (`Cache.mk : PageNo → … → Cache`),
+so `info.getUsedConstantsAsSet` alone misses every field-type dependency (e.g.
+`Cache` would not list `Node`/`PageNo`). We union the inductive's own used
+constants with each constructor's, dropping the inductive's own auto-generated
+companions (`.mk`, other ctors, the type itself). Non-inductives fall back to the
+plain used-constant set. This makes `deps` sound for topological reconstruction of
+a self-contained record (a struct must be emitted after its field types). -/
+private def usedConstantsFor (env : Environment) (info : ConstantInfo) : Array Name :=
+  match info with
+  | .inductInfo iv =>
+      let ctorTypeConsts := iv.ctors.foldl (init := info.getUsedConstantsAsSet) fun acc ctor =>
+        match env.find? ctor with
+        | some ci => acc.union ci.getUsedConstantsAsSet
+        | none    => acc
+      -- Drop the family's own names (the type + its constructors): a decl never
+      -- depends on itself, and the ctors are companions, not external deps.
+      let ownNames := (iv.all ++ iv.ctors).foldl (·.insert ·) (∅ : Std.HashSet Name)
+      ctorTypeConsts.toArray.filter (!ownNames.contains ·)
+  | _ => info.getUsedConstantsAsSet.toArray
+
 /-- Sorted, deduped fully-qualified names (excluding `self`), each normalized to
 its resolvable display form (`CollectCommon.displayName` unmangles `_private.…`).
 `self` is compared in the same normalized form so a decl never lists itself even
@@ -394,11 +416,23 @@ private def buildDeclSourceMap (src : String) (commands : Array Syntax)
   let mut m : Std.HashMap (Nat × Nat) String := {}
   for cmdStx in commands do
     if cmdStx.getKind == ``Lean.Parser.Command.declaration then
-      if let some declId := findByKind cmdStx [``Lean.Parser.Command.declId] then
-        if let some idPos := declId[0].getPos? then
-          if let some src? := sliceTrimmed cmdStx src then
-            let p := fileMap.toPosition idPos
-            m := m.insert (p.line, p.column) src?
+      if let some src? := sliceTrimmed cmdStx src then
+        -- Key by the position `findDeclarationRanges?.selectionRange.pos` reports
+        -- for the constant (which is how `buildEntry` looks the source up):
+        --  * NAMED decl → the `declId` name-token position.
+        --  * ANONYMOUS `instance`/`example` (no `declId`) → the whole command's
+        --    start position (`cmdStx[1]`, the inner decl node — past the
+        --    `declModifiers`), which is what `selectionRange.pos` points at for a
+        --    nameless declaration. Without this, anonymous instances (e.g.
+        --    `instance : Monad M where …`) never landed in the map and had null
+        --    `declSource`, breaking any record whose proof uses that instance.
+        let keyPos? :=
+          match findByKind cmdStx [``Lean.Parser.Command.declId] with
+          | some declId => declId[0].getPos?
+          | none        => (cmdStx.getArg 1).getPos? <|> cmdStx.getPos?
+        if let some p := keyPos? then
+          let pos := fileMap.toPosition p
+          m := m.insert (pos.line, pos.column) src?
   return m
 
 /-- Syntax kinds of the simp-family tactics whose argument-lists we harvest from
@@ -513,7 +547,7 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
   let axStrs := match info with
     | .thmInfo _ => allAxStrs
     | _          => #[]
-  let deps := fmtNames info.name info.getUsedConstantsAsSet.toArray
+  let deps := fmtNames info.name (usedConstantsFor env info)
   let doc? ← findDocString? env info.name
   let modStr := match env.getModuleIdxFor? info.name with
     | some idx => (env.allImportedModuleNames[idx.toNat]?).map toString |>.getD ""
