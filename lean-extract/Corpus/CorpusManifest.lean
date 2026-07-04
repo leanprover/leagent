@@ -161,10 +161,15 @@ def reverseProofGuarded (ty v : Expr) (enableClosers : Bool)
       (Lean.Meta.MetaM.run' (ReverseElab.reverseProof ty v enableClosers extraClosers))
       (fun _ => pure { script := "", method := "error" })
 
-/-- Sorted, deduped fully-qualified names (excluding `self`). -/
+/-- Sorted, deduped fully-qualified names (excluding `self`), each normalized to
+its resolvable display form (`CollectCommon.displayName` unmangles `_private.…`).
+`self` is compared in the same normalized form so a decl never lists itself even
+when private. Dedup+sort happen AFTER normalization, so two references that only
+differed by mangling collapse to one. -/
 private def fmtNames (self : Name) (ns : Array Name) : Array String :=
-  let strs := ns.toList.map toString
-  let uniq := strs.eraseDups.filter (· != self.toString)
+  let selfStr := (CollectCommon.displayName self).toString
+  let strs := ns.toList.map (fun n => (CollectCommon.displayName n).toString)
+  let uniq := strs.eraseDups.filter (· != selfStr)
   (uniq.mergeSort (· < ·)).toArray
 
 /-! ## Corpus-eligibility filter (parity with the import-based extractor)
@@ -207,7 +212,14 @@ private def corpusEligible (env : Environment) (includeInternal includePrivate :
     (name : Name) (info : ConstantInfo) : CoreM Bool := do
   if alwaysSkip env name then return false
   unless includeInternal do
-    if name.isInternalDetail then return false
+    -- A private decl (`_private.…`) is internal-detail by name but is user-authored
+    -- material: keep it iff its UNMANGLED user name is itself not internal-detail
+    -- (a genuine authored private decl, not a private compiler shard). Its ultimate
+    -- inclusion is still gated by `includePrivate` below. Non-private internal
+    -- details (`match_…`, `_aux`, …) are dropped as before.
+    let genuinePrivate :=
+      Lean.isPrivateName name && !(Lean.privateToUserName name).isInternalDetail
+    if name.isInternalDetail && !genuinePrivate then return false
     match info with
     | .ctorInfo _ | .recInfo _ => return false
     | _ => pure ()
@@ -532,7 +544,9 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
         else pure (none, none)
     | _ => pure (none, none)
   return {
-    name := info.name.toString
+    -- Resolvable display name: private decls are unmangled from `_private.…` to
+    -- their user name, so the record is citeable and joins with deps/premises.
+    name := (CollectCommon.displayName info.name).toString
     kind := CollectCommon.kindToString info
     module := modStr
     type := typeStr
