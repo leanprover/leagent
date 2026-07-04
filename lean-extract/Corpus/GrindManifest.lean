@@ -7,6 +7,7 @@ Authors: Paul Govereau
 import Lean
 import Corpus.CollectCommon
 import Corpus.Frontend
+import Corpus.Verify
 
 /-!
 `$/lean/grindManifest`: a FileWorker request that, for each theorem in the
@@ -381,12 +382,17 @@ the budget. Emits one entry per eligible theorem, sorted by name. -/
 private def foldGrindEntries (includePrivate : Bool) (deadlineMs : Nat)
     : MetaM (Array GrindManifestEntry) := do
   let env ← getEnv
-  -- Collect eligible theorems first.
+  -- Source the file-local constants from the shared VERIFICATION substrate
+  -- (`Verify.verifiedFileConstants`) rather than re-enumerating `env.constants`:
+  -- grind-manifest is a CLIENT of the verification mechanism. Grind re-proves each
+  -- statement from scratch (whole-statement self-play) and never touches the
+  -- original proof term, so `isSorryFree` is NOT a filter here — every eligible
+  -- theorem is attempted, matching the prior behavior exactly.
   let mut eligible : Array (Name × ConstantInfo) := #[]
-  for (name, info) in env.constants.toList do
-    if CollectCommon.isUserConstant env name then
-      if (← grindEligible env includePrivate name info) then
-        eligible := eligible.push (name, info)
+  for vc in (← Corpus.Verify.verifiedFileConstants) do
+    let name := vc.info.name
+    if (← grindEligible env includePrivate name vc.info) then
+      eligible := eligible.push (name, vc.info)
   let startMs ← IO.monoMsNow
   let mut out : Array GrindManifestEntry := #[]
   for (name, info) in eligible do

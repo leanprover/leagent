@@ -196,6 +196,18 @@ file's post-elaboration `CoreM`; each site's re-run re-enters `MetaM` on the
 restored `ctx`. -/
 private def foldGrindSites (trees : Array Elab.InfoTree) (includePrivate : Bool)
     (deadlineMs : Nat) : CoreM (Array GrindInProofEntry) := do
+  -- The file-local constants that are NOT verified (their proof contains `sorryAx`),
+  -- from the shared verification substrate. Grind-in-proof is a CLIENT of that
+  -- mechanism: a grind call site inside a `sorry`-laced proof is not trustworthy
+  -- training data, so we shed it. We gate NEGATIVELY (skip only enclosing theorems
+  -- we can positively identify as sorry-laced) rather than positively (keep only
+  -- names in a verified set): `parentDecl?`'s name need not string-match
+  -- `info.name` for every constant (private-name mangling), and a positive gate
+  -- would wrongly drop sound sites on any mismatch. The negative gate is a proven
+  -- no-op on sorry-free corpora and never discards good data on ambiguity.
+  let unverified : Std.HashSet String :=
+    (← Corpus.Verify.verifiedFileConstants).foldl
+      (fun s vc => if vc.isSorryFree then s else s.insert vc.info.name.toString) {}
   -- Collect sites across all command trees first (cheap; blocks on lazy info).
   let mut sites : Array GrindSite := #[]
   for tree in trees do
@@ -218,6 +230,10 @@ private def foldGrindSites (trees : Array Elab.InfoTree) (includePrivate : Bool)
     let authorHints := renderAuthorHints authorPs
     -- Skip private-enclosed sites when requested.
     if !includePrivate && isPriv then
+      continue
+    -- Skip sites whose enclosing theorem is positively identified as sorry-laced
+    -- (not verified). No-op on sorry-free corpora. See `unverified` above.
+    if unverified.contains enclosing then
       continue
     let base : GrindInProofEntry := {
       enclosingTheorem := enclosing, module := ctx.env.mainModule.toString,

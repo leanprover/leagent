@@ -10,6 +10,7 @@ import Lean.PrettyPrinter
 import Corpus.CollectCommon
 import Corpus.ReverseElab
 import Corpus.Frontend
+import Corpus.Verify
 
 /-!
 The corpus collector: for each user declaration in an elaborated file, computes
@@ -585,24 +586,34 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
     (includeInternal includePrivate reverseElab closers : Bool) (deadlineMs : Nat := 0)
     : CoreM (Array CorpusManifestEntry) := do
   let env ← getEnv
-  -- Collect the eligible constants first so we can order them before building.
-  let mut eligible : Array (Name × ConstantInfo) := #[]
-  for (name, info) in env.constants.toList do
-    if CollectCommon.isUserConstant env name then
-      if (← corpusEligible env includeInternal includePrivate name info) then
-        eligible := eligible.push (name, info)
+  -- Source the file-local constants from the shared VERIFICATION substrate
+  -- (`Verify.verifiedFileConstants`) rather than re-enumerating `env.constants`:
+  -- the corpus collector is a CLIENT of the verification mechanism. This iterates
+  -- `env.constants` in the same order and applies the same `isUserConstant` filter
+  -- as before, so the eligible set — and thus the record set — is unchanged. Each
+  -- `VerifiedConst` also carries `isSorryFree`; the reverse-elab ENRICHMENT is the
+  -- consumer of that signal (a `sorry`-laced proof is not a valid learning target),
+  -- and `ReverseElab`'s own `errToSorry := false` / `Expr.hasSorry` guards already
+  -- reject any `sorry`/partial script, so no valid `proof_script` is ever emitted
+  -- for an unverified proof. The base record (name/type/deps/…) is emitted for every
+  -- eligible constant regardless (a `sorry` theorem still belongs in the corpus,
+  -- flagged `has_sorry`); only its `proof_script` would be forgone.
+  let mut eligible : Array Verify.VerifiedConst := #[]
+  for vc in (← Verify.verifiedFileConstants) do
+    if (← corpusEligible env includeInternal includePrivate vc.info.name vc.info) then
+      eligible := eligible.push vc
   -- Cheap-first scheduling only matters when we actually reverse-elaborate under a
   -- deadline; otherwise keep the original (name) order to minimize behavior change.
   let scheduled :=
     if reverseElab && deadlineMs > 0 then
-      eligible.qsort (fun a b => reverseCost a.2 < reverseCost b.2)
+      eligible.qsort (fun a b => reverseCost a.info < reverseCost b.info)
     else eligible
   let startMs ← IO.monoMsNow
   let mut out : Array CorpusManifestEntry := #[]
-  for (_, info) in scheduled do
+  for vc in scheduled do
     -- Past the budget, keep emitting records but stop attempting reverse-elab.
     let attemptReverse := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
-    out := out.push (← buildEntry srcMap simpArgMap reverseElab closers info attemptReverse)
+    out := out.push (← buildEntry srcMap simpArgMap reverseElab closers vc.info attemptReverse)
   return out.qsort (fun a b => a.name < b.name)
 
 /-- The in-process corpus-collector entry point: build the corpus manifest entries
