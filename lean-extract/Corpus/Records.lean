@@ -33,6 +33,20 @@ structure ConstRecord where
   self-contained record inlines for its owned `def`/`inductive`/`structure`
   dependencies. Null for constants with no source command. -/
   declSource  : Option String
+  /-- Dotted enclosing namespace the declaration was elaborated under (e.g.
+  `"LeanSQLite.Engine"`; empty at top level). The true declaring namespace, from
+  the command-stack walk — not derivable from `name`. An assembled record wraps
+  the (unqualified) `decl_source` under this namespace. -/
+  declNamespace : String
+  /-- Verbatim source of the scope commands active at the declaration, outermost
+  first (`namespace`/`section` openers plus live `open`/`variable`/`universe`/
+  `set_option`). Replaying these — then closing namespaces/sections — reproduces
+  the declaration's elaboration scope in a standalone file. -/
+  scopePrelude : List String
+  /-- Direct imports of the declaration's file (dotted module names). A
+  self-contained record imports the non-owned ones as its baseline and inlines the
+  owned cone. Identical for every record from the same module. -/
+  fileImports : List String
   type        : String
   value       : Option String
   /-- Mechanically reverse-elaborated tactic script (from the proof `Expr`),
@@ -82,10 +96,13 @@ def toJson (r : ConstRecord) : Json :=
     ("start_col",    Lean.toJson r.startCol),
     ("end_line",     Lean.toJson r.endLine),
     ("end_col",      Lean.toJson r.endCol),
-    ("signature",    Lean.toJson r.signature),
-    ("body",         Lean.toJson r.body),
-    ("decl_source",  Lean.toJson r.declSource),
-    ("type",         Json.str r.type),
+    ("signature",     Lean.toJson r.signature),
+    ("body",          Lean.toJson r.body),
+    ("decl_source",   Lean.toJson r.declSource),
+    ("decl_namespace", Json.str r.declNamespace),
+    ("scope_prelude", Lean.toJson r.scopePrelude),
+    ("file_imports",  Lean.toJson r.fileImports),
+    ("type",          Json.str r.type),
     ("value",        Lean.toJson r.value),
     ("proof_script", Lean.toJson r.proofScript),
     ("proof_method", Lean.toJson r.proofMethod),
@@ -155,6 +172,9 @@ def fromJson? (j : Json) : Except String ConstRecord := do
     signature   := ← getOptStr "signature"
     body        := ← getOptStr "body"
     declSource  := ← getOptStr "decl_source"
+    declNamespace := (← getOptStr "decl_namespace").getD ""
+    scopePrelude  := ← getOptStrList "scope_prelude"
+    fileImports   := ← getOptStrList "file_imports"
     type        := ← getStr "type"
     value       := ← getOptStr "value"
     proofScript := ← getOptStr "proof_script"

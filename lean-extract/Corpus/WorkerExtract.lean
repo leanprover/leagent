@@ -64,6 +64,9 @@ def entryToRecord (e : CorpusManifestEntry) (relFile : String) (tagConfig : TagC
     signature   := e.signature
     body        := e.body
     declSource  := e.declSource
+    declNamespace := e.declNamespace
+    scopePrelude  := e.scopePrelude.toList
+    fileImports   := e.fileImports.toList
     type        := e.type
     value       := e.value?
     proofScript := e.proofScript

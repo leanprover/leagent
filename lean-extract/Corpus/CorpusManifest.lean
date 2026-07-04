@@ -79,6 +79,24 @@ structure CorpusManifestEntry where
   dependencies. `none` only for constants with no source command (companions,
   projections, recursors, anonymous instances). -/
   declSource  : Option String
+  /-- Dotted enclosing namespace the declaration was elaborated under (e.g.
+  `"LeanSQLite.Engine"`; empty at top level). The TRUE declaring namespace, from
+  the command-stack walk — NOT derivable from `name` (which cannot be split back
+  into namespace vs. dotted short name). Lets a self-contained record wrap the
+  decl's verbatim (unqualified) `declSource` under the right `namespace`. -/
+  declNamespace : String
+  /-- Verbatim source of the scope commands in effect at the declaration,
+  outermost first (the `namespace`/`section` openers plus any live
+  `open`/`variable`/`universe`/`set_option`). Replaying these — then closing
+  namespaces/sections — reproduces the declaration's elaboration scope in an
+  assembled standalone file. -/
+  scopePrelude : Array String
+  /-- The DIRECT imports of the declaration's file (`env.imports`, the actual
+  `import X` header lines), as dotted module names. A self-contained record needs
+  these to reconstruct the file's baseline: the assembler imports the
+  non-project-owned ones (Init/Std/Mathlib) and inlines the owned cone. Identical
+  for every declaration elaborated in the same file. -/
+  fileImports : Array String
   /-- Transitive premise cone: every PROJECT-OWNED constant reachable through the
   term of this declaration (BFS over `getUsedConstantsAsSet`, expanding only
   owned bodies so core/Std/Mathlib is never dragged in), sorted and excluding
@@ -435,6 +453,91 @@ private def buildDeclSourceMap (src : String) (commands : Array Syntax)
           m := m.insert (pos.line, pos.column) src?
   return m
 
+/-- The `(line, column)` key that a `declaration` command should be filed under —
+the position `findDeclarationRanges?.selectionRange.pos` reports for the constant,
+which is how `buildEntry` looks entries up. NAMED decls key on the `declId`
+name-token; ANONYMOUS `instance`/`example` (no `declId`) key on the inner decl
+node start (`cmdStx[1]`, past `declModifiers`). `none` if neither has a position. -/
+private def declKeyPos (fileMap : FileMap) (cmdStx : Syntax) : Option (Nat × Nat) := do
+  let p ← match findByKind cmdStx [``Lean.Parser.Command.declId] with
+    | some declId => declId[0].getPos?
+    | none        => (cmdStx.getArg 1).getPos? <|> cmdStx.getPos?
+  let pos := fileMap.toPosition p
+  return (pos.line, pos.column)
+
+/-- The SCOPE a declaration was elaborated under: the enclosing namespace path and
+the verbatim source of every scope-setting command in effect. -/
+structure DeclScope where
+  /-- Dotted enclosing namespace, e.g. `"LeanSQLite.Engine"` (empty at top level).
+  This is the TRUE declaring namespace — recoverable only by walking the command
+  stack, NOT from the constant's full name (which cannot be split back into
+  namespace vs. dotted short name: `LeanSQLite.Engine.Node.lookupKey` declared as
+  `def Node.lookupKey` under `namespace LeanSQLite.Engine` has short name
+  `Node.lookupKey`, not `lookupKey`). -/
+  «namespace» : String
+  /-- Verbatim source of the scope commands active at the declaration, outermost
+  first: the `namespace`/`section` openers plus any `open`/`variable`/`universe`/
+  `set_option` still in scope. Replaying these (then closing namespaces/sections
+  with matching `end`s) reproduces the declaration's elaboration scope. -/
+  prelude : Array String
+  deriving Inhabited
+
+/-- Build a map from each declaration's key position to its `DeclScope`, by a
+single left-to-right walk of the file's top-level `commands` maintaining a scope
+stack. `namespace N`/`section [id]` push (tracking the name for the dotted path
+and for the matching `end`); `end [id]` pops; `open`/`variable`/`universe`/
+`set_option` are recorded as active scope entries (also popped when their
+enclosing section closes). Every `declaration` command encountered is filed with
+a snapshot of the current namespace path + active scope-command sources.
+
+`open X in foo` / `set_option ... in foo` attach to a SINGLE declaration and are
+part of that decl's own command syntax (hence already in `decl_source`), so they
+never appear as standalone top-level commands here — this walk only sees
+command-level scoping, which is exactly what must be replayed AROUND the decl. -/
+private def buildScopeMap (src : String) (commands : Array Syntax)
+    : Std.HashMap (Nat × Nat) DeclScope := Id.run do
+  let fileMap := src.toFileMap
+  let mut m : Std.HashMap (Nat × Nat) DeclScope := {}
+  -- Stack of open scopes. Each frame: (kind-name for the dotted path or "" if the
+  -- entry is not a namespace, isNamespace, verbatim source, endName for matching).
+  -- We keep namespace/section as structural frames and open/variable/... as
+  -- content frames that live until their enclosing section closes.
+  let mut nsPath : Array String := #[]          -- namespace components, for the dotted path
+  let mut scopeStack : Array (Bool × String) := #[]  -- (isSectionOrNamespace, verbatimSrc); content entries have isSection=false
+  -- For matching `end`, track how many scopeStack entries + nsPath comps each
+  -- opener contributed. A namespace/section opener records a barrier.
+  let mut barriers : Array (Nat × Nat × Option String) := #[]  -- (scopeStackLen, nsPathLen, nsCompPushed?)
+  for cmdStx in commands do
+    let k := cmdStx.getKind
+    let srcOf : Option String := sliceTrimmed cmdStx src
+    if k == ``Lean.Parser.Command.declaration then
+      if let some key := declKeyPos fileMap cmdStx then
+        m := m.insert key { «namespace» := ".".intercalate nsPath.toList,
+                            prelude := scopeStack.map (·.2) }
+    else if k == ``Lean.Parser.Command.namespace then
+      -- `namespace <id>`: the identifier is the last significant child.
+      let comp := (cmdStx.getArg 1).getId.toString
+      barriers := barriers.push (scopeStack.size, nsPath.size, some comp)
+      nsPath := nsPath.push comp
+      if let some s := srcOf then scopeStack := scopeStack.push (true, s)
+      else scopeStack := scopeStack.push (true, s!"namespace {comp}")
+    else if k == ``Lean.Parser.Command.section then
+      barriers := barriers.push (scopeStack.size, nsPath.size, none)
+      if let some s := srcOf then scopeStack := scopeStack.push (true, s)
+      else scopeStack := scopeStack.push (true, "section")
+    else if k == ``Lean.Parser.Command.end then
+      -- Pop to the most recent barrier.
+      if let some (ssLen, nsLen, _) := barriers.back? then
+        barriers := barriers.pop
+        scopeStack := scopeStack.extract 0 ssLen
+        nsPath := nsPath.extract 0 nsLen
+    else if k == ``Lean.Parser.Command.open
+         || k == ``Lean.Parser.Command.variable
+         || k == ``Lean.Parser.Command.universe
+         || k == ``Lean.Parser.Command.set_option then
+      if let some s := srcOf then scopeStack := scopeStack.push (false, s)
+  return m
+
 /-- Syntax kinds of the simp-family tactics whose argument-lists we harvest from
 the source proof to use as reverse-elaboration closer candidates. `simp only` is
 the `simp` kind with an `only` child, so both forms are covered by these two. -/
@@ -531,6 +634,7 @@ private def buildSimpArgMap (src : String) (commands : Array Syntax)
 
 private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
     (declSrcMap : Std.HashMap (Nat × Nat) String)
+    (scopeMap : Std.HashMap (Nat × Nat) DeclScope)
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
     (reverseElab closers : Bool) (info : ConstantInfo)
     (attemptReverse : Bool := true) : CoreM CorpusManifestEntry := do
@@ -564,6 +668,10 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
   let declSource :=
     match ranges? with
     | some r => declSrcMap[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
+    | none   => none
+  let declScope :=
+    match ranges? with
+    | some r => scopeMap[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
     | none   => none
   let (startLine, startCol, endLine, endCol) :=
     match ranges? with
@@ -627,6 +735,9 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
     signature
     body
     declSource
+    declNamespace := (declScope.map (·.«namespace»)).getD ""
+    scopePrelude  := (declScope.map (·.prelude)).getD #[]
+    fileImports   := env.imports.map (·.module.toString)
     premises
     proofScript
     proofMethod
@@ -667,6 +778,7 @@ theorems get a script depends on the schedule. `deadlineMs = 0` disables all of
 this (process in name order, always attempt — the historical behavior). -/
 private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
     (declSrcMap : Std.HashMap (Nat × Nat) String)
+    (scopeMap : Std.HashMap (Nat × Nat) DeclScope)
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
     (includeInternal includePrivate reverseElab closers : Bool) (deadlineMs : Nat := 0)
     : CoreM (Array CorpusManifestEntry) := do
@@ -698,7 +810,7 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
   for vc in scheduled do
     -- Past the budget, keep emitting records but stop attempting reverse-elab.
     let attemptReverse := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
-    out := out.push (← buildEntry srcMap declSrcMap simpArgMap reverseElab closers vc.info attemptReverse)
+    out := out.push (← buildEntry srcMap declSrcMap scopeMap simpArgMap reverseElab closers vc.info attemptReverse)
   return out.qsort (fun a b => a.name < b.name)
 
 /-- The in-process corpus-collector entry point: build the corpus manifest entries
@@ -716,10 +828,11 @@ def corpusManifestCore (r : Frontend.ElabResult)
   Frontend.runCollectorOn r do
     let srcMap := buildSourceMap r.source r.commands
     let declSrcMap := buildDeclSourceMap r.source r.commands
+    let scopeMap := buildScopeMap r.source r.commands
     -- Only build the simp-arg map when closers are on (it walks every proof's
     -- syntax); otherwise it is unused.
     let simpArgMap ← if closers then buildSimpArgMap r.source r.commands else pure {}
-    foldCorpusEntries srcMap declSrcMap simpArgMap
+    foldCorpusEntries srcMap declSrcMap scopeMap simpArgMap
       includeInternal includePrivate reverseElab closers reverseDeadlineMs
 
 end Corpus
