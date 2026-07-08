@@ -45,18 +45,6 @@ def grindInProofEntryToRecord (e : GrindInProofEntry) (relFile : String)
     coverageGap      := e.coverageGap
     isPrivate        := e.isPrivate }
 
-/-- Summary of an in-proof grind-extraction run. File-level counters plus
-per-call-site outcome counts. -/
-structure GrindInProofRunStats where
-  filesTotal   : Nat := 0
-  filesOk      : Nat := 0
-  filesEmpty   : Nat := 0  -- elaborated but produced 0 grind call sites
-  filesError   : Nat := 0
-  closed       : Nat := 0  -- call sites grind closed
-  stuck        : Nat := 0  -- grind ran but could not close
-  errored      : Nat := 0  -- grind threw / site skipped
-  skipped      : Nat := 0  -- past the per-file deadline
-  deriving Inhabited
 
 /-- Per-file in-proof grind timeout (ms). See `GrindExtract.grindFileTimeoutMs`. -/
 def grindInProofFileTimeoutMs : Nat := 600000
@@ -67,9 +55,9 @@ errors are logged to stderr and skipped (one bad file never aborts the run).
 
 `unsafe` because in-process elaboration runs imported modules' interpreted
 `initialize` code (see `Frontend.elaborateFile`). -/
-unsafe def extractGrindInProofViaWorkers (projectRoot : System.FilePath)
+unsafe def extractGrindInProofViaFrontend (projectRoot : System.FilePath)
     (files : Array Discover.DiscoveredFile) (includePrivate : Bool)
-    : IO (Array GrindInProofRecord × Array String × GrindInProofRunStats) := do
+    : IO (Array GrindInProofRecord × Array String × GrindRunStats) := do
   let _ := projectRoot  -- parity with the old signature; discovery already resolved paths
   Frontend.initFrontend
   let grindDeadlineMs := grindInProofFileTimeoutMs * 4 / 5
@@ -79,7 +67,7 @@ unsafe def extractGrindInProofViaWorkers (projectRoot : System.FilePath)
     pure (df, avail, entries)
   let mut recs      : Array GrindInProofRecord := #[]
   let mut available : Std.HashSet String := {}
-  let mut stats     : GrindInProofRunStats := { filesTotal := files.size }
+  let mut stats     : GrindRunStats := { filesTotal := files.size }
   for res in results do
     match res with
     | .ok (df, avail, entries) =>

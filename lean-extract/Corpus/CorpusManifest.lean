@@ -219,36 +219,13 @@ private def fmtNames (self : Name) (ns : Array Name) : Array String :=
   let uniq := strs.eraseDups.filter (· != selfStr)
   (uniq.mergeSort (· < ·)).toArray
 
-/-! ## Corpus-eligibility filter (parity with the import-based extractor)
+/-! ## Corpus-eligibility filter
 
-`Common.foldUserConstants` keeps every module-local non-internal-detail constant,
-but the corpus schema (lean-extract `Corpus/Extract.lean`) drops more: auto-
-generated companions, constructors/recursors (unless `--include-internal`),
-private names (unless `--include-private`), and range-less synthetic theorems
-(`.injEq`/`.sizeOf_spec`/`.brecOn`/… that survive but have no authored source).
-Without this filter the worker corpus over-emits relative to the baseline, so we
-port the predicates here (they need the `Environment`, which the thin client
-lacks — hence server-side). Kept textually in sync with `Extract.lean:82-176`
-and `Extract.lean:305-308`. -/
+The shared predicates (`CollectCommon.alwaysSkip` etc.) exclude compiler
+noise. This filter additionally drops constructors/recursors (unless
+`--include-internal`), private names (unless `--include-private`), and
+range-less synthetic theorems (`.injEq`/`.sizeOf_spec`/`.brecOn`/…). -/
 
-/-- Compiler-synthesized name fragments that slip past `isInternalDetail` but are
-never corpus material. Mirrors `Extract.hasGeneratedTag`. -/
-private def hasGeneratedTag (n : Name) : Bool :=
-  let s := n.toString
-  let containsTag (tag : String) : Bool := (s.splitOn tag).length > 1
-  containsTag "._proof_" || containsTag "._eq_" || containsTag "._eqDef"
-    || containsTag "._sunfold" || containsTag "._unfold"
-
-/-- Auto-generated `def` equation-compiler theorems (`eq_def`/`induct` suffix).
-Mirrors `Extract.isGeneratedTheoremSuffix`. -/
-private def isGeneratedTheoremSuffix : Name → Bool
-  | .str _ s => s == "eq_def" || s == "induct"
-  | _        => false
-
-/-- Names always dropped from the corpus. Mirrors `Extract.alwaysSkip`. -/
-private def alwaysSkip (env : Environment) (n : Name) : Bool :=
-  Lean.isAuxRecursor env n || Lean.isNoConfusion env n || n.isAnonymous
-    || hasGeneratedTag n || isGeneratedTheoremSuffix n || env.isProjectionFn n
 
 /-- The full corpus-eligibility test applied per constant inside the collector,
 mirroring `Extract.shouldSkip` (minus the owned-module check — in the worker the
@@ -257,7 +234,7 @@ plugin already restricts to module-local user constants) plus
 `true` to KEEP the constant. -/
 private def corpusEligible (env : Environment) (includeInternal includePrivate : Bool)
     (name : Name) (info : ConstantInfo) : CoreM Bool := do
-  if alwaysSkip env name then return false
+  if CollectCommon.alwaysSkip env name then return false
   unless includeInternal do
     -- A private decl (`_private.…`) is internal-detail by name but is user-authored
     -- material: keep it iff its UNMANGLED user name is itself not internal-detail
@@ -276,77 +253,7 @@ private def corpusEligible (env : Environment) (includeInternal includePrivate :
   | .thmInfo _ => return (← Lean.findDeclarationRanges? name).isSome
   | _          => return true
 
-/-! ## Transitive premise cone (project-owned constants)
 
-`premises` is the transitive cone of PROJECT-OWNED constants reachable from a
-declaration's term, ported from the import-based extractor's `collectPremises`
-(`lean-extract` `Corpus/Extract.lean`). The semantics differ from that port in
-one essential way driven by the worker model: in the import-based extractor the
-project's files are *imported* (they carry a module index) and the only
-index-less constants are core builtins, so ownership keyed off the module name.
-In the WORKER, the file under study is being *elaborated*, so ITS OWN constants
-carry NO module index (`getModuleIdxFor? = none`) while everything else
-(core/Std/Mathlib AND any imported project files) is indexed. Ownership here
-therefore means: index-less (defined by this file) OR indexed under the project
-root prefix (another file of the same project). The project root is the first
-component of the worker's main module name (e.g. `LeanSQLite` for
-`LeanSQLite.Basic`).
-
-Note premises deliberately do NOT use the `CollectCommon.isUserConstant` record filter:
-the cone legitimately includes private names (`_private.…`) and generated
-companions (`.match_1`, `.proof_1`, `.rec`, …) — they are real owned premises of
-a proof/definition even though they never get their own corpus record. -/
-
-/-- The project root: the first component of the worker's main module name. For
-`LeanSQLite.Basic` this is `LeanSQLite`. Used as the owned-module prefix. -/
-private def projectRoot (env : Environment) : Name :=
-  let rec firstComponent : Name → Name
-    | .str .anonymous s => .str .anonymous s
-    | .num .anonymous n => .num .anonymous n
-    | .str p _          => firstComponent p
-    | .num p _          => firstComponent p
-    | .anonymous        => .anonymous
-  firstComponent env.mainModule
-
-/-- True iff `n` is owned by the project under study: either defined by the file
-being elaborated (no module index) or by an imported module sharing the project
-root prefix. Excludes core/Std/Mathlib. -/
-private def isOwnedName (env : Environment) (root : Name) (n : Name) : Bool :=
-  match env.getModuleIdxFor? n with
-  | none     => true  -- defined by the file under elaboration
-  | some idx =>
-    match env.allImportedModuleNames[idx.toNat]? with
-    | some m => root == m || root.isPrefixOf m
-    | none   => false
-
-/-- Transitive premise cone for `root`: BFS over `Environment.constants`
-following only owned constants. The seed is the direct dep set of `root`; for
-each owned constant popped we enqueue its own direct deps. External or absent
-constants are skipped (we never drag Init/Std/Mathlib into the cone). The result
-is owned-only and excludes `root`. Ported from `Corpus/Extract.lean`.
-
-Termination: every popped name is inserted into `visited` before its deps are
-enqueued, and names drawn from a finite environment form a finite set. -/
-private partial def collectPremises (env : Environment) (owned : Name → Bool)
-    (root : Name) : Array Name := Id.run do
-  let some rootCi := env.find? root | return #[]
-  let mut visited : Std.HashSet Name := {}
-  let mut queue   : Array Name := rootCi.getUsedConstantsAsSet.toArray
-  visited := visited.insert root
-  let mut result  : Array Name := #[]
-  while h : queue.size > 0 do
-    let n := queue[queue.size - 1]
-    queue := queue.pop
-    if visited.contains n then continue
-    visited := visited.insert n
-    -- Only owned constants are reported and only owned bodies are expanded.
-    if owned n then
-      result := result.push n
-      if let some ci := env.find? n then
-        for d in ci.getUsedConstantsAsSet.toArray do
-          unless visited.contains d do
-            queue := queue.push d
-  return result
 
 /-! ## SOURCE signature/body via command-`Syntax` navigation
 
@@ -688,8 +595,8 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
   -- ctors/recs/quots get an empty list (matching the import-based extractor).
   let premises := match info with
     | .thmInfo _ | .defnInfo _ =>
-        let root := projectRoot env
-        fmtNames info.name (collectPremises env (isOwnedName env root) info.name)
+        let root := CollectCommon.projectRoot env
+        fmtNames info.name (CollectCommon.collectPremises env (CollectCommon.isOwnedName env root) info.name)
     | _ => #[]
   -- Reverse-elaborated tactic script (theorems only), via `reverseProofGuarded`:
   -- the proof-term SIZE FILTER (`reverseNodeCeiling`) skips obviously-pathological

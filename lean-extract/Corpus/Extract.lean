@@ -2,6 +2,7 @@ import Lean
 import Corpus.Records
 import Corpus.Tags
 import Corpus.ReverseElab
+import Corpus.CollectCommon
 
 /-!
 Core extraction: walk an `Environment` (built by `importModules`) and emit
@@ -71,49 +72,6 @@ private def moduleNameToRelPath (modName : Name) : System.FilePath :=
       (fun acc s => if acc.toString.isEmpty then ⟨s⟩ else acc / s)
   ⟨rel.toString ++ ".lean"⟩
 
-/-- Detect Lean's compiler-synthesized name fragments. These slip past
-`isInternalDetail` for some declarations but are never useful corpus
-material:
-  - `._proof_*`  proof-term lifts from tactic blocks inside `def`s
-  - `._eq_*`     auto-generated equation lemmas for definitions / matches
-  - `._eqDef`    canonical equation form
-  - `._sunfold`  smart-unfolding helper
-  - `._unfold`   unfolder helper -/
-private def hasGeneratedTag (n : Name) : Bool :=
-  let s := n.toString
-  let containsTag (tag : String) : Bool := (s.splitOn tag).length > 1
-  containsTag "._proof_"
-    || containsTag "._eq_"
-    || containsTag "._eqDef"
-    || containsTag "._sunfold"
-    || containsTag "._unfold"
-
-/-- Auto-generated theorems produced by Lean's `def` equation compiler. Their
-last name segment is `eq_def` (canonical equation) or `induct` (custom
-induction principle for a recursive def). They carry no docstring and no
-source range, and they crowd premise tracking with mechanical boilerplate.
-
-We deliberately keep the inductive/structure-level auxiliaries `injEq`,
-`inj`, and `sizeOf_spec` — they encode user-relevant facts (constructor
-injectivity, sizeOf equations) that may legitimately appear as premises in
-authored proofs. -/
-private def isGeneratedTheoremSuffix : Name → Bool
-  | .str _ s => s == "eq_def" || s == "induct"
-  | _        => false
-
-/-- Names not visible to users we should always drop.
-
-We additionally drop structure-projection theorems / functions: when the
-parent type is a structure, names like `Foo.field` are auto-generated
-projections (for Prop-valued structures these surface as theorems). They
-are not authored corpus material and clutter premise tracking. -/
-private def alwaysSkip (env : Environment) (n : Name) : Bool :=
-  Lean.isAuxRecursor env n
-  || Lean.isNoConfusion env n
-  || n.isAnonymous
-  || hasGeneratedTag n
-  || isGeneratedTheoremSuffix n
-  || env.isProjectionFn n
 
 /-- Return a sorted list of fully-qualified names with duplicates removed. -/
 private def fmtNames (ns : Array Name) : List String :=
@@ -121,46 +79,11 @@ private def fmtNames (ns : Array Name) : List String :=
   let uniq := strs.eraseDups
   uniq.mergeSort (fun a b => a < b)
 
-/-- True if `n` belongs to a constant in an owned module. -/
-private def isOwnedName (env : Environment) (isOwnedMod : Name → Bool)
-    (n : Name) : Bool :=
-  match moduleOf? env n with
-  | none   => false
-  | some m => isOwnedMod m
-
-/-- Transitive premise cone for `root`: BFS over `Environment.constants`
-following only owned constants. The seed is the direct dep set of `root`.
-For each owned constant in the worklist we add its own direct deps; external
-or absent constants are skipped (we never drag Init/Std/Mathlib into the
-cone). The result is filtered to owned-only and excludes `root`.
-
-Termination: every popped name is added to `visited` before its deps are
-enqueued, and `Name`s drawn from a finite environment form a finite set. -/
-private def collectPremises (env : Environment) (isOwnedMod : Name → Bool)
-    (root : Name) : Array Name := Id.run do
-  let some rootCi := env.find? root | #[]
-  let mut visited : Std.HashSet Name := {}
-  let mut queue   : Array Name := rootCi.getUsedConstantsAsSet.toArray
-  visited := visited.insert root
-  let mut result  : Array Name := #[]
-  while h : queue.size > 0 do
-    let n := queue[queue.size - 1]
-    queue := queue.pop
-    if visited.contains n then continue
-    visited := visited.insert n
-    -- Only owned constants are reported and only owned bodies are expanded.
-    if isOwnedName env isOwnedMod n then
-      result := result.push n
-      if let some ci := env.find? n then
-        for d in ci.getUsedConstantsAsSet.toArray do
-          unless visited.contains d do
-            queue := queue.push d
-  return result
 
 /-- Should we skip this constant entirely (before doing any heavy work)? -/
 private def shouldSkip (env : Environment) (opts : ExtractOptions)
     (name : Name) (ci : ConstantInfo) : Bool := Id.run do
-  if alwaysSkip env name then return true
+  if CollectCommon.alwaysSkip env name then return true
   unless opts.includeInternal do
     if name.isInternalDetail then return true
     -- Constructors and recursors: dropped unless explicitly included; we have
@@ -240,9 +163,12 @@ private def buildRecord (env : Environment) (opts : ExtractOptions)
   -- term (theorems and defs with bodies). Axioms / opaques / inductives /
   -- quots / structures get an empty list.
   let isOwnedMod := isOwned opts.rootModules
+  let ownedPred := fun n => match moduleOf? env n with
+    | none   => false
+    | some m => isOwnedMod m
   let premisesList : List String := match ci with
     | .thmInfo _ | .defnInfo _ =>
-        let names := collectPremises env isOwnedMod name
+        let names := CollectCommon.collectPremises env ownedPred name
         (fmtNames names).filter (fun s => s != name.toString)
     | _ => []
   -- Transitive axioms (only meaningful for theorems).

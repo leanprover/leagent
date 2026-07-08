@@ -46,17 +46,6 @@ def grindEntryToRecord (e : GrindManifestEntry) (relFile : String)
     isPrivate       := e.isPrivate
     sourceUsesGrind := sourceUsesGrind }
 
-/-- Summary of a grind-extraction run. -/
-structure GrindRunStats where
-  filesTotal   : Nat := 0
-  filesOk      : Nat := 0
-  filesEmpty   : Nat := 0  -- elaborated but produced 0 grind records
-  filesError   : Nat := 0
-  closed       : Nat := 0  -- theorems grind closed
-  stuck        : Nat := 0  -- grind ran but could not close
-  errored      : Nat := 0  -- grind threw
-  skipped      : Nat := 0  -- past the per-file deadline
-  deriving Inhabited
 
 /-- Per-file grind timeout (ms). The per-file fold bounds itself with
 `grindDeadlineMs` set to 80% of this (cheap-first, tail-shed to
@@ -70,7 +59,7 @@ are logged to stderr and skipped (one bad file never aborts the run).
 
 `unsafe` because in-process elaboration runs imported modules' interpreted
 `initialize` code (see `Frontend.elaborateFile`). -/
-unsafe def extractGrindViaWorkers (projectRoot : System.FilePath)
+unsafe def extractGrindViaFrontend (projectRoot : System.FilePath)
     (files : Array Discover.DiscoveredFile) (includePrivate : Bool)
     : IO (Array GrindGoalRecord × Array String × GrindRunStats) := do
   let _ := projectRoot  -- parity with the old signature; discovery already resolved paths

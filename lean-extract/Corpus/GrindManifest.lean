@@ -113,17 +113,6 @@ range (excludes synthetic `.injEq`/`.sizeOf_spec`/…), not an internal detail,
 not a generated companion. This mirrors `CorpusManifest`'s `corpusEligible` for
 theorems, so the grind dataset lines up with the corpus dataset by `name`. -/
 
-/-- Compiler-synthesized name fragments never worth attempting. Mirrors
-`CorpusManifest.hasGeneratedTag`. -/
-private def hasGeneratedTag (n : Name) : Bool :=
-  let s := n.toString
-  let containsTag (tag : String) : Bool := (s.splitOn tag).length > 1
-  containsTag "._proof_" || containsTag "._eq_" || containsTag "._eqDef"
-    || containsTag "._sunfold" || containsTag "._unfold"
-
-private def isGeneratedTheoremSuffix : Name → Bool
-  | .str _ s => s == "eq_def" || s == "induct"
-  | _        => false
 
 /-- Keep iff this is a source-authored theorem grind should attempt. -/
 private def grindEligible (_env : Environment) (includePrivate : Bool)
@@ -131,7 +120,7 @@ private def grindEligible (_env : Environment) (includePrivate : Bool)
   match info with
   | .thmInfo _ =>
     if name.isInternalDetail then return false
-    if hasGeneratedTag name || isGeneratedTheoremSuffix name then return false
+    if CollectCommon.hasGeneratedTag name || CollectCommon.isGeneratedTheoremSuffix name then return false
     if !includePrivate && Lean.isPrivateName name then return false
     -- Range-less synthetic theorems (`.injEq`, `.brecOn`, …) have no authored goal.
     return (← Lean.findDeclarationRanges? name).isSome

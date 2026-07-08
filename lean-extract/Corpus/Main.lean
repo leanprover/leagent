@@ -267,27 +267,9 @@ private def stratifiedSplit (rs : Array ConstRecord) (key : String)
       te := te ++ c
     return (tr, va, te)
 
-/-- Write a list of records as JSONL to `path`, one record per line. -/
-private def writeJsonl (path : System.FilePath)
-    (records : Array ConstRecord) : IO Unit := do
-  IO.FS.writeFile path ""  -- truncate or create
-  let h ← IO.FS.Handle.mk path IO.FS.Mode.write
-  for r in records do
-    h.putStrLn (Lean.toJson r).compress
-  h.flush
-
-/-- Write grind goal records as JSONL to `path`, one per line. -/
-private def writeGrindJsonl (path : System.FilePath)
-    (records : Array GrindGoalRecord) : IO Unit := do
-  IO.FS.writeFile path ""
-  let h ← IO.FS.Handle.mk path IO.FS.Mode.write
-  for r in records do
-    h.putStrLn (Lean.toJson r).compress
-  h.flush
-
-/-- Write in-proof grind records as JSONL to `path`, one per line. -/
-private def writeGrindInProofJsonl (path : System.FilePath)
-    (records : Array GrindInProofRecord) : IO Unit := do
+/-- Write an array of JSON-serializable records as JSONL to `path`, one per line. -/
+private def writeJsonl [Lean.ToJson α] (path : System.FilePath)
+    (records : Array α) : IO Unit := do
   IO.FS.writeFile path ""
   let h ← IO.FS.Handle.mk path IO.FS.Mode.write
   for r in records do
@@ -455,14 +437,14 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
       IO.println s!"corpus-extract: discovered {files.size} source file(s); running grind…"
       let (recs, available, gstats) ←
-        Corpus.extractGrindViaWorkers projectRoot files cli.includePrivate
+        Corpus.extractGrindViaFrontend projectRoot files cli.includePrivate
       IO.println s!"corpus-extract: {gstats.filesOk} ok, {gstats.filesEmpty} empty, \
         {gstats.filesError} error (of {gstats.filesTotal}); \
         theorems: {gstats.closed} closed, {gstats.stuck} stuck, \
         {gstats.errored} error, {gstats.skipped} skipped"
       let grindDir : System.FilePath := outDir / "data" / "grind"
       IO.FS.createDirAll grindDir
-      writeGrindJsonl (grindDir / "train.jsonl") recs
+      writeJsonl (grindDir / "train.jsonl") recs
       -- metadata.json: run summary + the env-wide available-hint set.
       let metaJson := Json.mkObj [
         ("toolVersion",     Json.str toolVersion),
@@ -487,14 +469,14 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
       IO.println s!"corpus-extract: discovered {files.size} source file(s); running in-proof grind…"
       let (recs, available, gstats) ←
-        Corpus.extractGrindInProofViaWorkers projectRoot files cli.includePrivate
+        Corpus.extractGrindInProofViaFrontend projectRoot files cli.includePrivate
       IO.println s!"corpus-extract: {gstats.filesOk} ok, {gstats.filesEmpty} empty, \
         {gstats.filesError} error (of {gstats.filesTotal}); \
         call sites: {gstats.closed} closed, {gstats.stuck} stuck, \
         {gstats.errored} error, {gstats.skipped} skipped"
       let grindDir : System.FilePath := outDir / "data" / "grind-in-proof"
       IO.FS.createDirAll grindDir
-      writeGrindInProofJsonl (grindDir / "train.jsonl") recs
+      writeJsonl (grindDir / "train.jsonl") recs
       -- metadata.json: run summary + the env-wide available-hint set.
       let metaJson := Json.mkObj [
         ("toolVersion",    Json.str toolVersion),
@@ -529,7 +511,7 @@ unsafe def runCli (args : List String) : IO UInt32 := do
           let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
           let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
           IO.println s!"corpus-extract: discovered {files.size} source file(s); driving workers…"
-          let (recs, wstats) ← Corpus.extractViaWorkers projectRoot files tagConfig
+          let (recs, wstats) ← Corpus.extractViaFrontend projectRoot files tagConfig
                                  cli.includeInternal cli.includePrivate cli.reverseElab
                                  cli.reverseClosers
           IO.println s!"corpus-extract: {wstats.filesOk} ok, {wstats.filesEmpty} empty, \
