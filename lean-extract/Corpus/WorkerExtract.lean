@@ -22,9 +22,8 @@ supplies the `file` path (from discovery) and `tags` (from the local `TagConfig`
 and performs the kind-string mapping; the collector computes everything that needs
 an `Environment`.
 
-The name `extractViaWorkers` is kept for source compatibility with `Main.lean`,
-though there are no longer any workers — it now means "the frontend-driven glob
-path" as opposed to the legacy `--enumerate import` walk.
+`extractViaFrontend` is the frontend-driven glob path, as opposed to the legacy
+`--enumerate import` walk.
 -/
 
 namespace Corpus
@@ -133,7 +132,7 @@ from `tagConfig`.
 
 `unsafe` because in-process elaboration runs imported modules' interpreted
 `initialize` code (see `Frontend.elaborateFile`). -/
-unsafe def extractViaWorkers (projectRoot : System.FilePath)
+unsafe def extractViaFrontend (projectRoot : System.FilePath)
     (files : Array Discover.DiscoveredFile)
     (tagConfig : TagConfig) (includeInternal includePrivate reverseElab : Bool)
     (reverseClosers : Bool := false)

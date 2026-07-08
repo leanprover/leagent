@@ -79,4 +79,69 @@ final formatting unmangles, so dependency resolution is unaffected. -/
 def displayName (name : Name) : Name :=
   if Lean.isPrivateName name then Lean.privateToUserName name else name
 
+/-- Compiler-synthesized name fragments that slip past `isInternalDetail` but are
+never corpus material (`._proof_*`, `._eq_*`, `._eqDef`, `._sunfold`, `._unfold`). -/
+def hasGeneratedTag (n : Name) : Bool :=
+  let s := n.toString
+  let containsTag (tag : String) : Bool := (s.splitOn tag).length > 1
+  containsTag "._proof_" || containsTag "._eq_" || containsTag "._eqDef"
+    || containsTag "._sunfold" || containsTag "._unfold"
+
+/-- Auto-generated `def` equation-compiler theorems (`eq_def`/`induct` suffix). -/
+def isGeneratedTheoremSuffix : Name → Bool
+  | .str _ s => s == "eq_def" || s == "induct"
+  | _        => false
+
+/-- Names always dropped from the corpus: aux recursors, noConfusion, anonymous,
+generated-tag names, equation-compiler suffixes, projections. -/
+def alwaysSkip (env : Environment) (n : Name) : Bool :=
+  Lean.isAuxRecursor env n || Lean.isNoConfusion env n || n.isAnonymous
+    || hasGeneratedTag n || isGeneratedTheoremSuffix n || env.isProjectionFn n
+
+/-- The project root: the first component of the environment's main module name.
+For `LeanSQLite.Basic` this is `LeanSQLite`. Used as the owned-module prefix. -/
+def projectRoot (env : Environment) : Name :=
+  let rec firstComponent : Name → Name
+    | .str .anonymous s => .str .anonymous s
+    | .num .anonymous n => .num .anonymous n
+    | .str p _          => firstComponent p
+    | .num p _          => firstComponent p
+    | .anonymous        => .anonymous
+  firstComponent env.mainModule
+
+/-- True iff `n` is owned by the project under study: either defined by the file
+being elaborated (no module index) or by an imported module sharing the project
+root prefix. Excludes core/Std/Mathlib. -/
+def isOwnedName (env : Environment) (root : Name) (n : Name) : Bool :=
+  match env.getModuleIdxFor? n with
+  | none     => true
+  | some idx =>
+    match env.allImportedModuleNames[idx.toNat]? with
+    | some m => root == m || root.isPrefixOf m
+    | none   => false
+
+/-- Transitive premise cone: BFS over `Environment.constants` following only
+constants for which `owned` returns true. The seed is the direct dep set of
+`root`; for each owned constant popped we enqueue its own direct deps. External or
+absent constants are skipped. The result is owned-only and excludes `root`. -/
+partial def collectPremises (env : Environment) (owned : Name → Bool)
+    (root : Name) : Array Name := Id.run do
+  let some rootCi := env.find? root | return #[]
+  let mut visited : Std.HashSet Name := {}
+  let mut queue   : Array Name := rootCi.getUsedConstantsAsSet.toArray
+  visited := visited.insert root
+  let mut result  : Array Name := #[]
+  while h : queue.size > 0 do
+    let n := queue[queue.size - 1]
+    queue := queue.pop
+    if visited.contains n then continue
+    visited := visited.insert n
+    if owned n then
+      result := result.push n
+      if let some ci := env.find? n then
+        for d in ci.getUsedConstantsAsSet.toArray do
+          unless visited.contains d do
+            queue := queue.push d
+  return result
+
 end Corpus.CollectCommon
