@@ -539,12 +539,106 @@ private def buildSimpArgMap (src : String) (commands : Array Syntax)
           m := m.insert (p.line, p.column) (simpPoolClosers pool)
   return m
 
+
+/-- Hard wall-clock budget for a single theorem's reverse-elab child process. -/
+def reverseProofTimeoutMs : Nat := 15000
+
+private partial def waitChildWithTimeout {cfg : IO.Process.StdioConfig}
+    (child : IO.Process.Child cfg) (started timeoutMs : Nat) : IO (Option UInt32) := do
+  match (← child.tryWait) with
+  | some code => return some code
+  | none =>
+      if (← IO.monoMsNow) - started ≥ timeoutMs then
+        try child.kill catch _ => pure ()
+        let _ ← child.wait
+        return none
+      IO.sleep (100 : UInt32)
+      waitChildWithTimeout child started timeoutMs
+
+private def parseScriptResult (stdout : String) : Option ReverseElab.ScriptResult :=
+  match Json.parse stdout.trimAscii.toString >>= fromJson? with
+  | .ok r => some r
+  | .error _ => none
+
+/-- Internal child-process entry point: elaborate one file, reverse-elaborate one
+theorem in-process, print the `ScriptResult` as JSON in `Main.lean`. -/
+unsafe def reverseOneInFile (absPath : System.FilePath) (moduleName declName : Name)
+    (closers : Bool) : IO ReverseElab.ScriptResult := do
+  Frontend.initFrontend
+  let importLock : Frontend.ImportLock ← Std.Mutex.new ()
+  let df : Discover.DiscoveredFile := {
+    absPath := absPath
+    module := moduleName
+    relPath := absPath.toString
+  }
+  let r ← Frontend.elaborateFile importLock df
+  Frontend.runCollectorOn r do
+    let env ← getEnv
+    let some info := env.find? declName
+      | return { script := "", method := "error" }
+    match info with
+    | .thmInfo _ =>
+        match info.value? (allowOpaque := true) with
+        | none => return { script := "", method := "error" }
+        | some v =>
+            let simpArgMap ← if closers then buildSimpArgMap r.source r.commands else pure {}
+            let ranges? ← Lean.findDeclarationRanges? info.name
+            let extraClosers := if closers then
+                match ranges? with
+                | some rg => simpArgMap.getD (rg.selectionRange.pos.line, rg.selectionRange.pos.column) #[]
+                | none    => #[]
+              else #[]
+            reverseProofGuarded info.type v closers extraClosers
+    | _ => return { script := "", method := "error" }
+
+/-- Run one theorem's reverse-elab in a child process so a pathological proof can
+be killed without pinning the main extraction. -/
+def reverseProofInChild (file : Frontend.ElabResult) (declName : Name)
+    (enableClosers : Bool) (timeoutMs : Nat := reverseProofTimeoutMs)
+    : CoreM ReverseElab.ScriptResult := do
+  let exe ← IO.appPath
+  let args :=
+    #["--internal-reverse-one",
+      "--source-file", file.file.absPath.toString,
+      "--module", file.file.module.toString,
+      "--decl", declName.toString] ++
+    (if enableClosers then #["--closers"] else #[])
+  let child ← IO.Process.spawn {
+    cmd := exe.toString
+    args := args
+    stdin := .null
+    stdout := .piped
+    stderr := .piped
+    setsid := true
+  }
+  let stdoutTask ← IO.asTask child.stdout.readToEnd Task.Priority.dedicated
+  let stderrTask ← IO.asTask child.stderr.readToEnd Task.Priority.dedicated
+  let started ← IO.monoMsNow
+  match (← waitChildWithTimeout child started timeoutMs) with
+  | none =>
+      let _ ← IO.wait stdoutTask
+      let _ ← IO.wait stderrTask
+      IO.eprintln s!"corpus-extract: reverse-elab timed out for {declName} after {timeoutMs}ms"
+      return { script := "", method := "timeout" }
+  | some code =>
+      let stdout ← IO.ofExcept (← IO.wait stdoutTask)
+      let stderr ← IO.ofExcept (← IO.wait stderrTask)
+      if code != 0 then
+        IO.eprintln s!"corpus-extract: reverse-elab child failed for {declName} (exit {code}): {stderr.trimAscii}"
+        return { script := "", method := "error" }
+      match parseScriptResult stdout with
+      | some r => return r
+      | none =>
+          IO.eprintln s!"corpus-extract: reverse-elab child returned invalid JSON for {declName}: {stdout.trimAscii}"
+          return { script := "", method := "error" }
+
 private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
     (declSrcMap : Std.HashMap (Nat × Nat) String)
     (scopeMap : Std.HashMap (Nat × Nat) DeclScope)
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
     (reverseElab closers : Bool) (info : ConstantInfo)
-    (attemptReverse : Bool := true) : CoreM CorpusManifestEntry := do
+    (attemptReverse : Bool := true) (reverseFile? : Option Frontend.ElabResult := none)
+    : CoreM CorpusManifestEntry := do
   let env ← getEnv
   let typeStr ← ppExpr120 info.type
   let value? ← match info.value? (allowOpaque := true) with
@@ -622,7 +716,9 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
                   | some r => simpArgMap.getD (r.selectionRange.pos.line, r.selectionRange.pos.column) #[]
                   | none   => #[]
                 else #[]
-              let r ← reverseProofGuarded info.type v closers extraClosers
+              let r ← match reverseFile? with
+                | some file => reverseProofInChild file info.name closers
+                | none      => reverseProofGuarded info.type v closers extraClosers
               pure (if r.script.isEmpty then none else some r.script, some r.method)
           | none => pure (none, none)
         else pure (none, none)
@@ -668,6 +764,15 @@ private def reverseCost (info : ConstantInfo) : Nat :=
       | none   => 0
   | _ => 0
 
+private def isTheoremInfo : ConstantInfo → Bool
+  | .thmInfo _ => true
+  | _          => false
+
+private def theoremProgressStep (total : Nat) : Nat :=
+  if total ≤ 20 then 1
+  else if total ≤ 100 then 10
+  else 25
+
 /-- Fold `buildEntry` over the module-local user constants that also pass the
 corpus-eligibility filter (`corpusEligible`), so the manifest matches the
 import-based extractor's record set. Unlike `Common.foldUserConstants`, this
@@ -688,6 +793,7 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
     (scopeMap : Std.HashMap (Nat × Nat) DeclScope)
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
     (includeInternal includePrivate reverseElab closers : Bool) (deadlineMs : Nat := 0)
+    (fileLabel : String := "") (reverseFile? : Option Frontend.ElabResult := none)
     : CoreM (Array CorpusManifestEntry) := do
   let env ← getEnv
   -- Source the file-local constants from the shared VERIFICATION substrate
@@ -706,6 +812,13 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
   for vc in (← Verify.verifiedFileConstants) do
     if (← corpusEligible env includeInternal includePrivate vc.info.name vc.info) then
       eligible := eligible.push vc
+  let theoremTotal := eligible.foldl (fun n vc => if isTheoremInfo vc.info then n + 1 else n) 0
+  let logPrefix :=
+    if fileLabel.isEmpty then "corpus-extract: theorem extraction"
+    else s!"corpus-extract: theorem extraction {fileLabel}"
+  if theoremTotal > 0 then
+    IO.eprintln s!"{logPrefix}: 0/{theoremTotal} theorem(s) starting \
+      ({eligible.size} total record(s), reverse-elab={reverseElab})"
   -- Cheap-first scheduling only matters when we actually reverse-elaborate under a
   -- deadline; otherwise keep the original (name) order to minimize behavior change.
   let scheduled :=
@@ -714,10 +827,19 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
     else eligible
   let startMs ← IO.monoMsNow
   let mut out : Array CorpusManifestEntry := #[]
+  let mut theoremDone := 0
+  let progressStep := theoremProgressStep theoremTotal
   for vc in scheduled do
     -- Past the budget, keep emitting records but stop attempting reverse-elab.
     let attemptReverse := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
-    out := out.push (← buildEntry srcMap declSrcMap scopeMap simpArgMap reverseElab closers vc.info attemptReverse)
+    let entry ← buildEntry srcMap declSrcMap scopeMap simpArgMap reverseElab closers vc.info attemptReverse reverseFile?
+    out := out.push entry
+    if isTheoremInfo vc.info then
+      theoremDone := theoremDone + 1
+      if theoremDone == theoremTotal || theoremDone % progressStep == 0 then
+        let method := entry.proofMethod.getD "none"
+        IO.eprintln s!"{logPrefix}: {theoremDone}/{theoremTotal} theorem(s) \
+          last={entry.name} proof_method={method}"
   return out.qsort (fun a b => a.name < b.name)
 
 /-- The in-process corpus-collector entry point: build the corpus manifest entries
@@ -740,6 +862,6 @@ def corpusManifestCore (r : Frontend.ElabResult)
     -- syntax); otherwise it is unused.
     let simpArgMap ← if closers then buildSimpArgMap r.source r.commands else pure {}
     foldCorpusEntries srcMap declSrcMap scopeMap simpArgMap
-      includeInternal includePrivate reverseElab closers reverseDeadlineMs
+      includeInternal includePrivate reverseElab closers reverseDeadlineMs r.file.relPath (some r)
 
 end Corpus

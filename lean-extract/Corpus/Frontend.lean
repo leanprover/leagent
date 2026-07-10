@@ -6,7 +6,6 @@ Authors: Paul Govereau
 -/
 import Lean
 import Std.Sync.Mutex
-import Std.Sync.Semaphore
 import Corpus.Discover
 
 /-!
@@ -35,11 +34,11 @@ exactly the three things the plugins read from `doc.cmdSnaps`/`doc.meta.text`:
 UNSYNCHRONIZED process-global refs (`importingRef`/`runInitializersRef`, the env-
 extension/attribute registries) via `Lean.withImporting`. Lean's own source is
 explicit that only ONE thread may be inside that region at a time. So when we run
-files in parallel we serialize the header/import phase behind a single process-wide
-mutex; the per-command elaboration (`IO.processCommands`) — which touches only the
-per-file `Environment` value and per-file monad state — runs OUTSIDE the lock,
-fully parallel. That keeps essentially all the parallelism (elaboration dominates
-runtime) while making the global-ref accesses single-threaded.
+files in parallel we first warm up the registry by importing discovered external
+header imports once, single-threaded, then serialize each file's header/import
+phase behind one process-wide mutex. The per-command elaboration (`IO.processCommands`)
+— which touches only the per-file `Environment` value and per-file monad state —
+runs OUTSIDE the lock, in parallel.
 
 `withImporting`'s `finally` unconditionally resets `runInitializersRef := false`,
 so `enableInitializersExecution` must be re-run INSIDE the lock before EVERY
@@ -156,23 +155,49 @@ def runCollectorOn {α} (r : ElabResult) (collect : CoreM α) : IO α := do
   let (a, _) ← collect.toIO coreCtx coreSt
   return a
 
-/-- The default bound on concurrent file elaborations.
-
-SET TO 1 (sequential) because in-process cross-file parallelism is UNSAFE: Lean's
-environment-extension registry (`envExtensionsRef`) is a process-global, lock-free
-array that `importModules (loadExts := true)` GROWS as it runs imported modules'
-interpreted `initialize` blocks. Serializing the import phase (the `importLock`)
-is not enough — an import on one thread growing the registry while another thread
-is mid-elaboration leaves that thread's env with a stale-sized extension-state
-array, and the next extension access panics ("invalid environment extension has
-been accessed"). This reliably fires under `--reverse-elab` (heavy parallel tactic
-elaboration). See `elaborateFiles` for the (kept, but for now unused-beyond-1)
-parallel machinery and the warmup path that could make >1 safe.
-
-Note the batch tool was already EFFECTIVELY sequential before this migration (its
-`WorkerPool` visited each unique file URI once, so only one worker ran at a time),
-so `1` is not a regression — it matches prior throughput while being correct. -/
+/-- Default to sequential execution unless the caller opts into `--jobs`.
+Parallel execution is available after `warmupImportRegistry`, but `1` remains the
+least surprising default for memory use and for projects with source files that
+register new process-global Lean extensions while being elaborated. -/
 def defaultMaxConcurrent : Nat := 1
+
+private def sameImport (a b : Import) : Bool :=
+  a.module == b.module && a.importAll == b.importAll &&
+    a.isExported == b.isExported && a.isMeta == b.isMeta
+
+private def pushImportOnce (imports : Array Import) (imp : Import) : Array Import :=
+  if imports.any (sameImport · imp) then imports else imports.push imp
+
+private def headerImportsOfFile (df : Discover.DiscoveredFile) : IO (Array Import) := do
+  let source ← IO.FS.readFile df.absPath
+  let inputCtx := Parser.mkInputContext source df.absPath.toString
+  let (header, _, _) ← Parser.parseHeader inputCtx
+  return Lean.Elab.headerToImports header
+
+private def isDiscoveredModule (files : Array Discover.DiscoveredFile) (module : Name) : Bool :=
+  files.any (fun df => df.module == module)
+
+private def collectExternalHeaderImports (files : Array Discover.DiscoveredFile) : IO (Array Import) := do
+  let mut imports : Array Import := #[]
+  for df in files do
+    for imp in (← headerImportsOfFile df) do
+      unless isDiscoveredModule files imp.module do
+        imports := pushImportOnce imports imp
+  return imports
+
+/-- Import external header dependencies once before parallel elaboration starts.
+This forces dependency environment extensions and initializers to register
+single-threaded, avoiding the known registry-growth race without eagerly loading
+the package being extracted as `.olean`s. It cannot protect packages whose source
+files themselves register new process-global extensions during elaboration, so
+callers can keep `--jobs 1` for those packages. -/
+unsafe def warmupImportRegistry (files : Array Discover.DiscoveredFile) : IO Unit := do
+  let imports ← collectExternalHeaderImports files
+  unless imports.isEmpty do
+    IO.eprintln s!"corpus-extract: warming Lean import registry with {imports.size} external import(s)"
+    Lean.enableInitializersExecution
+    let _ ← Lean.importModules imports {} (trustLevel := 1024) (loadExts := true)
+    IO.eprintln "corpus-extract: Lean import registry warmup complete"
 
 /-- Elaborate every discovered file and apply `f` to each. Results are returned IN
 INPUT ORDER; a file whose elaboration or collector throws is captured as
@@ -185,21 +210,16 @@ re-run inside `elaborateFile`).
 **sequential** fast path: each file runs to completion on the calling thread, no
 threads or semaphore. This is the correct-and-current mode.
 
-`maxConcurrent > 1` takes the parallel path (a `Std.Semaphore` gates at most
-`maxConcurrent` file bodies on dedicated threads). **This path is currently unsafe
-to use directly**: per-file `importModules` grows the process-global, lock-free
-`envExtensionsRef` on first sight of a registering module, racing concurrent
-elaboration on other threads (the `invalid environment extension` panic). To make
-it safe, a caller must first WARM UP the registry — import the union of every
-file's header imports once, single-threaded, before calling with `maxConcurrent >
-1` — so no per-file import grows the registry during the parallel window. Until
-that warmup exists, `defaultMaxConcurrent := 1` keeps every caller on the safe
-sequential path. The machinery is kept so the future warmup work is a small,
-localized change. -/
-def elaborateFiles {α} (files : Array Discover.DiscoveredFile)
+`maxConcurrent > 1` first warms up imported modules single-threaded, then takes
+the parallel path in bounded batches of at most `maxConcurrent` dedicated tasks.
+The per-file header/import phase remains serialized behind `importLock`; the
+command elaboration and collector body run in parallel. -/
+unsafe def elaborateFiles {α} (files : Array Discover.DiscoveredFile)
     (f : ImportLock → Discover.DiscoveredFile → IO α)
     (maxConcurrent : Nat := defaultMaxConcurrent)
     : IO (Array (Except IO.Error α)) := do
+  if maxConcurrent > 1 then
+    warmupImportRegistry files
   let importLock : ImportLock ← Std.Mutex.new ()
   if maxConcurrent ≤ 1 then
     -- Sequential: run each file on the calling thread; `EIO.toBaseIO` captures a
@@ -207,13 +227,19 @@ def elaborateFiles {α} (files : Array Discover.DiscoveredFile)
     -- batch. Order is input order.
     files.mapM fun df => (f importLock df).toBaseIO
   else
-    -- Parallel path (requires registry warmup — see docstring). A semaphore caps
-    -- how many file bodies run at once; `IO.asTask` wraps each result as Except.
-    let sem ← Std.Semaphore.new maxConcurrent
-    let tasks ← files.mapM fun df =>
-      IO.asTask (prio := .dedicated) do
-        let _ ← IO.wait (← sem.acquire).result?
-        try f importLock df finally sem.release
-    tasks.mapM fun t => IO.wait t
+    -- Parallel path. Run bounded batches so `--jobs N` never creates more than N
+    -- dedicated file tasks at a time.
+    let mut out : Array (Except IO.Error α) := #[]
+    let mut i := 0
+    while i < files.size do
+      let stop := Nat.min files.size (i + maxConcurrent)
+      let batch := files.extract i stop
+      let tasks ← batch.mapM fun df =>
+        IO.asTask (prio := .dedicated) do
+          f importLock df
+      let results ← tasks.mapM fun t => IO.wait t
+      out := out ++ results
+      i := stop
+    return out
 
 end Corpus.Frontend

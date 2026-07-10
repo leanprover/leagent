@@ -67,6 +67,8 @@ structure CliArgs where
   includePrivate     : Bool := true
   reverseElab        : Bool := false
   reverseClosers     : Bool := false
+  jobs               : Nat := Frontend.defaultMaxConcurrent
+  isolateFiles       : Bool := false
   splitByTag         : Option String := none
   seed               : Nat := 0
   datasetCardConfig  : Option System.FilePath := none
@@ -90,7 +92,7 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--enumerate glob|import] [--list-orphans]
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
-                     [--reverse-elab] [--closers]
+                     [--reverse-elab] [--closers] [--jobs <n>] [--isolate-files]
                      [--grind-manifest] [--grind-in-proof]
                      [--split-by-tag <key>] [--seed <n>]
                      [--dataset-card-config <path>]
@@ -110,6 +112,14 @@ writes data/grind/train.jsonl (the interactive script, the `grind only`
 reconstruction, and the activated/used lemma triple per theorem), plus the
 env-wide available-hint set into metadata.json. This REPLACES corpus extraction.
 
+--jobs controls frontend corpus extraction concurrency. The default is 1; values
+> 1 warm up external Lean imports single-threaded, then elaborate files in
+bounded parallel batches while serializing each file's import phase.
+
+--isolate-files extracts each discovered source file in a fresh child process and
+merges the JSONL in the parent. It is slower, but bounds memory for large projects
+whose frontend elaboration memory accumulates across files.
+
 --grind-in-proof instead captures grind data at the grind CALL SITES inside
 existing proofs: it walks each proof, re-runs instrumented grind on every
 subgoal a source `grind` was applied to (using the author's hints), and writes
@@ -120,6 +130,83 @@ mvcgen). REPLACES corpus extraction; mutually exclusive with --grind-manifest.
 
 private def parseNat? (s : String) : Option Nat :=
   s.toNat?
+
+
+structure ReverseOneArgs where
+  sourceFile : Option System.FilePath := none
+  moduleName : Option Name := none
+  declName   : Option Name := none
+  closers    : Bool := false
+  deriving Inhabited
+
+private def parseReverseOneArgs? (args : List String) : Option (Except String ReverseOneArgs) :=
+  if !args.contains "--internal-reverse-one" then none else some (go args {})
+where
+  go : List String → ReverseOneArgs → Except String ReverseOneArgs
+    | [], acc =>
+        if acc.sourceFile.isNone then .error "--internal-reverse-one expects --source-file"
+        else if acc.moduleName.isNone then .error "--internal-reverse-one expects --module"
+        else if acc.declName.isNone then .error "--internal-reverse-one expects --decl"
+        else .ok acc
+    | "--internal-reverse-one" :: xs, acc => go xs acc
+    | "--source-file" :: v :: xs, acc => go xs { acc with sourceFile := some v }
+    | "--module" :: v :: xs, acc => go xs { acc with moduleName := some v.toName }
+    | "--decl" :: v :: xs, acc => go xs { acc with declName := some v.toName }
+    | "--closers" :: xs, acc => go xs { acc with closers := true }
+    | x :: _, _ => .error s!"unknown --internal-reverse-one argument: {x}"
+
+private unsafe def runReverseOneCli (cfg : ReverseOneArgs) : IO UInt32 := do
+  let some sourceFile := cfg.sourceFile | return 2
+  let some moduleName := cfg.moduleName | return 2
+  let some declName := cfg.declName | return 2
+  let r ← Corpus.reverseOneInFile sourceFile moduleName declName cfg.closers
+  IO.println (Lean.toJson r).compress
+  return 0
+
+
+structure ExtractOneArgs where
+  sourceFile      : Option System.FilePath := none
+  moduleName      : Option Name := none
+  relPath         : Option String := none
+  config          : Option System.FilePath := none
+  includeInternal : Bool := false
+  includePrivate  : Bool := true
+  reverseElab     : Bool := false
+  reverseClosers  : Bool := false
+  deriving Inhabited
+
+private def parseExtractOneArgs? (args : List String) : Option (Except String ExtractOneArgs) :=
+  if !args.contains "--internal-extract-one" then none else some (go args {})
+where
+  go : List String → ExtractOneArgs → Except String ExtractOneArgs
+    | [], acc =>
+        if acc.sourceFile.isNone then .error "--internal-extract-one expects --source-file"
+        else if acc.moduleName.isNone then .error "--internal-extract-one expects --module"
+        else if acc.relPath.isNone then .error "--internal-extract-one expects --rel-path"
+        else .ok acc
+    | "--internal-extract-one" :: xs, acc => go xs acc
+    | "--source-file" :: v :: xs, acc => go xs { acc with sourceFile := some v }
+    | "--module" :: v :: xs, acc => go xs { acc with moduleName := some v.toName }
+    | "--rel-path" :: v :: xs, acc => go xs { acc with relPath := some v }
+    | "--config" :: v :: xs, acc => go xs { acc with config := some v }
+    | "--include-internal" :: xs, acc => go xs { acc with includeInternal := true }
+    | "--no-private" :: xs, acc => go xs { acc with includePrivate := false }
+    | "--reverse-elab" :: xs, acc => go xs { acc with reverseElab := true }
+    | "--closers" :: xs, acc => go xs { acc with reverseElab := true, reverseClosers := true }
+    | x :: _, _ => .error s!"unknown --internal-extract-one argument: {x}"
+
+private unsafe def runExtractOneCli (cfg : ExtractOneArgs) : IO UInt32 := do
+  let some sourceFile := cfg.sourceFile | return 2
+  let some moduleName := cfg.moduleName | return 2
+  let some relPath := cfg.relPath | return 2
+  let tagConfig ← match cfg.config with
+    | none => pure TagConfig.empty
+    | some path => Corpus.loadConfig path
+  let df : Corpus.Discover.DiscoveredFile := { absPath := sourceFile, module := moduleName, relPath := relPath }
+  let recs ← Corpus.extractOneFileViaFrontend "." df tagConfig cfg.includeInternal cfg.includePrivate cfg.reverseElab cfg.reverseClosers
+  for r in recs do
+    IO.println (Lean.toJson r).compress
+  return 0
 
 private def parseArgs (args : List String) : Except String CliArgs :=
   go args {}
@@ -146,6 +233,14 @@ where
         go xs { acc with reverseElab := true }
     | "--closers" :: xs, acc =>
         go xs { acc with reverseElab := true, reverseClosers := true }
+    | "--jobs" :: v :: xs, acc =>
+        match parseNat? v with
+        | some n =>
+            if n == 0 then .error "--jobs expects a positive integer"
+            else go xs { acc with jobs := n }
+        | none   => .error s!"--jobs expects a positive integer, got: {v}"
+    | "--isolate-files" :: xs, acc =>
+        go xs { acc with isolateFiles := true }
     | "--split-by-tag" :: v :: xs, acc =>
         if v.startsWith "--" then .error "--split-by-tag expects a tag key"
         else go xs { acc with splitByTag := some v }
@@ -377,6 +472,18 @@ private unsafe def reexecUnderLake (project : System.FilePath)
 applies filters/splits, then writes JSONL files, metadata, and (optionally)
 a HF dataset card. -/
 unsafe def runCli (args : List String) : IO UInt32 := do
+  match parseExtractOneArgs? args with
+  | some (.ok cfg) => return (← runExtractOneCli cfg)
+  | some (.error e) =>
+      IO.eprintln s!"corpus-extract: {e}"
+      return 2
+  | none => pure ()
+  match parseReverseOneArgs? args with
+  | some (.ok cfg) => return (← runReverseOneCli cfg)
+  | some (.error e) =>
+      IO.eprintln s!"corpus-extract: {e}"
+      return 2
+  | none => pure ()
   if args.contains "--help" || args.contains "-h" then
     IO.println usage
     return 0
@@ -510,10 +617,14 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       | .glob => do
           let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
           let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
-          IO.println s!"corpus-extract: discovered {files.size} source file(s); driving workers…"
-          let (recs, wstats) ← Corpus.extractViaFrontend projectRoot files tagConfig
-                                 cli.includeInternal cli.includePrivate cli.reverseElab
-                                 cli.reverseClosers
+          IO.println s!"corpus-extract: discovered {files.size} source file(s); driving frontend (jobs={cli.jobs})…"
+          let (recs, wstats) ←
+            if cli.isolateFiles then
+              Corpus.extractViaFrontendIsolated projectRoot files tagConfig
+                cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers cli.config
+            else
+              Corpus.extractViaFrontend projectRoot files tagConfig
+                cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers cli.jobs
           IO.println s!"corpus-extract: {wstats.filesOk} ok, {wstats.filesEmpty} empty, \
             {wstats.filesError} error (of {wstats.filesTotal})"
           pure recs

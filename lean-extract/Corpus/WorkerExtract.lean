@@ -125,6 +125,93 @@ structure WorkerRunStats where
   filesError   : Nat := 0  -- elaboration failed
   deriving Inhabited
 
+
+/-- Extract one discovered file in-process and map its entries to corpus records.
+Used by the normal in-process driver and by the internal one-file child mode. -/
+unsafe def extractOneFileViaFrontend (projectRoot : System.FilePath)
+    (df : Discover.DiscoveredFile) (tagConfig : TagConfig)
+    (includeInternal includePrivate reverseElab : Bool)
+    (reverseClosers : Bool := false) : IO (Array ConstRecord) := do
+  let _ := projectRoot
+  Frontend.initFrontend
+  let importLock : Frontend.ImportLock ← Std.Mutex.new ()
+  let r ← Frontend.elaborateFile importLock df
+  let entries ← extractFileEntries r includeInternal includePrivate reverseElab
+    (closers := reverseClosers)
+  return entries.map fun e => entryToRecord e df.relPath tagConfig
+
+private def parseRecordsJsonl (stdout : String) : Except String (Array ConstRecord) := do
+  let mut out : Array ConstRecord := #[]
+  for line in stdout.splitOn "\n" do
+    let line := line.trimAscii.toString
+    if line.isEmpty then
+      continue
+    let json ← Json.parse line
+    let rec ← (Lean.fromJson? json : Except String ConstRecord)
+    out := out.push rec
+  return out
+
+private def runIsolatedFileChild (df : Discover.DiscoveredFile)
+    (includeInternal includePrivate reverseElab reverseClosers : Bool)
+    (configPath? : Option System.FilePath) : IO (Except String (Array ConstRecord)) := do
+  let exe ← IO.appPath
+  let mut args := #[
+    "--internal-extract-one",
+    "--source-file", df.absPath.toString,
+    "--module", df.module.toString,
+    "--rel-path", df.relPath
+  ]
+  if includeInternal then
+    args := args.push "--include-internal"
+  if !includePrivate then
+    args := args.push "--no-private"
+  if reverseElab then
+    args := args.push "--reverse-elab"
+  if reverseClosers then
+    args := args.push "--closers"
+  if let some path := configPath? then
+    args := args ++ #["--config", path.toString]
+  let child ← IO.Process.spawn {
+    cmd := exe.toString
+    args := args
+    stdin := .null
+    stdout := .piped
+    stderr := .inherit
+  }
+  let stdout ← child.stdout.readToEnd
+  let code ← child.wait
+  if code != 0 then
+    return .error s!"child exited with code {code}"
+  return parseRecordsJsonl stdout
+
+/-- Drive every discovered file through a fresh child process, then merge records
+in discovery order. This is slower than `extractViaFrontend`, but bounds memory
+for large projects because each file's Lean environment dies with its child. -/
+unsafe def extractViaFrontendIsolated (projectRoot : System.FilePath)
+    (files : Array Discover.DiscoveredFile)
+    (tagConfig : TagConfig) (includeInternal includePrivate reverseElab : Bool)
+    (reverseClosers : Bool := false) (configPath? : Option System.FilePath := none)
+    : IO (Array ConstRecord × WorkerRunStats) := do
+  let _ := projectRoot
+  let _ := tagConfig
+  let mut recs : Array ConstRecord := #[]
+  let mut stats : WorkerRunStats := { filesTotal := files.size }
+  for h : i in [0:files.size] do
+    let df := files[i]
+    IO.eprintln s!"corpus-extract: isolated file extraction {i+1}/{files.size} starting {df.relPath}"
+    match (← runIsolatedFileChild df includeInternal includePrivate reverseElab reverseClosers configPath?) with
+    | .ok fileRecs =>
+        if fileRecs.isEmpty then
+          stats := { stats with filesEmpty := stats.filesEmpty + 1 }
+        else
+          stats := { stats with filesOk := stats.filesOk + 1 }
+        recs := recs ++ fileRecs
+        IO.eprintln s!"corpus-extract: isolated file extraction {i+1}/{files.size} finished {df.relPath} ({fileRecs.size} record(s))"
+    | .error msg =>
+        stats := { stats with filesError := stats.filesError + 1 }
+        IO.eprintln s!"corpus-extract: isolated file extraction {i+1}/{files.size} failed {df.relPath}: {msg}"
+  return (recs, stats)
+
 /-- Drive every discovered file through the frontend (in parallel) and collect
 `ConstRecord`s. Per-file errors are logged to stderr and skipped (one bad file
 never aborts the run). Records keep the `file` field from discovery and `tags`
@@ -136,15 +223,27 @@ unsafe def extractViaFrontend (projectRoot : System.FilePath)
     (files : Array Discover.DiscoveredFile)
     (tagConfig : TagConfig) (includeInternal includePrivate reverseElab : Bool)
     (reverseClosers : Bool := false)
+    (jobs : Nat := Frontend.defaultMaxConcurrent)
     : IO (Array ConstRecord × WorkerRunStats) := do
   let _ := projectRoot  -- retained in the signature for parity; discovery already resolved paths
   Frontend.initFrontend
+  let startedRef ← IO.mkRef 0
+  let finishedRef ← IO.mkRef 0
   -- Elaborate each file and run the corpus collector, all on the file's own thread.
-  let results ← Frontend.elaborateFiles files fun importLock df => do
-    let r ← Frontend.elaborateFile importLock df
-    let entries ← extractFileEntries r includeInternal includePrivate reverseElab
-      (closers := reverseClosers)
-    pure (df, entries)
+  let results ← Frontend.elaborateFiles files (fun importLock df => do
+    let started ← startedRef.modifyGet fun n => (n + 1, n + 1)
+    IO.eprintln s!"corpus-extract: file extraction {started}/{files.size} starting {df.relPath}"
+    try
+      let r ← Frontend.elaborateFile importLock df
+      let entries ← extractFileEntries r includeInternal includePrivate reverseElab
+        (closers := reverseClosers)
+      let finished ← finishedRef.modifyGet fun n => (n + 1, n + 1)
+      IO.eprintln s!"corpus-extract: file extraction {finished}/{files.size} finished {df.relPath} ({entries.size} record(s))"
+      pure (df, entries)
+    catch e =>
+      let finished ← finishedRef.modifyGet fun n => (n + 1, n + 1)
+      IO.eprintln s!"corpus-extract: file extraction {finished}/{files.size} failed {df.relPath}: {e.toString}"
+      throw e) (maxConcurrent := jobs)
   -- Aggregate in discovery order.
   let mut recs   : Array ConstRecord := #[]
   let mut stats  : WorkerRunStats := { filesTotal := files.size }

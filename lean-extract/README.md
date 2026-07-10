@@ -84,6 +84,7 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 | `--config <path>` | no | Tags-config JSON (see [Tags](#tags-config)). Default: no tags. |
 | `--reverse-elab` | no | Reverse-elaborate each theorem's proof term into a verified tactic `proof_script`. **Off by default** — it re-elaborates every proof (slower). |
 | `--closers` | no | With `--reverse-elab`, also try goal-closing tactics (`simp`/`omega`/…) to recover high-level proofs for automation-heavy bodies. ~20× slower; off by default. |
+| `--jobs <n>` | no | Frontend corpus extraction concurrency. Default `1`; values above `1` warm up external Lean imports once, then elaborate files in bounded parallel batches while keeping per-file import phases serialized. |
 | `--include-internal` | no | Emit compiler-internal names (`_aux.*`, `match_*`, constructors, recursors). Default: false. |
 | `--no-private` | no | Skip `private` declarations. Default: include them. |
 | `--split-by-tag <key>` | no | Stratified 80/10/10 train/valid/test split of theorems keyed on a tag value. Definitions are always one split. |
@@ -97,8 +98,8 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 # Default frontend-driven extraction.
 lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out
 
-# With verified proof scripts (slower).
-lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out --reverse-elab
+# With verified proof scripts and four concurrent file jobs.
+lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out --reverse-elab --jobs 4
 
 # Find files no imported module pulls in.
 lean_extract --modules LeanSQLite --source-root ../sqlite --list-orphans
@@ -201,13 +202,16 @@ Everything is one package — `lean-extract` drives Lean's frontend in-process:
 
 1. **Discover** (`Discover.lean`): walk the project tree, prune `.lake/`, map each
    `.lean` file to its module `Name`, keep those under the `--modules` roots.
-2. **Drive** (`WorkerExtract.lean` → `Frontend.lean`): `elaborateFiles` runs each
-   file on its own dedicated thread (bounded concurrency). Per file,
-   `elaborateFile` does `parseHeader` → `processHeader` (imports the file's deps)
-   → `IO.processCommands`, yielding the post-elaboration `Environment`, the
-   per-command `Syntax`, and the `InfoTree`s. The header/import phase is serialized
-   behind one process-wide lock (imports touch unsynchronized Lean globals); the
-   per-command elaboration runs fully parallel.
+2. **Drive** (`WorkerExtract.lean` → `Frontend.lean`): `elaborateFiles` runs files
+   in bounded batches of dedicated tasks when `--jobs > 1`. Before
+   parallel work starts, it parses every file header and imports the union of
+   external direct dependencies once, single-threaded, so Lean's process-global
+   import registry is warm without eagerly loading the package being extracted.
+   Per file, `elaborateFile` does `parseHeader` → `processHeader` (imports
+   the file's deps) → `IO.processCommands`, yielding the post-elaboration
+   `Environment`, the per-command `Syntax`, and the `InfoTree`s. The header/import
+   phase is still serialized behind one process-wide lock; the per-command
+   elaboration and collector body run in parallel.
 3. **Collect** (`CorpusManifest.lean` via `Frontend.runCollectorOn`): fold over the
    module-local user constants in the post-elaboration environment. Per constant it
    computes the type/value (pretty-printed), `deps`, `axioms`, `premises`

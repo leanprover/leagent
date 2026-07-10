@@ -62,7 +62,7 @@ not count an opaque blob as a genuine decomposition. -/
 structure ScriptResult where
   script : String
   method : String
-  deriving Inhabited
+  deriving Inhabited, FromJson, ToJson
 
 /-- Delaborate with explicit args / universes / full names / proofs forced on,
 maximizing the chance the printed term re-elaborates to the same thing. Verbose
