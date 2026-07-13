@@ -543,6 +543,12 @@ private def buildSimpArgMap (src : String) (commands : Array Syntax)
 /-- Hard wall-clock budget for a single theorem's reverse-elab child process. -/
 def reverseProofTimeoutMs : Nat := 15000
 
+/-- Small proofs are safe and much faster to reverse-elaborate in the already
+elaborated file process. Larger proofs still use the killable child path below,
+because a single `isDefEq` on an automation-heavy term can otherwise pin the
+collector in wall time despite heartbeat limits. -/
+def reverseInProcessNodeCeiling : Nat := 250
+
 private partial def waitChildWithTimeout {cfg : IO.Process.StdioConfig}
     (child : IO.Process.Child cfg) (started timeoutMs : Nat) : IO (Option UInt32) := do
   match (← child.tryWait) with
@@ -632,11 +638,31 @@ def reverseProofInChild (file : Frontend.ElabResult) (declName : Name)
           IO.eprintln s!"corpus-extract: reverse-elab child returned invalid JSON for {declName}: {stdout.trimAscii}"
           return { script := "", method := "error" }
 
+/-- Reverse-elaborate using the already-elaborated file for small proof terms and
+the killable one-theorem child process for larger terms. This avoids re-elaborating
+the same file once per cheap theorem while preserving hard wall-clock containment
+for the proofs most likely to hang. -/
+def reverseProofHybrid (file : Frontend.ElabResult) (declName : Name)
+    (ty v : Expr) (enableClosers : Bool) (extraClosers : Array String)
+    : CoreM ReverseElab.ScriptResult := do
+  let nodes := ReverseElab.distinctNodes v
+  if nodes > reverseNodeCeiling then
+    return { script := "", method := "skipped_large" }
+  if nodes ≤ reverseInProcessNodeCeiling then
+    reverseProofGuarded ty v enableClosers extraClosers
+  else
+    reverseProofInChild file declName enableClosers
+
+private def shouldSkipReverse (reverseSkip : Array String) (info : ConstantInfo) : Bool :=
+  let rawName := info.name.toString
+  let displayName := (CollectCommon.displayName info.name).toString
+  reverseSkip.any fun skip => skip == rawName || skip == displayName
+
 private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
     (declSrcMap : Std.HashMap (Nat × Nat) String)
     (scopeMap : Std.HashMap (Nat × Nat) DeclScope)
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
-    (reverseElab closers : Bool) (info : ConstantInfo)
+    (reverseElab closers : Bool) (reverseSkip : Array String) (info : ConstantInfo)
     (attemptReverse : Bool := true) (reverseFile? : Option Frontend.ElabResult := none)
     : CoreM CorpusManifestEntry := do
   let env ← getEnv
@@ -703,6 +729,9 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
   let (proofScript, proofMethod) ← match info with
     | .thmInfo _ =>
         if reverseElab then
+          if shouldSkipReverse reverseSkip info then
+            pure (none, some "skipped_requested")
+          else
           -- Once the fold's wall-clock deadline has passed, `attemptReverse` is
           -- false: emit the record with a `deadline_skipped` marker instead of
           -- running the expensive reverse-elab, so the theorem's record still
@@ -717,7 +746,7 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
                   | none   => #[]
                 else #[]
               let r ← match reverseFile? with
-                | some file => reverseProofInChild file info.name closers
+                | some file => reverseProofHybrid file info.name info.type v closers extraClosers
                 | none      => reverseProofGuarded info.type v closers extraClosers
               pure (if r.script.isEmpty then none else some r.script, some r.method)
           | none => pure (none, none)
@@ -792,7 +821,8 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
     (declSrcMap : Std.HashMap (Nat × Nat) String)
     (scopeMap : Std.HashMap (Nat × Nat) DeclScope)
     (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
-    (includeInternal includePrivate reverseElab closers : Bool) (deadlineMs : Nat := 0)
+    (includeInternal includePrivate reverseElab closers : Bool)
+    (reverseSkip : Array String := #[]) (deadlineMs : Nat := 0)
     (fileLabel : String := "") (reverseFile? : Option Frontend.ElabResult := none)
     : CoreM (Array CorpusManifestEntry) := do
   let env ← getEnv
@@ -832,7 +862,7 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
   for vc in scheduled do
     -- Past the budget, keep emitting records but stop attempting reverse-elab.
     let attemptReverse := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
-    let entry ← buildEntry srcMap declSrcMap scopeMap simpArgMap reverseElab closers vc.info attemptReverse reverseFile?
+    let entry ← buildEntry srcMap declSrcMap scopeMap simpArgMap reverseElab closers reverseSkip vc.info attemptReverse reverseFile?
     out := out.push entry
     if isTheoremInfo vc.info then
       theoremDone := theoremDone + 1
@@ -853,7 +883,8 @@ tail-shed to `deadline_skipped`); the driver sets it below its own per-file boun
 See `foldCorpusEntries` for the scheduling contract. -/
 def corpusManifestCore (r : Frontend.ElabResult)
     (includeInternal includePrivate reverseElab closers : Bool)
-    (reverseDeadlineMs : Nat := 0) : IO (Array CorpusManifestEntry) :=
+    (reverseDeadlineMs : Nat := 0) (reverseSkip : Array String := #[])
+    : IO (Array CorpusManifestEntry) :=
   Frontend.runCollectorOn r do
     let srcMap := buildSourceMap r.source r.commands
     let declSrcMap := buildDeclSourceMap r.source r.commands
@@ -862,6 +893,6 @@ def corpusManifestCore (r : Frontend.ElabResult)
     -- syntax); otherwise it is unused.
     let simpArgMap ← if closers then buildSimpArgMap r.source r.commands else pure {}
     foldCorpusEntries srcMap declSrcMap scopeMap simpArgMap
-      includeInternal includePrivate reverseElab closers reverseDeadlineMs r.file.relPath (some r)
+      includeInternal includePrivate reverseElab closers reverseSkip reverseDeadlineMs r.file.relPath (some r)
 
 end Corpus

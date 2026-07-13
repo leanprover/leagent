@@ -84,7 +84,9 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 | `--config <path>` | no | Tags-config JSON (see [Tags](#tags-config)). Default: no tags. |
 | `--reverse-elab` | no | Reverse-elaborate each theorem's proof term into a verified tactic `proof_script`. **Off by default** — it re-elaborates every proof (slower). |
 | `--closers` | no | With `--reverse-elab`, also try goal-closing tactics (`simp`/`omega`/…) to recover high-level proofs for automation-heavy bodies. ~20× slower; off by default. |
-| `--jobs <n>` | no | Frontend corpus extraction concurrency. Default `1`; values above `1` warm up external Lean imports once, then elaborate files in bounded parallel batches while keeping per-file import phases serialized. |
+| `--skip-reverse <decl>` | no | Skip reverse-elaboration for a theorem declaration, matching either the corpus display name or raw Lean internal name. Repeatable; emits `proof_method=skipped_requested`. |
+| `--jobs <n>` | no | Frontend corpus extraction concurrency. Default `1`; values above `1` warm up external Lean imports once, then elaborate files in bounded parallel batches while keeping per-file import phases serialized. With `--isolate-files`, this bounds concurrent file child processes. |
+| `--isolate-files` | no | Extract each source file in a fresh child process and merge JSONL in the parent. Slower per file, but bounds cumulative Lean memory growth; combine with `--jobs <n>` for bounded process-level parallelism. |
 | `--include-internal` | no | Emit compiler-internal names (`_aux.*`, `match_*`, constructors, recursors). Default: false. |
 | `--no-private` | no | Skip `private` declarations. Default: include them. |
 | `--split-by-tag <key>` | no | Stratified 80/10/10 train/valid/test split of theorems keyed on a tag value. Definitions are always one split. |
@@ -100,6 +102,9 @@ lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out
 
 # With verified proof scripts and four concurrent file jobs.
 lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out --reverse-elab --jobs 4
+
+# Memory-bounded extraction with four isolated file children at a time.
+lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out --reverse-elab --isolate-files --jobs 4
 
 # Find files no imported module pulls in.
 lean_extract --modules LeanSQLite --source-root ../sqlite --list-orphans
