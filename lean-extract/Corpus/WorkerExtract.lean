@@ -99,6 +99,7 @@ baseline is cheap. -/
 def extractFileEntries (r : Frontend.ElabResult)
     (includeInternal includePrivate reverseElab : Bool)
     (manifestTimeoutMs : Nat := 60000) (closers : Bool := false)
+    (reverseSkip : Array String := #[])
     : IO (Array CorpusManifestEntry) := do
   -- Baseline pass (no reverse-elab): the guaranteed record set.
   let baseline ← corpusManifestCore r includeInternal includePrivate
@@ -112,6 +113,7 @@ def extractFileEntries (r : Frontend.ElabResult)
   try
     corpusManifestCore r includeInternal includePrivate
       (reverseElab := true) (closers := closers) (reverseDeadlineMs := reverseDeadlineMs)
+      (reverseSkip := reverseSkip)
   catch e =>
     IO.eprintln s!"corpus-extract: reverse-elab failed for {r.file.relPath} \
       ({e.toString}); kept {baseline.size} records without proof scripts"
@@ -131,13 +133,14 @@ Used by the normal in-process driver and by the internal one-file child mode. -/
 unsafe def extractOneFileViaFrontend (projectRoot : System.FilePath)
     (df : Discover.DiscoveredFile) (tagConfig : TagConfig)
     (includeInternal includePrivate reverseElab : Bool)
-    (reverseClosers : Bool := false) : IO (Array ConstRecord) := do
+    (reverseClosers : Bool := false) (reverseSkip : Array String := #[])
+    : IO (Array ConstRecord) := do
   let _ := projectRoot
   Frontend.initFrontend
   let importLock : Frontend.ImportLock ← Std.Mutex.new ()
   let r ← Frontend.elaborateFile importLock df
   let entries ← extractFileEntries r includeInternal includePrivate reverseElab
-    (closers := reverseClosers)
+    (closers := reverseClosers) (reverseSkip := reverseSkip)
   return entries.map fun e => entryToRecord e df.relPath tagConfig
 
 private def parseRecordsJsonl (stdout : String) : Except String (Array ConstRecord) := do
@@ -153,7 +156,8 @@ private def parseRecordsJsonl (stdout : String) : Except String (Array ConstReco
 
 private def runIsolatedFileChild (df : Discover.DiscoveredFile)
     (includeInternal includePrivate reverseElab reverseClosers : Bool)
-    (configPath? : Option System.FilePath) : IO (Except String (Array ConstRecord)) := do
+    (configPath? : Option System.FilePath) (reverseSkip : Array String := #[])
+    : IO (Except String (Array ConstRecord)) := do
   let exe ← IO.appPath
   let mut args := #[
     "--internal-extract-one",
@@ -169,6 +173,8 @@ private def runIsolatedFileChild (df : Discover.DiscoveredFile)
     args := args.push "--reverse-elab"
   if reverseClosers then
     args := args.push "--closers"
+  for decl in reverseSkip do
+    args := args ++ #["--skip-reverse", decl]
   if let some path := configPath? then
     args := args ++ #["--config", path.toString]
   let child ← IO.Process.spawn {
@@ -191,25 +197,48 @@ unsafe def extractViaFrontendIsolated (projectRoot : System.FilePath)
     (files : Array Discover.DiscoveredFile)
     (tagConfig : TagConfig) (includeInternal includePrivate reverseElab : Bool)
     (reverseClosers : Bool := false) (configPath? : Option System.FilePath := none)
+    (reverseSkip : Array String := #[])
+    (maxConcurrent : Nat := Frontend.defaultMaxConcurrent)
     : IO (Array ConstRecord × WorkerRunStats) := do
   let _ := projectRoot
   let _ := tagConfig
   let mut recs : Array ConstRecord := #[]
   let mut stats : WorkerRunStats := { filesTotal := files.size }
-  for h : i in [0:files.size] do
-    let df := files[i]
+  let jobs := Nat.max 1 maxConcurrent
+  let runOne (i : Nat) (df : Discover.DiscoveredFile) :
+      IO (Discover.DiscoveredFile × Except String (Array ConstRecord)) := do
     IO.eprintln s!"corpus-extract: isolated file extraction {i+1}/{files.size} starting {df.relPath}"
-    match (← runIsolatedFileChild df includeInternal includePrivate reverseElab reverseClosers configPath?) with
+    let r ← runIsolatedFileChild df includeInternal includePrivate reverseElab reverseClosers configPath? reverseSkip
+    match r with
     | .ok fileRecs =>
-        if fileRecs.isEmpty then
-          stats := { stats with filesEmpty := stats.filesEmpty + 1 }
-        else
-          stats := { stats with filesOk := stats.filesOk + 1 }
-        recs := recs ++ fileRecs
         IO.eprintln s!"corpus-extract: isolated file extraction {i+1}/{files.size} finished {df.relPath} ({fileRecs.size} record(s))"
     | .error msg =>
-        stats := { stats with filesError := stats.filesError + 1 }
         IO.eprintln s!"corpus-extract: isolated file extraction {i+1}/{files.size} failed {df.relPath}: {msg}"
+    return (df, r)
+  let mut i := 0
+  while i < files.size do
+    let stop := Nat.min files.size (i + jobs)
+    let batch := files.extract i stop
+    let mut tasks : Array (Task (Except IO.Error (Discover.DiscoveredFile × Except String (Array ConstRecord)))) := #[]
+    for h : j in [0:batch.size] do
+      let idx := i + j
+      let df := batch[j]
+      tasks := tasks.push (← IO.asTask (prio := .dedicated) (runOne idx df))
+    let results ← tasks.mapM fun t => IO.wait t
+    for result in results do
+      match result with
+      | .ok (_, .ok fileRecs) =>
+          if fileRecs.isEmpty then
+            stats := { stats with filesEmpty := stats.filesEmpty + 1 }
+          else
+            stats := { stats with filesOk := stats.filesOk + 1 }
+          recs := recs ++ fileRecs
+      | .ok (_, .error _) =>
+          stats := { stats with filesError := stats.filesError + 1 }
+      | .error e =>
+          stats := { stats with filesError := stats.filesError + 1 }
+          IO.eprintln s!"corpus-extract: isolated file extraction task failed: {e}"
+    i := stop
   return (recs, stats)
 
 /-- Drive every discovered file through the frontend (in parallel) and collect
@@ -223,6 +252,7 @@ unsafe def extractViaFrontend (projectRoot : System.FilePath)
     (files : Array Discover.DiscoveredFile)
     (tagConfig : TagConfig) (includeInternal includePrivate reverseElab : Bool)
     (reverseClosers : Bool := false)
+    (reverseSkip : Array String := #[])
     (jobs : Nat := Frontend.defaultMaxConcurrent)
     : IO (Array ConstRecord × WorkerRunStats) := do
   let _ := projectRoot  -- retained in the signature for parity; discovery already resolved paths
@@ -236,7 +266,7 @@ unsafe def extractViaFrontend (projectRoot : System.FilePath)
     try
       let r ← Frontend.elaborateFile importLock df
       let entries ← extractFileEntries r includeInternal includePrivate reverseElab
-        (closers := reverseClosers)
+        (closers := reverseClosers) (reverseSkip := reverseSkip)
       let finished ← finishedRef.modifyGet fun n => (n + 1, n + 1)
       IO.eprintln s!"corpus-extract: file extraction {finished}/{files.size} finished {df.relPath} ({entries.size} record(s))"
       pure (df, entries)

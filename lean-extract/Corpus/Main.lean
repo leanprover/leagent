@@ -67,6 +67,7 @@ structure CliArgs where
   includePrivate     : Bool := true
   reverseElab        : Bool := false
   reverseClosers     : Bool := false
+  reverseSkip        : Array String := #[]
   jobs               : Nat := Frontend.defaultMaxConcurrent
   isolateFiles       : Bool := false
   splitByTag         : Option String := none
@@ -92,7 +93,8 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--enumerate glob|import] [--list-orphans]
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
-                     [--reverse-elab] [--closers] [--jobs <n>] [--isolate-files]
+                     [--reverse-elab] [--closers] [--skip-reverse <decl>]
+                     [--jobs <n>] [--isolate-files]
                      [--grind-manifest] [--grind-in-proof]
                      [--split-by-tag <key>] [--seed <n>]
                      [--dataset-card-config <path>]
@@ -119,6 +121,10 @@ bounded parallel batches while serializing each file's import phase.
 --isolate-files extracts each discovered source file in a fresh child process and
 merges the JSONL in the parent. It is slower, but bounds memory for large projects
 whose frontend elaboration memory accumulates across files.
+
+--skip-reverse skips reverse-elaboration for a theorem declaration. Repeat it for
+multiple declarations. It matches either the corpus display name or the raw Lean
+internal name and emits proof_method=skipped_requested for that theorem.
 
 --grind-in-proof instead captures grind data at the grind CALL SITES inside
 existing proofs: it walks each proof, re-runs instrumented grind on every
@@ -173,6 +179,7 @@ structure ExtractOneArgs where
   includePrivate  : Bool := true
   reverseElab     : Bool := false
   reverseClosers  : Bool := false
+  reverseSkip     : Array String := #[]
   deriving Inhabited
 
 private def parseExtractOneArgs? (args : List String) : Option (Except String ExtractOneArgs) :=
@@ -193,6 +200,7 @@ where
     | "--no-private" :: xs, acc => go xs { acc with includePrivate := false }
     | "--reverse-elab" :: xs, acc => go xs { acc with reverseElab := true }
     | "--closers" :: xs, acc => go xs { acc with reverseElab := true, reverseClosers := true }
+    | "--skip-reverse" :: v :: xs, acc => go xs { acc with reverseSkip := acc.reverseSkip.push v }
     | x :: _, _ => .error s!"unknown --internal-extract-one argument: {x}"
 
 private unsafe def runExtractOneCli (cfg : ExtractOneArgs) : IO UInt32 := do
@@ -203,7 +211,8 @@ private unsafe def runExtractOneCli (cfg : ExtractOneArgs) : IO UInt32 := do
     | none => pure TagConfig.empty
     | some path => Corpus.loadConfig path
   let df : Corpus.Discover.DiscoveredFile := { absPath := sourceFile, module := moduleName, relPath := relPath }
-  let recs ← Corpus.extractOneFileViaFrontend "." df tagConfig cfg.includeInternal cfg.includePrivate cfg.reverseElab cfg.reverseClosers
+  let recs ← Corpus.extractOneFileViaFrontend "." df tagConfig cfg.includeInternal cfg.includePrivate
+    cfg.reverseElab cfg.reverseClosers cfg.reverseSkip
   for r in recs do
     IO.println (Lean.toJson r).compress
   return 0
@@ -233,6 +242,9 @@ where
         go xs { acc with reverseElab := true }
     | "--closers" :: xs, acc =>
         go xs { acc with reverseElab := true, reverseClosers := true }
+    | "--skip-reverse" :: v :: xs, acc =>
+        if v.startsWith "--" then .error "--skip-reverse expects a declaration name"
+        else go xs { acc with reverseSkip := acc.reverseSkip.push v }
     | "--jobs" :: v :: xs, acc =>
         match parseNat? v with
         | some n =>
@@ -622,9 +634,11 @@ unsafe def runCli (args : List String) : IO UInt32 := do
             if cli.isolateFiles then
               Corpus.extractViaFrontendIsolated projectRoot files tagConfig
                 cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers cli.config
+                cli.reverseSkip cli.jobs
             else
               Corpus.extractViaFrontend projectRoot files tagConfig
-                cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers cli.jobs
+                cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers
+                cli.reverseSkip cli.jobs
           IO.println s!"corpus-extract: {wstats.filesOk} ok, {wstats.filesEmpty} empty, \
             {wstats.filesError} error (of {wstats.filesTotal})"
           pure recs
