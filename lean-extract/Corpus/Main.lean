@@ -47,10 +47,9 @@ open Lean
 def toolVersion : String := "0.2.0"
 
 /-- How to enumerate the declarations to extract.
-  * `glob`   — drive Lean's frontend, in-process, over the source files discovered
-               on disk under the `--modules` roots: each file is elaborated in its
-               TRUE context and a collector folds the resulting environment
-               (orphan-safe; the default). Files run in parallel.
+  * `glob`   — drive Lean's frontend over source files discovered under the
+               `--modules` roots. Each file is elaborated in its true context
+               and collected in an isolated process by default.
   * `import` — the legacy path: `importModules` the `--modules` roots and walk
                the resulting `Environment`. Misses orphan files. -/
 inductive EnumerateMode where
@@ -68,8 +67,10 @@ structure CliArgs where
   reverseElab        : Bool := false
   reverseClosers     : Bool := false
   reverseSkip        : Array String := #[]
-  jobs               : Nat := Frontend.defaultMaxConcurrent
-  isolateFiles       : Bool := false
+  reverseTimeoutMs   : Nat := 300000
+  jobs               : Option Nat := none
+  isolateFiles       : Bool := true
+  resume             : Bool := false
   splitByTag         : Option String := none
   seed               : Nat := 0
   datasetCardConfig  : Option System.FilePath := none
@@ -94,7 +95,8 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
                      [--reverse-elab] [--closers] [--skip-reverse <decl>]
-                     [--jobs <n>] [--isolate-files]
+                     [--reverse-timeout <seconds>]
+                     [--jobs <n>] [--no-isolate-files] [--resume]
                      [--grind-manifest] [--grind-in-proof]
                      [--split-by-tag <key>] [--seed <n>]
                      [--dataset-card-config <path>]
@@ -104,27 +106,37 @@ If --source-root (or, failing that, the current directory) contains a
 lakefile.lean or lakefile.toml, the tool re-execs itself under `lake env`
 from that directory so LEAN_PATH resolves to the project's built .oleans.
 
---enumerate glob (default) drives `lean --worker` over the source files found
-on disk under the --modules roots (orphan-safe). --enumerate import uses the
-legacy importModules + Environment walk. --list-orphans prints the modules on
-disk that are not in the import closure of the --modules roots, then exits.
+--enumerate glob (default) drives Lean's frontend over the source files found on
+disk under the --modules roots (orphan-safe). --enumerate import uses the legacy
+importModules + Environment walk. --list-orphans prints the modules on disk that
+are not in the import closure of the declared roots, then exits.
 
 --grind-manifest re-proves every theorem with `grind`'s default strategy and
 writes data/grind/train.jsonl (the interactive script, the `grind only`
 reconstruction, and the activated/used lemma triple per theorem), plus the
 env-wide available-hint set into metadata.json. This REPLACES corpus extraction.
 
---jobs controls frontend corpus extraction concurrency. The default is 1; values
-> 1 warm up external Lean imports single-threaded, then elaborate files in
-bounded parallel batches while serializing each file's import phase.
+File extraction is isolated by default: each source file is processed in a child
+process and the results are merged by the parent.
 
---isolate-files extracts each discovered source file in a fresh child process and
-merges the JSONL in the parent. It is slower, but bounds memory for large projects
-whose frontend elaboration memory accumulates across files.
+--no-isolate-files reverts to in-process extraction (one shared Lean environment
+per run).
+
+Under isolation each completed file's records are staged to <output>/.shards/ as
+soon as its child returns. --resume reuses shards only when all relevant inputs
+and source hashes match. Successful runs remove the staging directory.
+
+--jobs controls extraction concurrency. Under isolation (the default) it is the
+number of concurrent child processes, defaulting to half the machine's hardware
+threads and capped at 4. Under --no-isolate-files it defaults to 1.
 
 --skip-reverse skips reverse-elaboration for a theorem declaration. Repeat it for
 multiple declarations. It matches either the corpus display name or the raw Lean
 internal name and emits proof_method=skipped_requested for that theorem.
+
+--reverse-timeout sets the isolated reverse-elaboration timeout in seconds
+(default 300). On timeout the file is re-run without reverse elaboration. A value
+of 0 disables this timeout.
 
 --grind-in-proof instead captures grind data at the grind CALL SITES inside
 existing proofs: it walks each proof, re-runs instrumented grind on every
@@ -136,6 +148,22 @@ mvcgen). REPLACES corpus extraction; mutually exclusive with --grind-manifest.
 
 private def parseNat? (s : String) : Option Nat :=
   s.toNat?
+
+@[extern "lean_internal_get_hardware_concurrency"]
+private opaque hardwareConcurrency (_ : Unit) : UInt32
+
+private def maxDefaultIsolatedJobs : Nat := 4
+
+/-- Resolve explicit or mode-specific extraction concurrency. -/
+private def resolveJobs (jobs? : Option Nat) (isolate : Bool) : Nat :=
+  match jobs? with
+  | some n => n
+  | none   =>
+    if isolate then
+      Nat.max 1 (Nat.min maxDefaultIsolatedJobs
+        ((hardwareConcurrency ()).toNat / 2))
+    else
+      Frontend.defaultMaxConcurrent
 
 
 structure ReverseOneArgs where
@@ -245,14 +273,22 @@ where
     | "--skip-reverse" :: v :: xs, acc =>
         if v.startsWith "--" then .error "--skip-reverse expects a declaration name"
         else go xs { acc with reverseSkip := acc.reverseSkip.push v }
+    | "--reverse-timeout" :: v :: xs, acc =>
+        match parseNat? v with
+        | some n => go xs { acc with reverseTimeoutMs := n * 1000 }
+        | none   => .error s!"--reverse-timeout expects seconds (non-negative integer), got: {v}"
     | "--jobs" :: v :: xs, acc =>
         match parseNat? v with
         | some n =>
             if n == 0 then .error "--jobs expects a positive integer"
-            else go xs { acc with jobs := n }
+            else go xs { acc with jobs := some n }
         | none   => .error s!"--jobs expects a positive integer, got: {v}"
     | "--isolate-files" :: xs, acc =>
         go xs { acc with isolateFiles := true }
+    | "--no-isolate-files" :: xs, acc =>
+        go xs { acc with isolateFiles := false }
+    | "--resume" :: xs, acc =>
+        go xs { acc with resume := true }
     | "--split-by-tag" :: v :: xs, acc =>
         if v.startsWith "--" then .error "--split-by-tag expects a tag key"
         else go xs { acc with splitByTag := some v }
@@ -517,6 +553,12 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       IO.eprintln "corpus-extract: --modules is required"
       IO.eprintln usage
       return 1
+    if cli.resume &&
+        (cli.enumerate != .glob || !cli.isolateFiles || cli.listOrphans ||
+          cli.grindManifest || cli.grindInProof) then
+      IO.eprintln "corpus-extract: --resume requires isolated corpus extraction with --enumerate glob"
+      IO.eprintln usage
+      return 1
     -- `--list-orphans`: discover files on disk under the `--modules` roots vs the
     -- import closure, print the difference, and exit. (Diagnostic only — no JSONL.)
     if cli.listOrphans then
@@ -625,22 +667,31 @@ unsafe def runCli (args : List String) : IO UInt32 := do
     -- Obtain the records either via the worker/plugin path (default, orphan-safe)
     -- or the legacy import-and-walk path. Both produce `Array ConstRecord` +
     -- per-kind counts; everything downstream (split/write/metadata/card) is shared.
+    -- Clean staging only after all final outputs are written.
+    let cleanupShardsRef ← IO.mkRef false
     let records : Array ConstRecord ← match cli.enumerate with
       | .glob => do
           let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
           let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
-          IO.println s!"corpus-extract: discovered {files.size} source file(s); driving frontend (jobs={cli.jobs})…"
+          let jobs := resolveJobs cli.jobs cli.isolateFiles
+          let mode := if cli.isolateFiles then "isolated" else "in-process"
+          IO.println s!"corpus-extract: discovered {files.size} source file(s); driving frontend ({mode}, jobs={jobs})…"
           let (recs, wstats) ←
             if cli.isolateFiles then
               Corpus.extractViaFrontendIsolated projectRoot files tagConfig
                 cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers cli.config
-                cli.reverseSkip cli.jobs
+                cli.reverseSkip jobs cli.reverseTimeoutMs outDir cli.resume
             else
               Corpus.extractViaFrontend projectRoot files tagConfig
                 cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers
-                cli.reverseSkip cli.jobs
+                cli.reverseSkip jobs
           IO.println s!"corpus-extract: {wstats.filesOk} ok, {wstats.filesEmpty} empty, \
             {wstats.filesError} error (of {wstats.filesTotal})"
+          if wstats.filesError > 0 then
+            let resumeHint := if cli.isolateFiles then "; staged shards were retained for --resume" else ""
+            throw <| IO.userError s!"extraction failed for {wstats.filesError} file(s){resumeHint}"
+          if cli.isolateFiles then
+            cleanupShardsRef.set true
           pure recs
       | .import => do
           -- Bring up Lean's search path and import the requested modules.
@@ -715,6 +766,8 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       }
       let card := renderCard cardCfg cardStats
       IO.FS.writeFile (outDir / "README.md") card
+    if (← cleanupShardsRef.get) then
+      Corpus.cleanupShards outDir
     IO.println s!"corpus-extract: wrote {theorems.size} theorems + {defns.size} definitions to {outDir}"
     return 0
 

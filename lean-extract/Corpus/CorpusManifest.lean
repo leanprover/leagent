@@ -615,7 +615,7 @@ def reverseProofInChild (file : Frontend.ElabResult) (declName : Name)
     stdin := .null
     stdout := .piped
     stderr := .piped
-    setsid := true
+    setsid := false -- Inherit the isolated file worker's process group.
   }
   let stdoutTask ← IO.asTask child.stdout.readToEnd Task.Priority.dedicated
   let stderrTask ← IO.asTask child.stderr.readToEnd Task.Priority.dedicated
