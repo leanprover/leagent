@@ -70,6 +70,8 @@ structure ElabResult where
   /-- InfoTrees for the file (one per top-level command). `GrindInProof` folds these
   for `grind` tactic call sites. -/
   trees   : PersistentArray Elab.InfoTree
+  /-- Whether parsing, imports, or command elaboration reported an error. -/
+  hasErrors : Bool
 
 /-- Process-wide serialization of the header/import phase. One per run; shared by
 every parallel file task. See the module docstring for why import must be single-
@@ -134,6 +136,7 @@ unsafe def elaborateFile (importLock : ImportLock) (df : Discover.DiscoveredFile
     source
     commands := s.commands
     trees    := s.commandState.infoState.trees
+    hasErrors := s.commandState.messages.hasErrors
   }
 
 /-- Run a `CoreM` collector over an `ElabResult`'s environment, in a `Core` context

@@ -1,4 +1,4 @@
--- Lake build configuration for the LeanSQLite package.
+-- Lake build configuration for the LeanExtract package.
 import Lake
 open Lake DSL
 
@@ -16,3 +16,6 @@ lean_lib Corpus where
 lean_exe lean_extract where
   root := `Corpus.Main
   supportInterpreter := true
+
+lean_exe resume_tests where
+  root := `ResumeTests

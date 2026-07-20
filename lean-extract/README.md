@@ -15,9 +15,9 @@ any tagging rules are all supplied on the command line.
 `lean-extract` has two extraction backends, selected with `--enumerate`:
 
 - **`glob` (default)** — the **frontend** path. The tool discovers the project's
-  source files on disk and drives Lean's frontend **directly, in-process** — one
-  real frontend elaboration per file, run in parallel across files on dedicated
-  threads — then folds a collector over each file's post-elaboration environment.
+  source files on disk and drives Lean's frontend directly, using one isolated
+  child process per file by default, then folds a collector over each file's
+  post-elaboration environment. `--no-isolate-files` uses one shared process.
   This sees each file in its *true elaboration context* (section variables,
   `open`s, `set_option`s, registered tactics) and finds **orphan** declarations
   in files that no other module imports.
@@ -35,11 +35,11 @@ Both backends write the **same JSONL schema**, so datasets stay comparable.
 
 > **History.** The `glob` path formerly drove a pool of `lean --worker`
 > subprocesses and pulled per-declaration data back over LSP from a Lean plugin
-> (in a sibling `workers` package). It now drives the frontend in-process; the
-> plugin logic was absorbed into `Corpus.*` and the `workers` dependency dropped.
+> (in a sibling `workers` package). It now drives the frontend directly; the plugin
+> logic was absorbed into `Corpus.*` and the `workers` dependency dropped.
 > The output is unchanged except that compiler-generated auxiliary names
 > (`match_*`, `_proof_*`) may be attributed differently — the worker elaborated
-> with `Elab.async := true` (the LSP default) while the in-process path uses the
+> with `Elab.async := true` (the LSP default) while the frontend path uses the
 > synchronous default; no real declaration, statement, or proof differs.
 
 ## Build
@@ -49,7 +49,7 @@ lake build
 ```
 
 The binary lands at `.lake/build/bin/lean_extract`. No plugin `.so`s or sibling
-package build are needed — the extraction logic is in-process now.
+package build are needed.
 
 Toolchain: the package pins Lean **4.31.0** via `lean-toolchain`.
 
@@ -58,7 +58,7 @@ Toolchain: the package pins Lean **4.31.0** via `lean-toolchain`.
 Both backends need `LEAN_PATH` pointing at the project-under-study's built
 `.olean`s (the frontend imports each file's dependencies). The tool handles this:
 if `--source-root` (or the current directory) is a Lake project, it re-execs
-itself under `lake env` from there, so the in-process elaboration inherits the
+itself under `lake env` from there, so frontend elaboration inherits the
 right search path. You never need to wrap the call in `lake env` yourself.
 
 ```bash
@@ -85,8 +85,10 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 | `--reverse-elab` | no | Reverse-elaborate each theorem's proof term into a verified tactic `proof_script`. **Off by default** — it re-elaborates every proof (slower). |
 | `--closers` | no | With `--reverse-elab`, also try goal-closing tactics (`simp`/`omega`/…) to recover high-level proofs for automation-heavy bodies. ~20× slower; off by default. |
 | `--skip-reverse <decl>` | no | Skip reverse-elaboration for a theorem declaration, matching either the corpus display name or raw Lean internal name. Repeatable; emits `proof_method=skipped_requested`. |
-| `--jobs <n>` | no | Frontend corpus extraction concurrency. Default `1`; values above `1` warm up external Lean imports once, then elaborate files in bounded parallel batches while keeping per-file import phases serialized. With `--isolate-files`, this bounds concurrent file child processes. |
-| `--isolate-files` | no | Extract each source file in a fresh child process and merge JSONL in the parent. Slower per file, but bounds cumulative Lean memory growth; combine with `--jobs <n>` for bounded process-level parallelism. |
+| `--jobs <n>` | no | Extraction concurrency. Isolated mode defaults to half the available hardware threads, capped at `4`; in-process mode defaults to `1`. |
+| `--no-isolate-files` | no | Elaborate files in one shared process instead of the default per-file child processes. |
+| `--resume` | no | Reuse valid per-file shards from an interrupted default (`glob`, isolated) run. Changed inputs invalidate the staging directory. |
+| `--reverse-timeout <seconds>` | no | Hard timeout for an isolated file when reverse elaboration is enabled. Default `300`; `0` disables it. A timed-out file is retried without reverse elaboration. |
 | `--include-internal` | no | Emit compiler-internal names (`_aux.*`, `match_*`, constructors, recursors). Default: false. |
 | `--no-private` | no | Skip `private` declarations. Default: include them. |
 | `--split-by-tag <key>` | no | Stratified 80/10/10 train/valid/test split of theorems keyed on a tag value. Definitions are always one split. |
@@ -103,8 +105,11 @@ lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out
 # With verified proof scripts and four concurrent file jobs.
 lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out --reverse-elab --jobs 4
 
-# Memory-bounded extraction with four isolated file children at a time.
-lean_extract --modules LeanSQLite --source-root ../sqlite --output ./out --reverse-elab --isolate-files --jobs 4
+# Resume an interrupted isolated extraction.
+lean_extract --modules Project --source-root ../project --output ./out --reverse-elab --resume
+
+# Use the shared in-process frontend.
+lean_extract --modules Project --source-root ../project --output ./out --no-isolate-files
 
 # Find files no imported module pulls in.
 lean_extract --modules LeanSQLite --source-root ../sqlite --list-orphans
@@ -180,21 +185,21 @@ the project — look them up in the `theorems` config if you need the full cone.
 
 ## Architecture
 
-Everything is one package — `lean-extract` drives Lean's frontend in-process:
+Everything is one package; `lean-extract` hosts Lean's frontend directly:
 
 ```
  lean-extract
  ├─ Corpus/Main.lean            CLI parsing; --enumerate branch; JSONL pipeline
  ├─ Corpus/Discover.lean        orphan-safe file discovery (walk, prune .lake/, path↔Name)
- ├─ Corpus/Frontend.lean        the in-process frontend driver: elaborate a file
+ ├─ Corpus/Frontend.lean        elaborate one file through Lean's frontend
  │                              (parseHeader→processHeader→IO.processCommands), run a
- │                              CoreM collector on it, parallel over files (import-locked)
+ │                              CoreM collector on the resulting environment
  ├─ Corpus/CollectCommon.lean   shared collector helpers (kindToString, isUserConstant)
  ├─ Corpus/CorpusManifest.lean  the corpus collector (corpusManifestCore)
  ├─ Corpus/GrindManifest.lean   the grind-manifest collector (grindManifestCore)
  ├─ Corpus/GrindInProof.lean    the in-proof grind collector (grindInProofCore)
  ├─ Corpus/ReverseElab.lean     proof-term → verified tactic script
- ├─ Corpus/WorkerExtract.lean   the corpus driver + CorpusManifestEntry → ConstRecord
+ ├─ Corpus/WorkerExtract.lean   isolated/shared driver, resume staging, record mapping
  ├─ Corpus/GrindExtract.lean    the grind-manifest driver
  ├─ Corpus/GrindInProofExtract.lean  the in-proof grind driver
  ├─ Corpus/Extract.lean         the legacy import-and-walk backend (--enumerate=import)
@@ -207,16 +212,12 @@ Everything is one package — `lean-extract` drives Lean's frontend in-process:
 
 1. **Discover** (`Discover.lean`): walk the project tree, prune `.lake/`, map each
    `.lean` file to its module `Name`, keep those under the `--modules` roots.
-2. **Drive** (`WorkerExtract.lean` → `Frontend.lean`): `elaborateFiles` runs files
-   in bounded batches of dedicated tasks when `--jobs > 1`. Before
-   parallel work starts, it parses every file header and imports the union of
-   external direct dependencies once, single-threaded, so Lean's process-global
-   import registry is warm without eagerly loading the package being extracted.
-   Per file, `elaborateFile` does `parseHeader` → `processHeader` (imports
-   the file's deps) → `IO.processCommands`, yielding the post-elaboration
-   `Environment`, the per-command `Syntax`, and the `InfoTree`s. The header/import
-   phase is still serialized behind one process-wide lock; the per-command
-   elaboration and collector body run in parallel.
+2. **Drive** (`WorkerExtract.lean` → `Frontend.lean`): by default, files run in
+   bounded batches of isolated child processes. `--no-isolate-files` instead uses
+   `elaborateFiles` in one process, warming external imports before parallel work
+   and serializing each file's import phase. In either mode, `elaborateFile` does
+   `parseHeader` → `processHeader` → `IO.processCommands`, yielding the final
+   `Environment`, command `Syntax`, and `InfoTree`s.
 3. **Collect** (`CorpusManifest.lean` via `Frontend.runCollectorOn`): fold over the
    module-local user constants in the post-elaboration environment. Per constant it
    computes the type/value (pretty-printed), `deps`, `axioms`, `premises`
@@ -227,23 +228,22 @@ Everything is one package — `lean-extract` drives Lean's frontend in-process:
    `CorpusManifestEntry` becomes a `ConstRecord`; the shared pipeline splits and
    writes the JSONL.
 
-**Why this design.** Driving the frontend in-process runs each file as a *real
-frontend* — tactics are registered and the elaboration context is authentic —
+**Why this design.** Driving the frontend directly runs each file in its real
+elaboration context, with registered tactics and project options,
 which is what makes in-context source reconstruction and `proof_script`
 re-elaboration possible, and finds orphan files the import graph misses. The
 import-based path cannot reproduce that context, so it is kept only as a
 `--enumerate=import` fallback. (This replaced an earlier `lean --worker` +
 LSP-plugin design; the collector logic is unchanged, only its host.)
 
-#### Timeouts (cooperative)
+#### Timeouts
 
-There is no subprocess to kill, so all bounds are cooperative: the
-`reverseNodeCeiling` size pre-filter skips pathological proof terms before any
-reverse-elab work; per-theorem heartbeat budgets bound the in-range ones; a finite
-per-goal `maxHeartbeats` backstop (`grindHeartbeats`) bounds each grind run; and a
-per-file wall-clock deadline sheds the expensive tail *between* theorems/sites.
-Parallelism means a proof that spins in a single uninterruptible call ties up one
-file thread, not the whole run.
+With `--reverse-elab`, isolated mode enforces a hard per-file deadline and, where
+process groups are supported, kills the full worker group on expiry. It retries
+baseline extraction without reverse elaboration under the same deadline. Reverse
+elaboration also applies proof-size filters, heartbeat limits, and per-theorem
+child-process bounds. `--no-isolate-files` has no hard file-level process
+deadline, so its per-file tail bound remains cooperative.
 
 ### Reverse-elaboration / proof simplification
 
