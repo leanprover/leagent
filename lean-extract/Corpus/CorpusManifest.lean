@@ -10,6 +10,7 @@ import Lean.PrettyPrinter
 import Corpus.CollectCommon
 import Corpus.ReverseElab
 import Corpus.Frontend
+import Corpus.SourceSyntax
 import Corpus.Verify
 
 /-!
@@ -38,6 +39,7 @@ a subprocess.
 namespace Corpus
 
 open Lean
+open SourceSyntax
 
 /-- One declaration in the corpus manifest. -/
 structure CorpusManifestEntry where
@@ -255,123 +257,6 @@ private def corpusEligible (env : Environment) (includeInternal includePrivate :
 
 
 
-/-! ## SOURCE signature/body via command-`Syntax` navigation
-
-We reconstruct the SOURCE signature/body by navigating the parsed command
-`Syntax` (NOT a byte heuristic). The top command node is
-`Lean.Parser.Command.declaration` with two children: `[0]` the `declModifiers`
-(where the leading doc comment lives) and `[1]` the inner decl node
-(`theorem`/`definition`/`abbrev`/`instance`/…). Inner child indices DIFFER per
-kind, so we locate sub-nodes by KIND via a DFS rather than by position.
-
-Keying back to `ConstantInfo`: a `declId`'s `ident` carries only the
-SOURCE-LOCAL name (`PAGE_SIZE`, not `LeanSQLite.PAGE_SIZE`), so we cannot match
-it to `info.name` directly. Instead we key a map by the `(line, column)` of each
-declaration's name token, and look each constant up via
-`findDeclarationRanges? info.name |>.selectionRange.pos` — whose `Position`
-points exactly at that name token. Companions/projections/recursors and
-anonymous instances/examples have no matching declId token, so they fall through
-to `(none, none)` as required. -/
-
-/-- DFS pre-order: the first sub-node whose `getKind` is in `kinds`. Used to find
-`declSig`/`optDeclSig` and `declValSimple`/`declValEqns`/`whereStructInst`
-regardless of the per-kind child layout. -/
-private partial def findByKind (stx : Syntax) (kinds : List SyntaxNodeKind) : Option Syntax :=
-  if kinds.contains stx.getKind then some stx
-  else match stx with
-    | .node _ _ args => args.findSome? (findByKind · kinds)
-    | _ => none
-
-private def sigKinds : List SyntaxNodeKind :=
-  [``Lean.Parser.Command.declSig, ``Lean.Parser.Command.optDeclSig]
-private def valKinds : List SyntaxNodeKind :=
-  [``Lean.Parser.Command.declValSimple, ``Lean.Parser.Command.declValEqns,
-   ``Lean.Parser.Command.whereStructInst]
-
-/-- Slice the SOURCE substring for `stx`'s absolute byte range out of `src`
-(`doc.meta.text.source`), trimming trailing ASCII whitespace. `none` if `stx`
-has no original range (synthetic / empty node, e.g. an `optDeclSig` with no
-binders and no type). -/
-private def sliceTrimmed (stx : Syntax) (src : String) : Option String := do
-  let r ← stx.getRange?
-  pure (String.Pos.Raw.extract src r.start r.stop).trimAsciiEnd.copy
-
-/-- Reconstruct `(signature?, body?)` from a `declaration` command's `Syntax`.
-For `declValSimple` (`:= term`) the body is just the term (child `[1]`), so the
-`:=` is excluded; for equations/`where` the whole `declVal` node is used. -/
-private def sigBodyOf (cmdStx : Syntax) (src : String) : Option String × Option String :=
-  let sig := (findByKind cmdStx sigKinds).bind (sliceTrimmed · src)
-  let body := (findByKind cmdStx valKinds).bind fun v =>
-    if v.getKind == ``Lean.Parser.Command.declValSimple then
-      sliceTrimmed v[1] src
-    else
-      sliceTrimmed v src
-  (sig, body)
-
-/-- Build a map from each declaration's name-token `(line, column)` to its
-SOURCE `(signature?, body?)`, by walking the per-command parsed `Syntax`
-(`ElabResult.commands`, which excludes the header). Any non-`declaration` command
-is skipped naturally (no `Command.declId` child). Positions are produced by
-`FileMap.toPosition` so they line up with `findDeclarationRanges?`'s `Position`. -/
-private def buildSourceMap (src : String) (commands : Array Syntax)
-    : Std.HashMap (Nat × Nat) (Option String × Option String) := Id.run do
-  let fileMap := src.toFileMap
-  let mut m : Std.HashMap (Nat × Nat) (Option String × Option String) := {}
-  for cmdStx in commands do
-    if cmdStx.getKind == ``Lean.Parser.Command.declaration then
-      if let some declId := findByKind cmdStx [``Lean.Parser.Command.declId] then
-        if let some idPos := declId[0].getPos? then
-          let p := fileMap.toPosition idPos
-          m := m.insert (p.line, p.column) (sigBodyOf cmdStx src)
-  return m
-
-/-- Build a map from each declaration's name-token `(line, column)` to the FULL
-SOURCE of its command — the entire `declaration` node's range, which begins at
-`declModifiers` (so the leading doc comment and any `@[...]`/`private`/`noncomputable`
-modifiers are included) and runs through the whole body. Unlike `buildSourceMap`
-(which isolates the sig and the value/proof separately, and returns `(none,none)`
-for inductives/structures whose layout it does not decompose), this captures the
-verbatim, re-elaboratable text of the WHOLE declaration for EVERY kind — exactly
-what a self-contained record inlines for its owned `def`/`inductive`/`structure`
-dependencies. Keyed identically to `buildSourceMap` (the name-token position, via
-`findDeclarationRanges?.selectionRange` on the constant side). -/
-private def buildDeclSourceMap (src : String) (commands : Array Syntax)
-    : Std.HashMap (Nat × Nat) String := Id.run do
-  let fileMap := src.toFileMap
-  let mut m : Std.HashMap (Nat × Nat) String := {}
-  for cmdStx in commands do
-    if cmdStx.getKind == ``Lean.Parser.Command.declaration then
-      if let some src? := sliceTrimmed cmdStx src then
-        -- Key by the position `findDeclarationRanges?.selectionRange.pos` reports
-        -- for the constant (which is how `buildEntry` looks the source up):
-        --  * NAMED decl → the `declId` name-token position.
-        --  * ANONYMOUS `instance`/`example` (no `declId`) → the whole command's
-        --    start position (`cmdStx[1]`, the inner decl node — past the
-        --    `declModifiers`), which is what `selectionRange.pos` points at for a
-        --    nameless declaration. Without this, anonymous instances (e.g.
-        --    `instance : Monad M where …`) never landed in the map and had null
-        --    `declSource`, breaking any record whose proof uses that instance.
-        let keyPos? :=
-          match findByKind cmdStx [``Lean.Parser.Command.declId] with
-          | some declId => declId[0].getPos?
-          | none        => (cmdStx.getArg 1).getPos? <|> cmdStx.getPos?
-        if let some p := keyPos? then
-          let pos := fileMap.toPosition p
-          m := m.insert (pos.line, pos.column) src?
-  return m
-
-/-- The `(line, column)` key that a `declaration` command should be filed under —
-the position `findDeclarationRanges?.selectionRange.pos` reports for the constant,
-which is how `buildEntry` looks entries up. NAMED decls key on the `declId`
-name-token; ANONYMOUS `instance`/`example` (no `declId`) key on the inner decl
-node start (`cmdStx[1]`, past `declModifiers`). `none` if neither has a position. -/
-private def declKeyPos (fileMap : FileMap) (cmdStx : Syntax) : Option (Nat × Nat) := do
-  let p ← match findByKind cmdStx [``Lean.Parser.Command.declId] with
-    | some declId => declId[0].getPos?
-    | none        => (cmdStx.getArg 1).getPos? <|> cmdStx.getPos?
-  let pos := fileMap.toPosition p
-  return (pos.line, pos.column)
-
 /-- The SCOPE a declaration was elaborated under: the enclosing namespace path and
 the verbatim source of every scope-setting command in effect. -/
 structure DeclScope where
@@ -418,7 +303,7 @@ private def buildScopeMap (src : String) (commands : Array Syntax)
     let k := cmdStx.getKind
     let srcOf : Option String := sliceTrimmed cmdStx src
     if k == ``Lean.Parser.Command.declaration then
-      if let some key := declKeyPos fileMap cmdStx then
+      if let some key := declarationKey? fileMap cmdStx then
         m := m.insert key { «namespace» := ".".intercalate nsPath.toList,
                             prelude := scopeStack.map (·.2) }
     else if k == ``Lean.Parser.Command.namespace then
