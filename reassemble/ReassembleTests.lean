@@ -186,11 +186,19 @@ private unsafe def testFailures (result : Corpus.Frontend.ElabResult)
   expectFailure "stale declaration location" do
     let _ ← LeanReassemble.planEdits result #[{ first with startLine := some 999 }]
   let overlapping : Array LeanReassemble.Edit := #[
-    { declaration := "first", range := ⟨⟨0⟩, ⟨4⟩⟩, replacement := "x" },
-    { declaration := "second", range := ⟨⟨3⟩, ⟨5⟩⟩, replacement := "y" }
+    { declaration := "first", range := ⟨⟨0⟩, ⟨4⟩⟩, expected := "abcd",
+      replacement := "x" },
+    { declaration := "second", range := ⟨⟨3⟩, ⟨5⟩⟩, expected := "de",
+      replacement := "y" }
   ]
   expectFailure "overlapping edits" do
     let _ ← LeanReassemble.applyEdits "abcdef" overlapping
+  let stale : Array LeanReassemble.Edit := #[
+    { declaration := "stale", range := ⟨⟨0⟩, ⟨3⟩⟩, expected := "xyz",
+      replacement := "x" }
+  ]
+  expectFailure "stale edit source" do
+    let _ ← LeanReassemble.applyEdits "abcdef" stale
   expectFailure "LSP errors" do
     LeanReassemble.validateWithWorker result.file.absPath
       "theorem invalid : True := 1\n"
@@ -201,6 +209,84 @@ private unsafe def testFailures (result : Corpus.Frontend.ElabResult)
       file := "TestFixtures/FrontendError.lean"
       output := "/tmp/lean-reassemble-frontend-error.lean"
     }
+
+private def removeDirIfExists (path : System.FilePath) : IO Unit := do
+  if ← path.pathExists then
+    IO.FS.removeDirAll path
+
+private unsafe def testMaterializers : IO Unit := do
+  let pid ← IO.Process.getPID
+  let repoOutput : System.FilePath := s!"/tmp/lean-reassemble-materialize-repo-{pid}"
+  let unitsOutput : System.FilePath := s!"/tmp/lean-reassemble-materialize-units-{pid}"
+  let movedOutput : System.FilePath := s!"/tmp/lean-reassemble-materialize-moved-{pid}"
+  removeDirIfExists repoOutput
+  removeDirIfExists unitsOutput
+  removeDirIfExists movedOutput
+  let sourceRoot : System.FilePath := "TestProject"
+  let records : System.FilePath := sourceRoot / "records.jsonl"
+  let sourcePath := sourceRoot / "Fixture" / "Basic.lean"
+  let original ← IO.FS.readFile sourcePath
+  try
+    LeanReassemble.materializeRepo {
+      sourceRoot
+      records
+      output := repoOutput
+    }
+    let repoRoot := repoOutput / "repos" / "TestProject"
+    let rewritten ← IO.FS.readFile (repoRoot / "Fixture" / "Basic.lean")
+    assertIO ((rewritten.splitOn "sorry").length == 3)
+      "repository replacement count"
+    assertIO (← (repoRoot / ".lake" / "build" / "lib" / "lean" /
+      "Fixture" / "Basic.olean").pathExists) "repository clean build"
+    assertIO (← (repoRoot / "rewrite-report.json").pathExists)
+      "repository rewrite report"
+    expectFailure "existing materialization output" do
+      LeanReassemble.materializeRepo {
+        sourceRoot
+        records
+        output := repoOutput
+      }
+    LeanReassemble.materializeUnits {
+      sourceRoot
+      records
+      output := unitsOutput
+    }
+    let firstTask := unitsOutput / "units" / "0-Fixture.first"
+    let secondTask := unitsOutput / "units" / "1-Fixture.second"
+    let firstSource ← IO.FS.readFile (firstTask / "src" / "Fixture" / "Basic.lean")
+    let secondSource ← IO.FS.readFile (secondTask / "src" / "Fixture" / "Basic.lean")
+    assertIO (firstSource == rewritten && secondSource == rewritten)
+      "unit source modules"
+    let taskJson ← IO.FS.readFile (firstTask / "task.json")
+    assertIO (taskJson.contains "\"target\": \"Fixture.first\"")
+      "unit target metadata"
+    assertIO (taskJson.contains "\"command\"") "unit replay command"
+    assertIO (!taskJson.contains unitsOutput.toString)
+      "artifact-relative task metadata"
+    let environment ← IO.FS.readFile (unitsOutput / "cache" / "environment.json")
+    assertIO (environment.contains "\"cache/roots/0\"") "unit cache root"
+    assertIO (!environment.contains ".work") "artifact-relative cache metadata"
+    assertIO (!(← (unitsOutput / ".work").pathExists)) "temporary build removal"
+    IO.FS.rename unitsOutput movedOutput
+    let movedSrcRoot := movedOutput / "units" / "0-Fixture.first" / "src"
+    let sysroot ← Lean.findSysroot
+    let replay ← IO.Process.output {
+      cmd := (sysroot / "bin" / "lean").toString
+      args := #["-R", movedSrcRoot.toString,
+        (movedSrcRoot / "Fixture" / "Basic.lean").toString]
+      cwd := some movedOutput
+      env := #[
+        ("LEAN_PATH", some ((movedOutput / "cache" / "roots" / "0").toString)),
+        ("LD_LIBRARY_PATH", some ((movedOutput / "cache" / "native" / "0").toString))
+      ]
+    }
+    assertIO (replay.exitCode == 0) "moved unit replay"
+    assertIO ((← IO.FS.readFile sourcePath) == original) "source tree unchanged"
+    assertIO (!(← (sourceRoot / ".lake").pathExists)) "source build cache unchanged"
+  finally
+    removeDirIfExists repoOutput
+    removeDirIfExists unitsOutput
+    removeDirIfExists movedOutput
 
 unsafe def run : IO Unit := do
   let result ← fixtureResult
@@ -218,6 +304,7 @@ unsafe def run : IO Unit := do
   let actual ← IO.FS.readFile output
   let expected ← IO.FS.readFile "TestFixtures/RewriteFixture.expected.lean"
   assertIO (actual == expected) "end-to-end rewrite output"
+  testMaterializers
   IO.println "reassemble tests passed"
 
 end ReassembleTests
