@@ -1,0 +1,6 @@
+name = "ReassemblyTestProject"
+version = "0.1.0"
+defaultTargets = ["Fixture"]
+
+[[lean_lib]]
+name = "Fixture"

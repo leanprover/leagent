@@ -18,8 +18,15 @@ structure RewriteConfig where
 structure Edit where
   declaration : String
   range : Lean.Syntax.Range
+  expected : String
   replacement : String
   deriving Inhabited, Repr
+
+structure RewriteResult where
+  sourcePath : System.FilePath
+  moduleName : Name
+  text : String
+  edits : Array Edit
 
 private structure Candidate where
   name : String
@@ -120,6 +127,9 @@ def validateEdits (source : String) (edits : Array Edit) : IO Unit := do
     if edit.range.start.byteIdx > edit.range.stop.byteIdx ||
         edit.range.stop.byteIdx > sourceSize then
       fail s!"invalid proof range for {edit.declaration}"
+    let actual := String.Pos.Raw.extract source edit.range.start edit.range.stop
+    if actual != edit.expected then
+      fail s!"source changed at proof range for {edit.declaration}"
   let ascending := edits.qsort fun a b => a.range.start.byteIdx < b.range.start.byteIdx
   for index in [1:ascending.size] do
     let previous := ascending[index - 1]!
@@ -153,23 +163,30 @@ def planEdits (frontendResult : Corpus.Frontend.ElabResult)
       | fail s!"declaration syntax not found for {record.name}"
     let some (kind, range) := Corpus.SourceSyntax.proofRange? command
       | fail s!"proof syntax not found for {record.name}"
+    let expected := String.Pos.Raw.extract frontendResult.source range.start range.stop
+    if let some body := record.body then
+      if expected.trimAsciiEnd.toString != body then
+        fail s!"record body does not match source proof for {record.name}"
     edits := edits.push {
       declaration := record.name
       range
+      expected
       replacement := replacementFor kind (commandIndent frontendResult.source command)
     }
   validateEdits frontendResult.source edits
   return edits
 
-/-- Apply byte-range edits from the end of the file toward the beginning. -/
+/-- Apply validated byte-range edits in one left-to-right pass. -/
 def applyEdits (source : String) (edits : Array Edit) : IO String := do
   validateEdits source edits
-  let descending := edits.qsort fun a b => a.range.start.byteIdx > b.range.start.byteIdx
-  let mut result := source
-  for edit in descending do
-    let before := String.Pos.Raw.extract result 0 edit.range.start
-    let after := String.Pos.Raw.extract result edit.range.stop result.rawEndPos
-    result := before ++ edit.replacement ++ after
+  let ascending := edits.qsort fun a b => a.range.start.byteIdx < b.range.start.byteIdx
+  let mut result := ""
+  let mut cursor : String.Pos.Raw := 0
+  for edit in ascending do
+    result := result ++ String.Pos.Raw.extract source cursor edit.range.start
+    result := result ++ edit.replacement
+    cursor := edit.range.stop
+  result := result ++ String.Pos.Raw.extract source cursor source.rawEndPos
   return result
 
 /-- Reject edited text that produces an LSP error diagnostic. -/
@@ -195,31 +212,22 @@ def validateWithWorker (sourcePath : System.FilePath) (text : String)
     let _ ← worker.shutdown
 
 /-- Rewrite one source file and validate the edited document before writing it. -/
-unsafe def rewriteFile (config : RewriteConfig) : IO Unit := do
-  let root ← IO.FS.realPath config.sourceRoot
-  let relFile := normalizeRelativePath config.file
+unsafe def rewriteSourceFile (sourceRoot : System.FilePath)
+    (records : Array Corpus.ConstRecord) (file : String) : IO RewriteResult := do
+  let root ← IO.FS.realPath sourceRoot
+  let relFile := normalizeRelativePath file
   let requestedPath : System.FilePath := relFile
   if requestedPath.isAbsolute then
-    fail s!"--file must be project-relative: {config.file}"
+    fail s!"--file must be project-relative: {file}"
   let sourcePath := root / relFile
   if !(← sourcePath.pathExists) then
     fail s!"source file does not exist: {sourcePath}"
-  let cwd ← IO.currentDir
-  let output :=
-    if config.output.isAbsolute then config.output else cwd / config.output
-  let outputAbs := output.normalize
   let sourceAbs ← IO.FS.realPath sourcePath
   unless isWithin root sourceAbs do
-    fail s!"source file escapes --source-root: {config.file}"
-  if outputAbs.toString == sourceAbs.toString then
-    fail "output path must differ from the source file"
-  if ← outputAbs.pathExists then
-    let resolvedOutput ← IO.FS.realPath outputAbs
-    if resolvedOutput.toString == sourceAbs.toString then
-      fail "output path must not resolve to the source file"
+    fail s!"source file escapes --source-root: {file}"
   let some moduleName := Corpus.Discover.filePathToModule root sourceAbs
     | fail s!"cannot derive module name for {sourcePath}"
-  let records ← selectTheorems (← readRecords config.records) relFile
+  let selected ← selectTheorems records relFile
   Corpus.Frontend.initFrontend
   let importLock : Corpus.Frontend.ImportLock ← Std.Mutex.new ()
   let frontendResult ← Corpus.Frontend.elaborateFile importLock {
@@ -229,11 +237,26 @@ unsafe def rewriteFile (config : RewriteConfig) : IO Unit := do
   }
   if frontendResult.hasErrors then
     fail s!"frontend elaboration failed for {sourcePath}"
-  let edits ← planEdits frontendResult records
+  let edits ← planEdits frontendResult selected
   let rewritten ← applyEdits frontendResult.source edits
   validateWithWorker sourceAbs rewritten
+  return { sourcePath := sourceAbs, moduleName, text := rewritten, edits }
+
+/-- Rewrite one source file and validate the edited document before writing it. -/
+unsafe def rewriteFile (config : RewriteConfig) : IO Unit := do
+  let cwd ← IO.currentDir
+  let output :=
+    if config.output.isAbsolute then config.output else cwd / config.output
+  let outputAbs := output.normalize
+  let result ← rewriteSourceFile config.sourceRoot (← readRecords config.records) config.file
+  if outputAbs.toString == result.sourcePath.toString then
+    fail "output path must differ from the source file"
+  if ← outputAbs.pathExists then
+    let resolvedOutput ← IO.FS.realPath outputAbs
+    if resolvedOutput.toString == result.sourcePath.toString then
+      fail "output path must not resolve to the source file"
   if let some parent := outputAbs.parent then
     IO.FS.createDirAll parent
-  IO.FS.writeFile outputAbs rewritten
+  IO.FS.writeFile outputAbs result.text
 
 end LeanReassemble
