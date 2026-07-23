@@ -193,29 +193,31 @@ private def copySearchRoots (artifact sysroot : System.FilePath)
     (roots : Array System.FilePath) : IO (Array String) := do
   let mut copied := #[]
   for root in roots do
-    let absolute ← IO.FS.realPath root
-    if !isWithin sysroot absolute then
-      let relative : System.FilePath :=
-        ("cache" : System.FilePath) / "roots" / toString copied.size
-      copyCacheTree absolute (artifact / relative)
-      copied := copied.push (artifactPath relative)
+    if ← root.pathExists then
+      let absolute ← IO.FS.realPath root
+      if !isWithin sysroot absolute then
+        let relative : System.FilePath :=
+          ("cache" : System.FilePath) / "roots" / toString copied.size
+        copyCacheTree absolute (artifact / relative)
+        copied := copied.push (artifactPath relative)
   return copied
 
 private def copyNativeRoots (artifact sysroot : System.FilePath)
     (roots : Array System.FilePath) : IO (Array String) := do
   let mut copied := #[]
   for root in roots do
-    let absolute ← IO.FS.realPath root
-    if !isWithin sysroot absolute then
-      let relative : System.FilePath :=
-        ("cache" : System.FilePath) / "native" / toString copied.size
-      let destination := artifact / relative
-      IO.FS.createDirAll destination
-      for entry in (← absolute.readDir) do
-        unless ← entry.path.isDir do
-          let _ ← runChecked destination "cp" #["-aL", entry.path.toString,
-            destination.toString]
-      copied := copied.push (artifactPath relative)
+    if ← root.pathExists then
+      let absolute ← IO.FS.realPath root
+      if !isWithin sysroot absolute then
+        let relative : System.FilePath :=
+          ("cache" : System.FilePath) / "native" / toString copied.size
+        let destination := artifact / relative
+        IO.FS.createDirAll destination
+        for entry in (← absolute.readDir) do
+          unless ← entry.path.isDir do
+            let _ ← runChecked destination "cp" #["-aL", entry.path.toString,
+              destination.toString]
+        copied := copied.push (artifactPath relative)
   return copied
 
 private def absoluteArtifactPaths (artifact : System.FilePath)
