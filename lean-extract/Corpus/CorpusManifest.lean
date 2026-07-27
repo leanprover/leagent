@@ -302,8 +302,8 @@ private def buildScopeMap (src : String) (commands : Array Syntax)
   for cmdStx in commands do
     let k := cmdStx.getKind
     let srcOf : Option String := sliceTrimmed cmdStx src
-    if k == ``Lean.Parser.Command.declaration then
-      if let some key := declarationKey? fileMap cmdStx then
+    if (declarationId? cmdStx).isSome then
+      for key in declarationKeys fileMap cmdStx do
         m := m.insert key { «namespace» := ".".intercalate nsPath.toList,
                             prelude := scopeStack.map (·.2) }
     else if k == ``Lean.Parser.Command.namespace then
@@ -407,7 +407,7 @@ private def simpPoolClosers (pool : Array Name) : Array String :=
     let argList := ", ".intercalate (pool.toList.map toString)
     #[s!"simp [{argList}]", s!"simp_all [{argList}]"]
 
-/-- Map each declaration's name-token `(line, column)` to the pooled-lemma simp
+/-- Map each declaration key `(line, column)` to the pooled-lemma simp
 closer candidates harvested from its proof syntax (see `harvestSimpPool`). Keyed
 like `buildSourceMap` so `buildEntry` can look up a constant's candidates by its
 `findDeclarationRanges?` selection position. -/
@@ -416,12 +416,10 @@ private def buildSimpArgMap (src : String) (commands : Array Syntax)
   let fileMap := src.toFileMap
   let mut m : Std.HashMap (Nat × Nat) (Array String) := {}
   for cmdStx in commands do
-    if cmdStx.getKind == ``Lean.Parser.Command.declaration then
-      if let some declId := findByKind cmdStx [``Lean.Parser.Command.declId] then
-        if let some idPos := declId[0].getPos? then
-          let p := fileMap.toPosition idPos
-          let pool ← harvestSimpPool cmdStx
-          m := m.insert (p.line, p.column) (simpPoolClosers pool)
+    if (declarationId? cmdStx).isSome then
+      let pool ← harvestSimpPool cmdStx
+      for key in declarationKeys fileMap cmdStx do
+        m := m.insert key (simpPoolClosers pool)
   return m
 
 
