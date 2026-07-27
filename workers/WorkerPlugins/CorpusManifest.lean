@@ -9,6 +9,7 @@ import Lean.Server.Snapshots
 import Lean.Util.CollectAxioms
 import Lean.Data.Lsp.Basic
 import Lean.PrettyPrinter
+import Lean.Elab.DeclarationRange
 import WorkerPlugins.Common
 import WorkerPlugins.ReverseElab
 
@@ -361,6 +362,42 @@ private partial def findByKind (stx : Syntax) (kinds : List SyntaxNodeKind) : Op
     | .node _ _ args => args.findSome? (findByKind · kinds)
     | _ => none
 
+private def innerDeclarationSyntax (cmdStx : Syntax) : Syntax :=
+  cmdStx.getArg 1
+
+private def declarationSelectionRef? (cmdStx : Syntax) : Option Syntax :=
+  if cmdStx.getKind == ``Lean.Parser.Command.declaration then
+    some (Lean.Elab.getDeclarationSelectionRef (innerDeclarationSyntax cmdStx))
+  else if (findByKind cmdStx [``Lean.Parser.Command.declId]).isSome then
+    some (Lean.Elab.getDeclarationSelectionRef cmdStx)
+  else
+    none
+
+private def syntaxKey? (fileMap : FileMap) (stx : Syntax) : Option (Nat × Nat) := do
+  let rawPos ← stx.getPos?
+  let pos := fileMap.toPosition rawPos
+  return (pos.line, pos.column)
+
+private def declarationNameKey? (fileMap : FileMap) (cmdStx : Syntax) : Option (Nat × Nat) := do
+  let rawPos ← match findByKind cmdStx [``Lean.Parser.Command.declId] with
+    | some declId => declId[0].getPos?
+    | none => cmdStx.getPos?
+  let pos := fileMap.toPosition rawPos
+  return (pos.line, pos.column)
+
+private def declarationKey? (fileMap : FileMap) (cmdStx : Syntax) : Option (Nat × Nat) :=
+  (declarationSelectionRef? cmdStx).bind (syntaxKey? fileMap ·) <|>
+    declarationNameKey? fileMap cmdStx
+
+private def declarationKeys (fileMap : FileMap) (cmdStx : Syntax) : Array (Nat × Nat) := Id.run do
+  let mut keys := #[]
+  if let some key := declarationNameKey? fileMap cmdStx then
+    keys := keys.push key
+  if let some key := declarationKey? fileMap cmdStx then
+    if !keys.contains key then
+      keys := keys.push key
+  return keys
+
 private def sigKinds : List SyntaxNodeKind :=
   [``Lean.Parser.Command.declSig, ``Lean.Parser.Command.optDeclSig]
 private def valKinds : List SyntaxNodeKind :=
@@ -398,11 +435,9 @@ private def buildSourceMap (src : String) (snaps : Array Snapshots.Snapshot)
   let mut m : Std.HashMap (Nat × Nat) (Option String × Option String) := {}
   for snap in snaps do
     let cmdStx := snap.stx
-    if cmdStx.getKind == ``Lean.Parser.Command.declaration then
-      if let some declId := findByKind cmdStx [``Lean.Parser.Command.declId] then
-        if let some idPos := declId[0].getPos? then
-          let p := fileMap.toPosition idPos
-          m := m.insert (p.line, p.column) (sigBodyOf cmdStx src)
+    if (findByKind cmdStx [``Lean.Parser.Command.declId]).isSome then
+      for key in declarationKeys fileMap cmdStx do
+        m := m.insert key (sigBodyOf cmdStx src)
   return m
 
 /-- Syntax kinds of the simp-family tactics whose argument-lists we harvest from
@@ -482,7 +517,7 @@ private def simpPoolClosers (pool : Array Name) : Array String :=
     let argList := ", ".intercalate (pool.toList.map toString)
     #[s!"simp [{argList}]", s!"simp_all [{argList}]"]
 
-/-- Map each declaration's name-token `(line, column)` to the pooled-lemma simp
+/-- Map each declaration key `(line, column)` to the pooled-lemma simp
 closer candidates harvested from its proof syntax (see `harvestSimpPool`). Keyed
 like `buildSourceMap` so `buildEntry` can look up a constant's candidates by its
 `findDeclarationRanges?` selection position. -/
@@ -492,12 +527,10 @@ private def buildSimpArgMap (src : String) (snaps : Array Snapshots.Snapshot)
   let mut m : Std.HashMap (Nat × Nat) (Array String) := {}
   for snap in snaps do
     let cmdStx := snap.stx
-    if cmdStx.getKind == ``Lean.Parser.Command.declaration then
-      if let some declId := findByKind cmdStx [``Lean.Parser.Command.declId] then
-        if let some idPos := declId[0].getPos? then
-          let p := fileMap.toPosition idPos
-          let pool ← harvestSimpPool cmdStx
-          m := m.insert (p.line, p.column) (simpPoolClosers pool)
+    if (findByKind cmdStx [``Lean.Parser.Command.declId]).isSome then
+      let pool ← harvestSimpPool cmdStx
+      for key in declarationKeys fileMap cmdStx do
+        m := m.insert key (simpPoolClosers pool)
   return m
 
 private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))

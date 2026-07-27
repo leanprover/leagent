@@ -102,8 +102,7 @@ private def commandForKey? (source : String) (commands : Array Syntax)
     (key : Nat × Nat) : Option Syntax :=
   let fileMap := source.toFileMap
   commands.find? fun command =>
-    command.getKind == ``Lean.Parser.Command.declaration &&
-      Corpus.SourceSyntax.declarationKey? fileMap command == some key
+    Corpus.SourceSyntax.declarationKeys fileMap command |>.contains key
 
 private def commandIndent (source : String) (command : Syntax) : String := Id.run do
   let some range := Corpus.SourceSyntax.commandRange? command | return ""
