@@ -154,6 +154,38 @@ private def testRewritePlan (result : Corpus.Frontend.ElabResult)
   assertIO (bytesOutsideEditsUnchanged result.source rewritten edits)
     "bytes outside proof ranges"
 
+/-- `--proofs keep` must locate and validate every proof exactly as `sorry` mode
+does, then write the file back unchanged. Byte-identical output is the assertion
+that matters: it means the edit ranges were right, since a wrong range would
+splice the wrong slice back. -/
+private def testKeepProofs (result : Corpus.Frontend.ElabResult)
+    (records : Array Corpus.ConstRecord) : IO Unit := do
+  let selected ← LeanReassemble.selectTheorems records result.file.relPath
+  let keepEdits ← LeanReassemble.planEdits result selected .keep
+  let sorryEdits ← LeanReassemble.planEdits result selected .replace
+  -- Same declarations, same ranges — only the replacement text differs.
+  assertIO (keepEdits.size == selected.size) "keep mode plans one edit per theorem"
+  assertIO (keepEdits.size == sorryEdits.size) "keep and sorry plan the same edits"
+  for index in [:keepEdits.size] do
+    let keep := keepEdits[index]!
+    let repl := sorryEdits[index]!
+    assertIO (keep.declaration == repl.declaration) "keep edit order matches"
+    assertIO (keep.range.start.byteIdx == repl.range.start.byteIdx &&
+              keep.range.stop.byteIdx == repl.range.stop.byteIdx)
+      s!"keep and sorry select the same range for {keep.declaration}"
+    -- The kept replacement IS the original slice, and the sorry one is not.
+    assertIO (keep.replacement == keep.expected)
+      s!"keep replacement is not the original proof for {keep.declaration}"
+    assertIO (repl.replacement.contains "sorry")
+      s!"sorry mode did not produce a sorry for {repl.declaration}"
+  -- Applying kept edits is the identity, across every proof form the fixture
+  -- covers (term, tactic, equations, where, comments, Unicode, private).
+  let kept ← LeanReassemble.applyEdits result.source keepEdits
+  assertIO (kept == result.source) "keep mode output is byte-identical to source"
+  -- And it is genuinely different from what sorry mode produces.
+  let sorried ← LeanReassemble.applyEdits result.source sorryEdits
+  assertIO (kept != sorried) "keep and sorry produced the same output"
+
 private def testManifestParity (result : Corpus.Frontend.ElabResult)
     (records : Array Corpus.ConstRecord) : IO Unit := do
   let shared := Corpus.SourceSyntax.buildSourceMap result.source result.commands
@@ -255,8 +287,22 @@ private unsafe def testMaterializers : IO Unit := do
     let secondTask := unitsOutput / "units" / "1-Fixture.second"
     let firstSource ← IO.FS.readFile (firstTask / "src" / "Fixture" / "Basic.lean")
     let secondSource ← IO.FS.readFile (secondTask / "src" / "Fixture" / "Basic.lean")
-    assertIO (firstSource == rewritten && secondSource == rewritten)
-      "unit source modules"
+    -- A unit is a task for ONE theorem: exactly its own proof is holed out, and
+    -- every neighbour in the module keeps its real proof. (The whole-file rewrite
+    -- `rewritten` sorries BOTH, which is right for materialize-repo and wrong here.)
+    assertIO ((firstSource.splitOn "sorry").length == 2)
+      "first unit holes exactly one proof"
+    assertIO ((secondSource.splitOn "sorry").length == 2)
+      "second unit holes exactly one proof"
+    assertIO (firstSource != secondSource)
+      "units for different targets must differ"
+    assertIO (firstSource != rewritten && secondSource != rewritten)
+      "a unit must not be the whole-file rewrite"
+    -- The target is holed and the neighbour is intact, in each direction.
+    assertIO (firstSource.contains "theorem second : preserved = 7 := rfl")
+      "first unit preserved the neighbour's proof"
+    assertIO (secondSource.contains "trivial")
+      "second unit preserved the neighbour's proof"
     let taskJson ← IO.FS.readFile (firstTask / "task.json")
     assertIO (taskJson.contains "\"target\": \"Fixture.first\"")
       "unit target metadata"
@@ -292,6 +338,7 @@ unsafe def run : IO Unit := do
   let result ← fixtureResult
   let records ← LeanReassemble.readRecords "TestFixtures/records.jsonl"
   testRewritePlan result records
+  testKeepProofs result records
   testManifestParity result records
   testFailures result records
   let output := "/tmp/lean-reassemble-rewrite-test.lean"
@@ -304,6 +351,18 @@ unsafe def run : IO Unit := do
   let actual ← IO.FS.readFile output
   let expected ← IO.FS.readFile "TestFixtures/RewriteFixture.expected.lean"
   assertIO (actual == expected) "end-to-end rewrite output"
+  -- End-to-end keep mode: the written file reproduces the source exactly.
+  let keepOutput := "/tmp/lean-reassemble-keep-test.lean"
+  LeanReassemble.rewriteFile {
+    sourceRoot := "."
+    records := "TestFixtures/records.jsonl"
+    file := result.file.relPath
+    output := keepOutput
+    proofMode := .keep
+  }
+  let keptFile ← IO.FS.readFile keepOutput
+  let original ← IO.FS.readFile "TestFixtures/RewriteFixture.lean"
+  assertIO (keptFile == original) "end-to-end keep output matches the source file"
   testMaterializers
   IO.println "reassemble tests passed"
 

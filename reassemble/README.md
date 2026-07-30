@@ -8,19 +8,20 @@ lake exe lean_reassemble rewrite-file \
   --source-root <lake-project> \
   --records <records.jsonl> \
   --file <project-relative.lean> \
-  --output <rewritten.lean>
+  --output <rewritten.lean> \
+  [--proofs sorry|keep]
 
 lake exe lean_reassemble materialize-repo \
   --source-root <lake-project> \
   --records <records.jsonl> \
   --output <artifact-dir> \
-  [--build-target <target>]
+  [--build-target <target>] [--proofs sorry|keep]
 
 lake exe lean_reassemble materialize-units \
   --source-root <lake-project> \
   --records <records.jsonl> \
   --output <artifact-dir> \
-  [--build-target <target>]
+  [--build-target <target>] [--proofs sorry|keep]
 ```
 
 Run these from `leagent/reassemble`. The source root must be a Lake project with
@@ -33,6 +34,54 @@ The reassembler consumes extraction JSONL records. For repository or unit
 materialization, pass records for one source project at a time. The records file
 must contain theorem records with `file`, `module`, `name`, and source location
 metadata matching the source checkout.
+
+`materialize-units` emits one task per theorem record, each holing only its own
+target. `materialize-repo` differs: it holes **every** record in one artifact, so
+pass it only the theorems you want sorried.
+
+## Proof Modes
+
+`--proofs` controls what happens to each selected theorem's proof:
+
+| Mode | Effect |
+|---|---|
+| `sorry` (default) | Replace the proof with `by sorry` — the training/eval artifact. |
+| `keep` | Preserve the proof verbatim — the compilable **reference state**. |
+
+`keep` is not a bypass. It runs the identical pipeline — match each record to
+exactly one declaration, obtain the proof range from parsed `Syntax`, check the
+recorded `body` against the source — and then writes the original text back
+instead of a `sorry`. The output is byte-identical to the source, which is what
+makes it meaningful: a wrong range would splice back the wrong slice, so an
+identical result is evidence the extraction agrees with the source.
+
+Two uses:
+
+- **Intermediate compilable state.** Get a buildable checkout corresponding to an
+  extractor run, before any proofs are holed out.
+- **Diff oracle.** Materialize the same records twice and diff. Every differing
+  hunk is a replaced proof and nothing else, which validates a sorried artifact:
+
+  ```bash
+  lake exe lean_reassemble materialize-repo --source-root ../proj \
+    --records t.jsonl --output /tmp/ref --proofs keep
+  lake exe lean_reassemble materialize-repo --source-root ../proj \
+    --records t.jsonl --output /tmp/holed
+  diff -r --exclude=.lake --exclude=rewrite-report.json \
+    /tmp/ref/repos/proj /tmp/holed/repos/proj
+  ```
+
+Under `keep`, unit verification is *stricter*: `sorry` warnings are permitted in
+`sorry` mode (the target is expected to warn) but rejected in `keep` mode, since a
+preserved artifact should compile with no diagnostics at all.
+
+`rewrite-report.json` and `manifest.json` record the mode, and count edits as
+`preserved` rather than `replaced`:
+
+```json
+{ "proof_mode": "keep", "eligible": 104, "replaced": 0,
+  "preserved": 104, "skipped": 0, "failed": 0 }
+```
 
 ## Repository Artifacts
 
@@ -47,8 +96,8 @@ metadata matching the source checkout.
 ```
 
 It copies the source project, removes `.git` and `.lake`, rewrites every theorem
-body in the provided records to `by sorry`, then runs `lake build` or
-`lake build <target>`.
+body in the provided records to `by sorry` (or preserves them under
+`--proofs keep`), then runs `lake build` or `lake build <target>`.
 
 Example:
 
@@ -85,10 +134,26 @@ lake build
       task.json
 ```
 
-Each task source is the complete original module with all theorem bodies from
-the selected records replaced by `by sorry`. The materializer builds a pristine
-copy of the source project first, copies the required `LEAN_PATH` and native
-library roots into `cache/`, and verifies each task with Lean directly.
+Each task is a proof problem for **one** theorem. Its source is the complete
+original module with only *that* theorem's proof replaced by `by sorry`; every
+other declaration in the module keeps its real proof, including lemmas the target
+depends on. Two tasks from the same module therefore differ, each holing its own
+target.
+
+The whole module is retained rather than extracting the theorem alone because
+private names, section variables, notation, and options are not reproducible in a
+fresh file — see [`docs/corpus-reassembly.md`](../docs/corpus-reassembly.md).
+
+Under `--proofs keep` nothing is holed, so every task from a given module is the
+same (unmodified) file; keep mode is usually more useful with `materialize-repo`.
+
+The materializer builds a pristine copy of the source project first, copies the
+required `LEAN_PATH` and native library roots into `cache/`, and verifies each task
+with Lean directly.
+
+Each source file is elaborated once and reused across all of its targets, so the
+per-task cost is a byte-splice plus one Lean verification. Expect roughly a second
+per task: 104 theorems over 10 files took about two minutes.
 
 Example:
 
@@ -100,6 +165,39 @@ lake exe lean_reassemble materialize-units \
   --records /path/to/project-theorems.jsonl \
   --output /tmp/project-units
 ```
+
+## Single-Theorem Units
+
+`lean-extract --decl <Name>` extracts one theorem plus its dependency closure and
+writes the target record on its own to `data/target.jsonl`. Passing that file here
+produces exactly one task, for that theorem:
+
+```bash
+# 1. Extract one theorem's closure.
+cd /path/to/leagent/lean-extract
+./.lake/build/bin/lean_extract \
+  --modules     Project \
+  --source-root ../../source-project \
+  --decl        Project.Btree.insert_sound \
+  --output      ./decl-out
+
+# 2. Materialize it as a single unit.
+cd ../reassemble
+lake exe lean_reassemble materialize-units \
+  --source-root ../../source-project \
+  --records     ../lean-extract/decl-out/Project.Btree.insert_sound/data/target.jsonl \
+  --output      /tmp/insert-sound-unit
+```
+
+The remaining files in that closure directory — `theorems/train.jsonl`,
+`definitions.jsonl`, and `metadata.json` — are context for whatever fills the hole,
+not materialization input. Each record's `closure_role` says whether it is needed
+to state the target or was used only by its original proof.
+
+Passing `theorems/train.jsonl` instead is also safe — each emitted task holes only
+its own target — but it produces one task per closure member rather than the single
+task you probably want. See
+[`docs/single-decl-extraction.md`](../docs/single-decl-extraction.md).
 
 ## Replaying A Unit
 
@@ -116,6 +214,15 @@ export LEAN_PATH="$(find "$ARTIFACT/cache/roots" -mindepth 1 -maxdepth 1 -type d
 export LD_LIBRARY_PATH="$(find "$ARTIFACT/cache/native" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | paste -sd: -)"
 
 lean -R "$TASK/src" "$SOURCE"
+```
+
+The `lean` on your `PATH` must be the toolchain the cache was built with, or the
+`.olean`s will be rejected with `incompatible header`. `task.json` records the
+exact pin, so the portable form is:
+
+```bash
+elan run "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["toolchain"])' "$TASK/task.json")" \
+  lean -R "$TASK/src" "$SOURCE"
 ```
 
 For a dataset consumer, the durable contract is:
