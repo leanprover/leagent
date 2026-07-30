@@ -1,14 +1,22 @@
 import LeanReassemble.Rewrite
+import Corpus.Artifact
 
 namespace LeanReassemble
 
 open Lean
+-- One shared implementation with the extractor: `--decl` names its output
+-- directory with the same function that names a unit task id here, so the two
+-- artifacts correspond by construction rather than by convention.
+open Corpus.Artifact (safeName)
 
 structure MaterializeConfig where
   sourceRoot : System.FilePath
   records : System.FilePath
   output : System.FilePath
   buildTarget : Option String := none
+  /-- `.replace` (default) holes out each selected proof; `.keep` preserves them,
+  producing the compilable reference state of the same records. See `ProofMode`. -/
+  proofMode : ProofMode := .replace
 
 private def fail {α} (message : String) : IO α :=
   throw <| IO.userError s!"lean-reassemble: {message}"
@@ -96,7 +104,7 @@ private def eligibleTheorems (records : Array Corpus.ConstRecord) :
     IO (Array Corpus.ConstRecord) := do
   let mut result := #[]
   for record in records do
-    if record.kind == "theorem" || record.kind == "private theorem" then
+    if Corpus.Artifact.isTheoremRecord record then
       if record.file.isNone then
         fail s!"theorem record {record.name} has no file"
       result := result.push record
@@ -115,6 +123,22 @@ private def theoremFiles (records : Array Corpus.ConstRecord) : Array String := 
         result := result.push file
   return result.qsort (· < ·)
 
+/-- How many of `records` belonging to `file` were ALREADY incomplete in the source
+(their transitive axioms include `sorryAx`). Those declarations warn when the module
+is compiled no matter what we rewrite, so they set the baseline a unit's `sorry`
+warnings are measured against.
+
+Only theorem records carry `axioms`, and only records for this file matter, since a
+unit compiles exactly one module. -/
+private def sourceSorryCountFor (records : Array Corpus.ConstRecord) (file : String)
+    : Nat :=
+  records.foldl (init := 0) fun acc record =>
+    match record.file with
+    | some recordFile =>
+        if normalizeRelativePath recordFile == file && record.axioms.contains "sorryAx"
+        then acc + 1 else acc
+    | none => acc
+
 private def buildArgs (target : Option String) : Array String :=
   #["build"] ++ target.toArray
 
@@ -123,10 +147,15 @@ private def projectName (root : System.FilePath) : IO String :=
   | some name => pure name
   | none => fail s!"cannot derive project name from {root}"
 
-private def rewriteSummary (eligible replaced : Nat) : Json :=
+/-- The rewrite summary. `replaced` counts proofs turned into `sorry`; under
+`.keep` nothing is replaced, and `preserved` reports the same edits instead — the
+proofs were located and validated, just written back unchanged. -/
+private def rewriteSummary (mode : ProofMode) (eligible edits : Nat) : Json :=
   Json.mkObj [
+    ("proof_mode", toString mode),
     ("eligible", eligible),
-    ("replaced", replaced),
+    ("replaced", if mode == .keep then 0 else edits),
+    ("preserved", if mode == .keep then edits else 0),
     ("skipped", 0),
     ("failed", 0)
   ]
@@ -144,7 +173,7 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
   let mut replaced := 0
   let mut rewrittenFiles : Array Json := #[]
   for file in theoremFiles theorems do
-    let result ← rewriteSourceFile sourceRoot records file
+    let result ← rewriteSourceFile sourceRoot records file config.proofMode
     let outputPath := repoRoot / file
     if let some parent := outputPath.parent then
       IO.FS.createDirAll parent
@@ -153,15 +182,16 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
     rewrittenFiles := rewrittenFiles.push <| Json.mkObj [
       ("file", file),
       ("module", result.moduleName.toString),
-      ("replacements", result.edits.size)
+      ("edits", result.edits.size)
     ]
   if replaced != theorems.size then
-    fail s!"replacement count mismatch: expected {theorems.size}, replaced {replaced}"
+    fail s!"edit count mismatch: expected {theorems.size} theorem(s), \
+      edited {replaced} (proof mode: {config.proofMode})"
   let _ ← runChecked repoRoot "lake" (buildArgs config.buildTarget) cleanLakeEnv
   let report := Json.mkObj [
     ("format", "lean-corpus-rewrite-report.v1"),
     ("files", Json.arr rewrittenFiles),
-    ("rewrite_summary", rewriteSummary theorems.size replaced),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size replaced),
     ("verification", Json.mkObj [("status", "passed"), ("command",
       String.intercalate " " (["lake", "build"] ++ config.buildTarget.toList))])
   ]
@@ -172,7 +202,7 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
     ("project", name),
     ("repository", artifactPath repoRel),
     ("build_target", toJson config.buildTarget),
-    ("rewrite_summary", rewriteSummary theorems.size replaced),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size replaced),
     ("verification", Json.mkObj [("status", "passed")])
   ]
 
@@ -227,10 +257,6 @@ private def absoluteArtifactPaths (artifact : System.FilePath)
 private def envValue (paths : Array String) : String :=
   System.SearchPath.toString (paths.toList.map System.FilePath.mk)
 
-private def safeName (name : String) : String :=
-  name.map fun char =>
-    if char.isAlphanum || char == '.' || char == '_' || char == '-' then char else '_'
-
 private def replacementSpan? (edits : Array Edit) (declaration : String) :
     Option (Nat × Nat) := Id.run do
   let ascending := edits.qsort fun a b => a.range.start.byteIdx < b.range.start.byteIdx
@@ -245,7 +271,8 @@ private def replacementSpan? (edits : Array Edit) (declaration : String) :
     outputCursor := stop
   return none
 
-private def unitTaskJson (id sourceRel toolchain : String) (record : Corpus.ConstRecord)
+private def unitTaskJson (id sourceRel toolchain proofMode : String)
+    (record : Corpus.ConstRecord)
     (span : Nat × Nat) (leanRoots nativeRoots : Array String)
     (diagnostics : String) : Json :=
   let srcRoot := s!"units/{id}/src"
@@ -262,6 +289,7 @@ private def unitTaskJson (id sourceRel toolchain : String) (record : Corpus.Cons
     ("replacement", Json.mkObj [("start_byte", span.1), ("end_byte", span.2)]),
     ("lean_path", Json.arr (leanRoots.map Json.str)),
     ("ld_library_path", Json.arr (nativeRoots.map Json.str)),
+    ("proof_mode", proofMode),
     ("verification", Json.mkObj [
       ("status", "passed"),
       ("exit_code", 0),
@@ -305,16 +333,24 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     ("LEAN_PATH", some (envValue (absoluteArtifactPaths artifact leanRoots))),
     ("LD_LIBRARY_PATH", some (envValue (absoluteArtifactPaths artifact nativeRoots)))
   ]
-  let mut rewrittenByFile : Std.HashMap String RewriteResult := {}
+  -- Elaborate each source file ONCE, then derive a per-target rewrite from it.
+  -- Elaboration is the expensive step, so it is shared; the cheap byte-splice is
+  -- what varies per task.
+  let mut preparedByFile : Std.HashMap String PreparedFile := {}
   for file in theoremFiles theorems do
-    rewrittenByFile := rewrittenByFile.insert file
-      (← rewriteSourceFile sourceRoot records file)
+    preparedByFile := preparedByFile.insert file (← prepareSourceFile sourceRoot file)
   let mut tasks : Array Json := #[]
   for index in [:theorems.size] do
     let record := theorems[index]!
     let file := normalizeRelativePath record.file.get!
-    let some rewritten := rewrittenByFile[file]?
-      | fail s!"rewritten source missing for {record.name}"
+    let some prepared := preparedByFile[file]?
+      | fail s!"prepared source missing for {record.name}"
+    -- A unit is a task for ONE theorem: hole out only this record's proof and
+    -- leave every other declaration in the module intact. Rewriting the whole
+    -- file's records here would sorry the target's neighbours too — including
+    -- lemmas its own proof depends on — and would make every task from a given
+    -- file byte-identical.
+    let rewritten ← rewritePreparedFile prepared #[record] config.proofMode
     if rewritten.moduleName.toString != record.module then
       fail s!"module mismatch for {record.name}"
     let some span := replacementSpan? rewritten.edits record.name
@@ -334,11 +370,35 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     let sourceRel := artifactPath (taskRel / "src" / file)
     let diagnostics := (verification.stdout ++ verification.stderr).replace
       artifact.toString "."
+    -- `sorry` warnings are expected under `.replace` (we just created one) and,
+    -- under EITHER mode, for declarations whose proof was already incomplete in the
+    -- source. Real projects carry work-in-progress `sorry`s, and the module retains
+    -- every declaration, so those warnings are not ours to reject: the extractor
+    -- records them as `sorryAx` in the record's `axioms`, and rejecting them would
+    -- make `--proofs keep` unusable on any project with an open goal.
+    --
+    -- What we DO reject under `.keep` is a `sorry` count higher than the source
+    -- explains — that would mean we holed out a proof we were told to preserve.
+    let sorryWarnings := (diagnostics.splitOn "\n").filter
+      (fun line => line.contains "warning:" && line.contains "declaration uses `sorry`")
+    let sourceSorryCount := sourceSorryCountFor records file
+    let expectedSorries :=
+      if config.proofMode == .keep then sourceSorryCount
+      -- The target itself is holed out; if it was already incomplete it is counted
+      -- in the baseline, so it must not be counted twice.
+      else if record.axioms.contains "sorryAx" then sourceSorryCount
+      else sourceSorryCount + 1
+    if sorryWarnings.length > expectedSorries then
+      fail s!"{record.name}: {sorryWarnings.length} `sorry` warning(s) but at most \
+        {expectedSorries} expected for proof mode {config.proofMode} \
+        ({sourceSorryCount} declaration(s) in this module are already incomplete \
+        in the source): {"; ".intercalate sorryWarnings}"
     for line in diagnostics.splitOn "\n" do
       if line.contains "warning:" && !line.contains "declaration uses `sorry`" then
         fail s!"unexpected warning while verifying {record.name}: {line}"
     writeJson (artifact / taskRel / "task.json")
-      (unitTaskJson id sourceRel toolchain record span leanRoots nativeRoots diagnostics)
+      (unitTaskJson id sourceRel toolchain (toString config.proofMode) record span
+        leanRoots nativeRoots diagnostics)
     tasks := tasks.push <| Json.mkObj [
       ("id", id),
       ("target", record.name),
@@ -353,7 +413,7 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     ("build_target", toJson config.buildTarget),
     ("environment", "cache/environment.json"),
     ("tasks", Json.arr tasks),
-    ("rewrite_summary", rewriteSummary theorems.size theorems.size),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size theorems.size),
     ("verification", Json.mkObj [("status", "passed")])
   ]
 

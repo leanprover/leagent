@@ -1,3 +1,4 @@
+import Corpus.Artifact
 import Corpus.CollectCommon
 import Corpus.Frontend
 import Corpus.Records
@@ -9,11 +10,32 @@ namespace LeanReassemble
 
 open Lean
 
+/-- What to do with each selected theorem's proof.
+
+`keep` is not a way of skipping the rewriter — it runs the SAME pipeline
+(match records to declarations, agree on the proof range, check the recorded
+`body` against the source) and only substitutes the original text for the
+`sorry`. So a `keep` artifact is a *verified reference state*: proof of the
+correspondence between records and source, in compilable form. -/
+inductive ProofMode where
+  /-- Replace each selected proof with `by sorry` (the default). -/
+  | replace
+  /-- Preserve each selected proof verbatim; output is byte-identical to source. -/
+  | keep
+  deriving Inhabited, BEq
+
+def ProofMode.toString : ProofMode → String
+  | .replace => "sorry"
+  | .keep    => "keep"
+
+instance : ToString ProofMode := ⟨ProofMode.toString⟩
+
 structure RewriteConfig where
   sourceRoot : System.FilePath
   records : System.FilePath
   file : String
   output : System.FilePath
+  proofMode : ProofMode := .replace
 
 structure Edit where
   declaration : String
@@ -45,23 +67,12 @@ private def isWithin (root path : System.FilePath) : Bool :=
   let path := path.toString
   path == root || path.startsWith (root ++ "/") || path.startsWith (root ++ "\\")
 
-/-- Read and decode one JSON object per nonempty input line. -/
+/-- Read and decode one JSON object per nonempty input line. Shares the extractor's
+JSONL conventions via `Corpus.Artifact`, so writer and reader cannot drift. -/
 def readRecords (path : System.FilePath) : IO (Array Corpus.ConstRecord) := do
-  let input ← IO.FS.readFile path
-  let mut records := #[]
-  let mut lineNumber := 0
-  for line in input.splitOn "\n" do
-    lineNumber := lineNumber + 1
-    let line := line.trimAscii
-    unless line.isEmpty do
-      let json ← match Json.parse line.toString with
-        | .ok json => pure json
-        | .error error => fail s!"malformed JSONL at line {lineNumber}: {error}"
-      let record ← match (fromJson? json : Except String Corpus.ConstRecord) with
-        | .ok record => pure record
-        | .error error => fail s!"invalid record at line {lineNumber}: {error}"
-      records := records.push record
-  return records
+  match Corpus.Artifact.parseJsonl (α := Corpus.ConstRecord) (← IO.FS.readFile path) with
+  | .ok records => return records
+  | .error error => fail s!"{path}: {error}"
 
 /-- Select theorem records for one source file and reject ambiguous input. -/
 def selectTheorems (records : Array Corpus.ConstRecord) (file : String) :
@@ -70,7 +81,7 @@ def selectTheorems (records : Array Corpus.ConstRecord) (file : String) :
   let mut selected := #[]
   let mut names : Std.HashSet String := {}
   for record in records do
-    if record.kind == "theorem" || record.kind == "private theorem" then
+    if Corpus.Artifact.isTheoremRecord record then
       let some recordFile := record.file
         | fail s!"theorem record {record.name} has no file"
       if normalizeRelativePath recordFile == requested then
@@ -112,12 +123,21 @@ private def commandIndent (source : String) (command : Syntax) : String := Id.ru
   let whitespace := String.Pos.Raw.extract source lineStart range.start
   if whitespace.all fun char => char == ' ' || char == '\t' then whitespace else ""
 
-private def replacementFor (kind : Corpus.SourceSyntax.DeclValueKind)
-    (indent : String) : String :=
-  let proof := s!"by\n{indent}  sorry"
-  match kind with
-  | .simple => proof
-  | .equations | .whereBody => s!":= {proof}"
+/-- The text that replaces one proof's source range.
+
+Under `.keep` the replacement IS the original slice, so applying the edits is the
+identity on the file. We deliberately keep it flowing through the edit machinery
+rather than short-circuiting: the range still has to be found and validated, which
+is what makes a kept artifact evidence that the records match the source. -/
+private def replacementFor (mode : ProofMode)
+    (kind : Corpus.SourceSyntax.DeclValueKind) (indent original : String) : String :=
+  match mode with
+  | .keep => original
+  | .replace =>
+    let proof := s!"by\n{indent}  sorry"
+    match kind with
+    | .simple => proof
+    | .equations | .whereBody => s!":= {proof}"
 
 /-- Validate edit bounds and reject overlapping source ranges. -/
 def validateEdits (source : String) (edits : Array Edit) : IO Unit := do
@@ -138,7 +158,8 @@ def validateEdits (source : String) (edits : Array Edit) : IO Unit := do
 
 /-- Match records to declarations and compute non-overlapping source edits. -/
 def planEdits (frontendResult : Corpus.Frontend.ElabResult)
-    (records : Array Corpus.ConstRecord) : IO (Array Edit) := do
+    (records : Array Corpus.ConstRecord) (mode : ProofMode := .replace)
+    : IO (Array Edit) := do
   let candidates ← declarationCandidates frontendResult
   let mut edits := #[]
   let mut matchedKeys : Std.HashSet (Nat × Nat) := {}
@@ -170,7 +191,8 @@ def planEdits (frontendResult : Corpus.Frontend.ElabResult)
       declaration := record.name
       range
       expected
-      replacement := replacementFor kind (commandIndent frontendResult.source command)
+      replacement := replacementFor mode kind
+        (commandIndent frontendResult.source command) expected
     }
   validateEdits frontendResult.source edits
   return edits
@@ -210,9 +232,21 @@ def validateWithWorker (sourcePath : System.FilePath) (text : String)
   finally
     let _ ← worker.shutdown
 
-/-- Rewrite one source file and validate the edited document before writing it. -/
-unsafe def rewriteSourceFile (sourceRoot : System.FilePath)
-    (records : Array Corpus.ConstRecord) (file : String) : IO RewriteResult := do
+/-- One source file, elaborated once, ready to be rewritten any number of ways.
+
+Separated from `rewriteSourceFile` because `materialize-units` needs MANY rewrites
+of the same file — one per target theorem — and elaboration is the expensive part.
+Reusing this across targets keeps the cost one elaboration per file rather than one
+per task. -/
+structure PreparedFile where
+  sourceAbs      : System.FilePath
+  relFile        : String
+  moduleName     : Name
+  frontendResult : Corpus.Frontend.ElabResult
+
+/-- Locate, validate, and elaborate one project-relative source file. -/
+unsafe def prepareSourceFile (sourceRoot : System.FilePath) (file : String)
+    : IO PreparedFile := do
   let root ← IO.FS.realPath sourceRoot
   let relFile := normalizeRelativePath file
   let requestedPath : System.FilePath := relFile
@@ -226,7 +260,6 @@ unsafe def rewriteSourceFile (sourceRoot : System.FilePath)
     fail s!"source file escapes --source-root: {file}"
   let some moduleName := Corpus.Discover.filePathToModule root sourceAbs
     | fail s!"cannot derive module name for {sourcePath}"
-  let selected ← selectTheorems records relFile
   Corpus.Frontend.initFrontend
   let importLock : Corpus.Frontend.ImportLock ← Std.Mutex.new ()
   let frontendResult ← Corpus.Frontend.elaborateFile importLock {
@@ -236,10 +269,25 @@ unsafe def rewriteSourceFile (sourceRoot : System.FilePath)
   }
   if frontendResult.hasErrors then
     fail s!"frontend elaboration failed for {sourcePath}"
-  let edits ← planEdits frontendResult selected
-  let rewritten ← applyEdits frontendResult.source edits
-  validateWithWorker sourceAbs rewritten
-  return { sourcePath := sourceAbs, moduleName, text := rewritten, edits }
+  return { sourceAbs, relFile, moduleName, frontendResult }
+
+/-- Rewrite an already-prepared file for a given set of records. -/
+def rewritePreparedFile (prepared : PreparedFile)
+    (selected : Array Corpus.ConstRecord) (mode : ProofMode := .replace)
+    (validate : Bool := true) : IO RewriteResult := do
+  let edits ← planEdits prepared.frontendResult selected mode
+  let rewritten ← applyEdits prepared.frontendResult.source edits
+  if validate then
+    validateWithWorker prepared.sourceAbs rewritten
+  return { sourcePath := prepared.sourceAbs, moduleName := prepared.moduleName,
+           text := rewritten, edits }
+
+/-- Rewrite one source file for every record that belongs to it. -/
+unsafe def rewriteSourceFile (sourceRoot : System.FilePath)
+    (records : Array Corpus.ConstRecord) (file : String)
+    (mode : ProofMode := .replace) : IO RewriteResult := do
+  let prepared ← prepareSourceFile sourceRoot file
+  rewritePreparedFile prepared (← selectTheorems records prepared.relFile) mode
 
 /-- Rewrite one source file and validate the edited document before writing it. -/
 unsafe def rewriteFile (config : RewriteConfig) : IO Unit := do
@@ -247,7 +295,8 @@ unsafe def rewriteFile (config : RewriteConfig) : IO Unit := do
   let output :=
     if config.output.isAbsolute then config.output else cwd / config.output
   let outputAbs := output.normalize
-  let result ← rewriteSourceFile config.sourceRoot (← readRecords config.records) config.file
+  let result ← rewriteSourceFile config.sourceRoot (← readRecords config.records)
+    config.file config.proofMode
   if outputAbs.toString == result.sourcePath.toString then
     fail "output path must differ from the source file"
   if ← outputAbs.pathExists then
