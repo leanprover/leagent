@@ -19,3 +19,6 @@ lean_exe lean_extract where
 
 lean_exe resume_tests where
   root := `ResumeTests
+
+lean_exe decl_closure_tests where
+  root := `DeclClosureTests

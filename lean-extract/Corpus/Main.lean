@@ -7,6 +7,8 @@ import Corpus.Discover
 import Corpus.WorkerExtract
 import Corpus.GrindExtract
 import Corpus.GrindInProofExtract
+import Corpus.DeclClosure
+import Corpus.Artifact
 
 /-!
 CLI entry for `corpus-extract`.
@@ -42,6 +44,7 @@ Output layout:
 namespace Corpus
 
 open Lean
+open Corpus.Artifact (writeJsonl partitionByConfig)
 
 /-- Tool version, bumped manually as the schema evolves. -/
 def toolVersion : String := "0.2.0"
@@ -87,6 +90,13 @@ structure CliArgs where
   set, this REPLACES the corpus extraction. Mutually exclusive with
   `--grind-manifest`. -/
   grindInProof       : Bool := false
+  /-- Single-declaration mode: extract each named declaration plus its transitive
+  owned dependency closure into its own per-target directory under `--output`.
+  Repeatable. When non-empty, this REPLACES corpus extraction. -/
+  decls              : Array Name := #[]
+  /-- With `--decl`, fail instead of warning when a closure member has no emitted
+  record (constructors, recursors, projections, generated lemmas). -/
+  strictClosure      : Bool := false
   deriving Inhabited
 
 private def usage : String := "\
@@ -98,6 +108,7 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--reverse-timeout <seconds>]
                      [--jobs <n>] [--no-isolate-files] [--resume]
                      [--grind-manifest] [--grind-in-proof]
+                     [--decl <Name> ...] [--strict-closure]
                      [--split-by-tag <key>] [--seed <n>]
                      [--dataset-card-config <path>]
                      [--help]
@@ -137,6 +148,16 @@ internal name and emits proof_method=skipped_requested for that theorem.
 --reverse-timeout sets the isolated reverse-elaboration timeout in seconds
 (default 300). On timeout the file is re-run without reverse elaboration. A value
 of 0 disables this timeout.
+
+--decl extracts ONE named declaration plus its transitive project-owned
+dependency closure, into its own directory under --output (mirroring the corpus
+layout, plus a data/target.jsonl holding the target record alone for composition
+with `lean_reassemble materialize-units`). Every record is annotated with
+closure_role: target / statement (needed to state the target) / proof (used only
+by its proof). Repeat --decl for several targets; the union of needed source files
+is elaborated once. This REPLACES corpus extraction, and is mutually exclusive
+with the grind modes. --strict-closure turns the closure-member-has-no-record
+warning into an error.
 
 --grind-in-proof instead captures grind data at the grind CALL SITES inside
 existing proofs: it walks each proof, re-runs instrumented grind on every
@@ -309,7 +330,33 @@ where
         go xs { acc with grindManifest := true }
     | "--grind-in-proof" :: xs, acc =>
         go xs { acc with grindInProof := true }
+    | "--decl" :: v :: xs, acc =>
+        if v.startsWith "--" then .error "--decl expects a declaration name"
+        else go xs { acc with decls := acc.decls.push v.toName }
+    | "--strict-closure" :: xs, acc =>
+        go xs { acc with strictClosure := true }
     | x :: _, _ => .error s!"unknown argument: {x}"
+
+/-- The first reason `--decl` cannot run with these arguments, if any. Returns
+`none` when the combination is valid (including when `--decl` is absent, except
+for flags that require it). Pure, so the guard set is readable as a table. -/
+private def declModeComplaint? (cli : CliArgs) : Option String :=
+  if cli.decls.isEmpty then
+    if cli.strictClosure then some "--strict-closure requires --decl" else none
+  else if cli.grindManifest || cli.grindInProof then
+    some "--decl is mutually exclusive with --grind-manifest and --grind-in-proof"
+  else if cli.listOrphans then
+    some "--decl is mutually exclusive with --list-orphans"
+  else if cli.enumerate != .glob then
+    some "--decl requires --enumerate glob (the import path cannot reconstruct source)"
+  else if cli.splitByTag.isSome then
+    some "--split-by-tag is meaningless with --decl (each target is a single \
+      closure, not a dataset split)"
+  else if cli.datasetCardConfig.isSome then
+    some "--dataset-card-config is meaningless with --decl (the card renders \
+      whole-corpus statistics)"
+  else
+    none
 
 /-- Render the extractor's own `metadata.json` payload. -/
 private def renderStats (stats : Corpus.RunStats) (modulesIn : Array Name)
@@ -328,20 +375,6 @@ private def renderStats (stats : Corpus.RunStats) (modulesIn : Array Name)
     ("rootModules",    Json.arr modulesIn.toArray),
     ("modulesEmitted", Json.arr modulesOut.toArray)
   ]
-
-/-- Partition records into the `theorems` config (kind ends in "theorem")
-and the `definitions` config (everything else). Order within each bucket
-follows the input. -/
-private def partitionByConfig (rs : Array ConstRecord) :
-    Array ConstRecord × Array ConstRecord := Id.run do
-  let mut thms : Array ConstRecord := #[]
-  let mut defs : Array ConstRecord := #[]
-  for r in rs do
-    if r.kind.endsWith "theorem" then
-      thms := thms.push r
-    else
-      defs := defs.push r
-  return (thms, defs)
 
 /-- Lookup a record's tag value for `key`, falling back to a synthetic
 `__untagged__` group when the tag is absent. -/
@@ -409,15 +442,6 @@ private def stratifiedSplit (rs : Array ConstRecord) (key : String)
       va := va ++ b
       te := te ++ c
     return (tr, va, te)
-
-/-- Write an array of JSON-serializable records as JSONL to `path`, one per line. -/
-private def writeJsonl [Lean.ToJson α] (path : System.FilePath)
-    (records : Array α) : IO Unit := do
-  IO.FS.writeFile path ""
-  let h ← IO.FS.Handle.mk path IO.FS.Mode.write
-  for r in records do
-    h.putStrLn (Lean.toJson r).compress
-  h.flush
 
 /-- Tally `kind` occurrences across `rs`, returning a sorted (kind, count) list. -/
 private def kindCountsOf (rs : Array ConstRecord) : List (String × Nat) := Id.run do
@@ -493,9 +517,16 @@ private unsafe def reexecUnderLake (project : System.FilePath)
   let cwd ← IO.currentDir
   let self ← IO.appPath
   let projectAbs := absolutize cwd project
-  -- Walk the original arg list and absolutize every flag value that is
-  -- a filesystem path. Bare flags and non-path values (`--modules`,
-  -- `--split-by-tag`, `--seed`, etc.) pass through untouched.
+  -- Walk the original arg list and absolutize every flag value that is a
+  -- filesystem path, because the child runs with `cwd := projectAbs` and would
+  -- otherwise resolve a relative path against the PROJECT rather than the
+  -- directory the user invoked us from.
+  --
+  -- Advance ONE token at a time, consuming a value only for a flag known to take
+  -- one. An earlier version stepped in pairs, which silently broke parity after
+  -- any bare flag (`--no-private`, `--reverse-elab`, `--strict-closure`, …): a
+  -- following `--output out` was then read as a (value, flag) pair, so `out` was
+  -- never absolutized and the run wrote into the source tree instead of the cwd.
   let pathFlags : List String :=
     ["--output", "--config", "--source-root", "--dataset-card-config"]
   let rec rebuild : List String → List String
@@ -504,7 +535,7 @@ private unsafe def reexecUnderLake (project : System.FilePath)
       if pathFlags.contains f then
         f :: (absolutize cwd v).toString :: rebuild xs
       else
-        f :: v :: rebuild xs
+        f :: rebuild (v :: xs)
     | [x] => [x]
   let childArgs : Array String :=
     #["env", self.toString] ++ (rebuild rawArgs).toArray
@@ -559,6 +590,13 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       IO.eprintln "corpus-extract: --resume requires isolated corpus extraction with --enumerate glob"
       IO.eprintln usage
       return 1
+    -- `--decl` is a distinct extraction with its own per-target output. Reject the
+    -- flags that belong to a different mode or are meaningless per-target rather
+    -- than ignoring them, which would misrepresent what the run produced.
+    if let some complaint := declModeComplaint? cli then
+      IO.eprintln s!"corpus-extract: {complaint}"
+      IO.eprintln usage
+      return 1
     -- `--list-orphans`: discover files on disk under the `--modules` roots vs the
     -- import closure, print the difference, and exit. (Diagnostic only — no JSONL.)
     if cli.listOrphans then
@@ -584,6 +622,42 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       IO.eprintln "corpus-extract: --output is required"
       IO.eprintln usage
       return 1
+    -- `--decl`: extract each named declaration plus its transitive owned
+    -- dependency closure into its own per-target directory. REPLACES corpus
+    -- extraction (its own closure computation + output layout), parallel to the
+    -- grind branches below.
+    if !cli.decls.isEmpty then
+      let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
+      let tagConfig ← match cli.config with
+        | none      => pure TagConfig.empty
+        | some path => Corpus.loadConfig path
+      -- Closure resolution rejects bad input (unknown/ambiguous/orphan targets,
+      -- name collisions) by throwing a `userError` that already carries the
+      -- `corpus-extract:` prefix. Report it as a plain diagnostic rather than
+      -- letting it surface as an uncaught exception.
+      try
+        return (← Corpus.DeclClosure.run {
+          targets          := cli.decls
+          projectRoot      := projectRoot
+          outDir           := outDir
+          roots            := cli.modules
+          tagConfig        := tagConfig
+          configPath?      := cli.config
+          includeInternal  := cli.includeInternal
+          includePrivate   := cli.includePrivate
+          reverseElab      := cli.reverseElab
+          reverseClosers   := cli.reverseClosers
+          reverseSkip      := cli.reverseSkip
+          reverseTimeoutMs := cli.reverseTimeoutMs
+          jobs             := resolveJobs cli.jobs cli.isolateFiles
+          isolateFiles     := cli.isolateFiles
+          resume           := cli.resume
+          strictClosure    := cli.strictClosure
+          toolVersion      := toolVersion
+        })
+      catch e =>
+        IO.eprintln e.toString
+        return 1
     -- The two grind modes are distinct extractions with distinct plugins/outputs;
     -- since each is an early-return guard, setting both would silently run only
     -- one. Reject the combination explicitly.
