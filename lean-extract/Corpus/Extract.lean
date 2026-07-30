@@ -53,14 +53,11 @@ private def kindOf (env : Environment) (ci : ConstantInfo) : String :=
   | .ctorInfo _    => "ctor"
   | .recInfo _     => "rec"
 
-/-- True if `n` belongs to one of the root prefixes given via `--modules`. -/
-private def isOwned (roots : Array Name) (modName : Name) : Bool :=
-  roots.any fun root => root == modName || root.isPrefixOf modName
+/-- Ownership here is the root-prefix notion shared with single-declaration
+extraction; see `CollectCommon.isOwnedModuleName`. -/
+private abbrev isOwned := CollectCommon.isOwnedModuleName
 
-/-- Module name for a constant, if any. -/
-private def moduleOf? (env : Environment) (n : Name) : Option Name :=
-  env.getModuleIdxFor? n |>.map fun idx =>
-    env.allImportedModuleNames[idx.toNat]!
+private abbrev moduleOf? := CollectCommon.moduleOf?
 
 /-- "Mod.Sub.Leaf" -> "Mod/Sub/Leaf.lean" (relative; no source-root prefix).
 The emitted record stores this so the dataset stays portable to other
@@ -162,10 +159,7 @@ private def buildRecord (env : Environment) (opts : ExtractOptions)
   -- Transitive premise cone: only non-empty for declarations that carry a
   -- term (theorems and defs with bodies). Axioms / opaques / inductives /
   -- quots / structures get an empty list.
-  let isOwnedMod := isOwned opts.rootModules
-  let ownedPred := fun n => match moduleOf? env n with
-    | none   => false
-    | some m => isOwnedMod m
+  let ownedPred := CollectCommon.isOwnedByRoots env opts.rootModules
   let premisesList : List String := match ci with
     | .thmInfo _ | .defnInfo _ =>
         let names := CollectCommon.collectPremises env ownedPred name

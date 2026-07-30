@@ -10,9 +10,23 @@ premise tracking).
 The tool is **project-agnostic**: the modules to extract, the source root, and
 any tagging rules are all supplied on the command line.
 
+## Extraction modes
+
+Three things the tool can produce. They are mutually exclusive:
+
+- **Corpus** (default) — one record per theorem/definition across the whole
+  project, split into `theorems` and `definitions` configs.
+- **Single declaration** (`--decl`) — one named declaration plus its transitive
+  owned dependency closure, in its own directory, with each record annotated by
+  cone. Composes with `reassemble` into a standalone Lean unit. See
+  [Single-declaration mode](#single-declaration-mode).
+- **Grind** (`--grind-manifest` / `--grind-in-proof`) — AlphaGrind datasets;
+  each replaces corpus extraction with its own schema and output directory.
+
 ## Two ways it runs
 
-`lean-extract` has two extraction backends, selected with `--enumerate`:
+Within corpus and single-declaration mode, `lean-extract` has two extraction
+backends, selected with `--enumerate`:
 
 - **`glob` (default)** — the **frontend** path. The tool discovers the project's
   source files on disk and drives Lean's frontend directly, using one isolated
@@ -61,6 +75,13 @@ if `--source-root` (or the current directory) is a Lake project, it re-execs
 itself under `lake env` from there, so frontend elaboration inherits the
 right search path. You never need to wrap the call in `lake env` yourself.
 
+Because the child runs with its working directory set to the project, relative
+path arguments (`--output`, `--config`, `--source-root`,
+`--dataset-card-config`) are rewritten to absolute paths against your original
+working directory first. (Before this was fixed, a bare flag such as
+`--no-private` appearing *before* a relative `--output` shifted the rewriter's
+parity and the output silently landed inside the source tree instead.)
+
 ```bash
 ./.lake/build/bin/lean_extract \
     --modules     LeanSQLite \
@@ -91,6 +112,8 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 | `--reverse-timeout <seconds>` | no | Hard timeout for an isolated file when reverse elaboration is enabled. Default `300`; `0` disables it. A timed-out file is retried without reverse elaboration. |
 | `--include-internal` | no | Emit compiler-internal names (`_aux.*`, `match_*`, constructors, recursors). Default: false. |
 | `--no-private` | no | Skip `private` declarations. Default: include them. |
+| `--decl <Name>` | no | **Single-declaration mode.** Extract this declaration plus its transitive owned dependency closure into its own per-target directory. Repeatable; the union of needed files is elaborated once. See [Single-declaration mode](#single-declaration-mode). |
+| `--strict-closure` | no | With `--decl`, fail instead of warning when a closure member has no emitted record (constructors, recursors, generated lemmas). |
 | `--split-by-tag <key>` | no | Stratified 80/10/10 train/valid/test split of theorems keyed on a tag value. Definitions are always one split. |
 | `--seed <n>` | no | Deterministic split seed (default 0). |
 | `--dataset-card-config <path>` | no | JSON describing dataset identity; generates the HF dataset card (`README.md`). |
@@ -110,6 +133,10 @@ lean_extract --modules Project --source-root ../project --output ./out --reverse
 
 # Use the shared in-process frontend.
 lean_extract --modules Project --source-root ../project --output ./out --no-isolate-files
+
+# One theorem plus its whole dependency closure, in its own directory.
+lean_extract --modules LeanSQLite --source-root ../sqlite \
+    --decl LeanSQLite.Btree.insert_sound --output ./decl-out
 
 # Find files no imported module pulls in.
 lean_extract --modules LeanSQLite --source-root ../sqlite --list-orphans
@@ -158,6 +185,7 @@ is used for both configs; fields not applicable to a record are `null`/`[]`.
 | `axioms` | string[] | Transitive axioms (`collectAxioms`). Theorems only. |
 | `is_protected` / `is_private` | bool | `Lean.isProtected` / `Lean.isPrivateName`. |
 | `tags` | object(str→str) | Tags from `--config`. |
+| `closure_role` | string\|null | `--decl` mode only: `target`, `statement` (needed to state the target), or `proof` (used only by its proof). Null in every other mode. |
 
 Constants are filtered before emit to match a stable dataset: non-owned modules,
 auxiliary recursors / noConfusion stubs, generated companions, ctors/recs (unless
@@ -183,6 +211,133 @@ premise_defs = [def_by_name[n] for n in t["premises"] if n in def_by_name]
 Names in `premises` not found among definitions are other theorems (lemmas) in
 the project — look them up in the `theorems` config if you need the full cone.
 
+## Single-declaration mode
+
+`--decl <Name>` extracts one declaration together with everything it depends on,
+rather than walking the whole project. Design details and edge-case policy live
+in [`docs/single-decl-extraction.md`](../docs/single-decl-extraction.md).
+
+```bash
+lean_extract \
+    --modules     LeanSQLite \
+    --source-root ../sqlite \
+    --decl        LeanSQLite.Btree.insert_sound \
+    --decl        LeanSQLite.Btree.split_len \
+    --output      ./decl-out
+```
+
+`--decl` is repeatable and `--output` is a directory. Targets need not be
+theorems — a `def` target lands in `definitions.jsonl` — but only a theorem
+target has a [unit form](#assembling-one-unit).
+
+`--modules` is still required: it defines the owned prefix tree, which is what
+makes the closure finite. Non-owned constants (Init/Std/Mathlib) are not emitted
+as records; they are recovered through imports.
+
+### Per-target output
+
+Each target gets a directory mirroring the corpus layout, so existing consumers
+read it unchanged:
+
+```text
+decl-out/
+  LeanSQLite.Btree.insert_sound/
+    metadata.json              # target identity, cone counts, imports, order
+    dropped.json               # what the closure could not represent, by reason
+    data/
+      definitions.jsonl        # closure defs/inductives/structures/axioms
+      target.jsonl             # the target record alone
+      theorems/
+        train.jsonl            # premise lemmas + the target
+```
+
+Records are written dependencies-first; `metadata.json` carries the
+`assemblyOrder` spanning both data files, plus the union of non-owned
+`file_imports` needed to make the closure resolvable.
+
+Every record carries `closure_role`:
+
+| Role | Meaning |
+|------|---------|
+| `target` | The requested declaration. |
+| `statement` | Needed to *state* the target (reachable from its type). |
+| `proof` | Used only by the target's *proof*. |
+
+The role is a property of a record within one target's closure, not of the
+constant — the same lemma can be `statement` for one target and `proof` for
+another, so each target directory carries its own copy.
+
+### Assembling one unit
+
+`data/target.jsonl` exists because `materialize-units` replaces the proof of
+*every* theorem record it receives. Pass it the target file — not the whole
+closure — so the target is the only hole:
+
+```bash
+cd ../reassemble
+lake exe lean_reassemble materialize-units \
+    --source-root ../../sqlite \
+    --records     ../lean-extract/decl-out/LeanSQLite.Btree.insert_sound/data/target.jsonl \
+    --output      /tmp/insert-sound-unit
+```
+
+That yields one standalone task, verified by invoking `lean` directly against a
+pristine `.olean` cache. The rest of the closure is the **context payload** — the
+premise statements and proofs available to whatever fills the hole, with
+`closure_role` separating what states the target from what its original proof
+used.
+
+Passing `theorems/train.jsonl` instead would sorry the premise lemmas too. The
+result still typechecks through `sorryAx`, but the premises the target is meant
+to build on have themselves become holes.
+
+Unit assembly needs the same source checkout the records came from: the
+reassembler verifies each record's module, name, position, and `body` against the
+elaborated source and fails rather than guessing if they drifted.
+
+Adding `--proofs keep` writes the proofs back verbatim instead of holing them out,
+giving a compilable reference state for the same records — useful as an
+intermediate checkout, or as the oracle to diff a sorried artifact against. See
+[Proof Modes](../reassemble/README.md#proof-modes).
+
+### Cost
+
+Closure size is not bounded — a deep theorem can reach most of the project, so
+this mode is not inherently fast. The way to amortize is to pass several `--decl`
+flags in **one** invocation: the union of needed files is elaborated once and each
+target is projected out of the shared record pool. Batching beats repeated runs.
+
+`--resume` does not make separate invocations cheap: a successful run removes its
+`.shards/` staging, so resume only helps after an *interrupted* run.
+
+`--reverse-elab` applies per file, so it multiplies cost by the closure's file
+count even though usually only the target's `proof_script` is wanted.
+
+### Caveats
+
+- `--no-private` leaves structurally incomplete closures: proofs routinely use
+  `private` lemmas that imports cannot recover. The mode warns.
+- Constructors, recursors, projections, generated companions, and
+  equation-compiler helpers appear in a closure but never have records — on a real
+  proof they outnumber the emitted records. They are classified by reason and
+  summarized in one line, with per-category names in `dropped.json`:
+
+  ```
+  corpus-extract: closure for LambdaCalc.Term.church_rosser: 83 member(s) not
+  representable as records (15 constructors, 9 equation_compiler_helpers, 42
+  generated_companions, 2 noConfusion_stubs, 13 recursors, 2
+  synthetic_theorems); see dropped.json
+  ```
+
+  Only the `unexplained` category signals a problem (eligible, but no record was
+  produced); it gets its own warning and sorts first. `--strict-closure` makes any
+  drop an error.
+- A target in an orphan file (one no root module imports) is rejected — check
+  `--list-orphans`.
+- Mutually exclusive with the grind modes and `--list-orphans`;
+  `--split-by-tag` and `--dataset-card-config` are rejected as meaningless
+  per-target.
+
 ## Architecture
 
 Everything is one package; `lean-extract` hosts Lean's frontend directly:
@@ -195,7 +350,12 @@ Everything is one package; `lean-extract` hosts Lean's frontend directly:
  │                              (parseHeader→processHeader→IO.processCommands), run a
  │                              CoreM collector on the resulting environment
  ├─ Corpus/CollectCommon.lean   shared collector helpers (kindToString, isUserConstant)
+ ├─ Corpus/Artifact.lean        artifact conventions shared with reassemble
  ├─ Corpus/CorpusManifest.lean  the corpus collector (corpusManifestCore)
+ ├─ Corpus/DeclClosure.lean     --decl mode: the driver sequencing its two phases
+ ├─ Corpus/DeclClosure/Cone.lean   phase 1: resolve targets, both cones, drop
+ │                                 classification, file selection (import-only env)
+ ├─ Corpus/DeclClosure/Emit.lean   phase 2: order, project, render, write
  ├─ Corpus/GrindManifest.lean   the grind-manifest collector (grindManifestCore)
  ├─ Corpus/GrindInProof.lean    the in-proof grind collector (grindInProofCore)
  ├─ Corpus/ReverseElab.lean     proof-term → verified tactic script

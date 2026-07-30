@@ -120,15 +120,50 @@ def isOwnedName (env : Environment) (root : Name) (n : Name) : Bool :=
     | some m => root == m || root.isPrefixOf m
     | none   => false
 
-/-- Transitive premise cone: BFS over `Environment.constants` following only
-constants for which `owned` returns true. The seed is the direct dep set of
-`root`; for each owned constant popped we enqueue its own direct deps. External or
-absent constants are skipped. The result is owned-only and excludes `root`. -/
-partial def collectPremises (env : Environment) (owned : Name → Bool)
-    (root : Name) : Array Name := Id.run do
-  let some rootCi := env.find? root | return #[]
+/-- The module that defines `n`, if the environment knows one. `none` means a
+builtin or an unattached constant — for an imported environment, everything that
+came from an `.olean` has an index. -/
+def moduleOf? (env : Environment) (n : Name) : Option Name :=
+  env.getModuleIdxFor? n |>.bind fun idx =>
+    env.allImportedModuleNames[idx.toNat]?
+
+/-- True iff `modName` sits under one of the `--modules` root prefixes.
+
+This is the ROOT-PREFIX notion of ownership, used wherever the `--modules` roots
+are the authority: the legacy import walk (`Corpus.Extract`) and single-declaration
+closure computation (`Corpus.DeclClosure`). It differs from `isOwnedName`, which
+keys on the elaborating file's own project root (`projectRoot`) and is what the
+per-file collector uses for the `premises` field. The two agree for a single-root
+project and diverge for a multi-root run; `--decl` records both in its
+`metadata.json` so an artifact says which was applied. -/
+def isOwnedModuleName (roots : Array Name) (modName : Name) : Bool :=
+  roots.any fun root => root == modName || root.isPrefixOf modName
+
+/-- Ownership predicate over CONSTANTS for the root-prefix notion: owned iff the
+constant's defining module is under one of `roots`. Unattached constants are not
+owned — they are core builtins, recovered through imports rather than records. -/
+def isOwnedByRoots (env : Environment) (roots : Array Name) : Name → Bool :=
+  fun n => match moduleOf? env n with
+    | none   => false
+    | some m => isOwnedModuleName roots m
+
+/-- Transitive premise cone from an EXPLICIT seed: BFS over
+`Environment.constants` following only constants for which `owned` returns true.
+For each owned constant popped we enqueue its own direct deps (type ∪ value), so
+an owned `def` in the cone drags in whatever its body needs. External or absent
+constants are skipped. The result is owned-only and excludes `root`.
+
+The seed is what distinguishes the two cones a caller may want:
+  * `rootCi.getUsedConstantsAsSet.toArray` (type ∪ value) — the PROOF cone, i.e.
+    everything needed to re-prove the declaration. This is `collectPremises`, the
+    cone the `premises` dataset field reports.
+  * `rootCi.type.getUsedConstantsAsSet.toArray` — the STATEMENT cone, i.e. only
+    what is needed to *state* it. Used by single-declaration extraction to
+    annotate each closure member (see `Corpus.DeclClosure`). -/
+partial def collectPremisesFrom (env : Environment) (owned : Name → Bool)
+    (root : Name) (seed : Array Name) : Array Name := Id.run do
   let mut visited : Std.HashSet Name := {}
-  let mut queue   : Array Name := rootCi.getUsedConstantsAsSet.toArray
+  let mut queue   : Array Name := seed
   visited := visited.insert root
   let mut result  : Array Name := #[]
   while h : queue.size > 0 do
@@ -143,5 +178,23 @@ partial def collectPremises (env : Environment) (owned : Name → Bool)
           unless visited.contains d do
             queue := queue.push d
   return result
+
+/-- Transitive premise cone: `collectPremisesFrom` seeded with `root`'s direct dep
+set (type ∪ value), i.e. the PROOF cone. This is the cone the `premises` dataset
+field reports. -/
+def collectPremises (env : Environment) (owned : Name → Bool)
+    (root : Name) : Array Name :=
+  match env.find? root with
+  | none        => #[]
+  | some rootCi => collectPremisesFrom env owned root rootCi.getUsedConstantsAsSet.toArray
+
+/-- The STATEMENT cone: `collectPremisesFrom` seeded from `root`'s TYPE only —
+every owned constant needed to state `root`, excluding anything reachable only
+through its proof/value. -/
+def collectStatementPremises (env : Environment) (owned : Name → Bool)
+    (root : Name) : Array Name :=
+  match env.find? root with
+  | none        => #[]
+  | some rootCi => collectPremisesFrom env owned root rootCi.type.getUsedConstantsAsSet.toArray
 
 end Corpus.CollectCommon

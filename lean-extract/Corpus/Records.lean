@@ -68,6 +68,15 @@ structure ConstRecord where
   isProtected : Bool
   isPrivate   : Bool
   tags        : List (String × String)
+  /-- Single-declaration mode (`--decl`) only: this record's role in ONE target's
+  dependency closure — `"target"`, `"statement"` (reachable from the target's
+  type, so needed to state it), or `"proof"` (reachable only through the target's
+  proof/value). `none` in every other extraction mode.
+
+  This is a property of the record WITHIN a closure, not of the constant: the same
+  lemma is `statement` for one target and `proof` for another, so each target's
+  output directory carries its own annotated copy. -/
+  closureRole : Option String := none
   deriving Inhabited
 
 namespace ConstRecord
@@ -112,7 +121,8 @@ def toJson (r : ConstRecord) : Json :=
     ("axioms",       Lean.toJson r.axioms),
     ("is_protected", Json.bool r.isProtected),
     ("is_private",   Json.bool r.isPrivate),
-    ("tags",         tagsJson)
+    ("tags",         tagsJson),
+    ("closure_role", Lean.toJson r.closureRole)
   ]
 
 instance : ToJson ConstRecord := ⟨toJson⟩
@@ -186,6 +196,7 @@ def fromJson? (j : Json) : Except String ConstRecord := do
     isProtected := ← getBool "is_protected"
     isPrivate   := ← getBool "is_private"
     tags        := tags
+    closureRole := ← getOptStr "closure_role"
   }
 
 instance : FromJson ConstRecord := ⟨fromJson?⟩
