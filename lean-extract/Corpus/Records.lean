@@ -345,6 +345,375 @@ instance : ToJson GrindInProofRecord := ⟨toJson⟩
 
 end GrindInProofRecord
 
+/-! ## Proof-state records (per-step tactic trajectories)
+
+A `ProofStateRecord` is ONE tactic-proved theorem's full trajectory: the nested
+tree of author-written tactics, each step carrying the goal states before and
+after it ran. This is the proof's INTERIOR — the thing neither `body` (a source
+slice) nor `proof_script` (a reverse-elaborated whole-proof string) can express.
+
+Emitted to `data/proof-states/train.jsonl`, a config separate from
+`theorems`/`definitions` so the corpus schema is unperturbed. Joins to the
+`theorems` config by `name`.
+
+Three nested types. Goals are INTERNED in a per-record table (`goals`) and
+referenced by index, because in a linear proof step `k`'s `goals_after` is step
+`k+1`'s `goals_before` — inlining them would nearly double the file and hide that
+identity. -/
+
+/-- One hypothesis in a goal's local context. Consecutive same-type declarations
+are grouped into one entry (`names`), the way `Meta.ppGoal` renders `a b : Nat`. -/
+structure ProofHyp where
+  /-- User-facing names sharing this type, in source order. -/
+  names : Array String
+  /-- Pretty-printed type. -/
+  type  : String
+  /-- Pretty-printed value, for `let`-bound (`ldecl`) hypotheses only. -/
+  value : Option String
+  /-- `true` iff this is a `let`-binding rather than a plain hypothesis. -/
+  isLet : Bool
+  deriving Inhabited, BEq
+
+namespace ProofHyp
+
+def toJson (h : ProofHyp) : Json :=
+  Json.mkObj [
+    ("names",  Json.arr (h.names.map Json.str)),
+    ("type",   Json.str h.type),
+    ("value",  Lean.toJson h.value),
+    ("is_let", Json.bool h.isLet)
+  ]
+
+instance : ToJson ProofHyp := ⟨toJson⟩
+
+def fromJson? (j : Json) : Except String ProofHyp := do
+  let names ← do
+    let v ← j.getObjVal? "names"
+    let arr ← v.getArr?
+    arr.mapM (·.getStr?)
+  let type ← (← j.getObjVal? "type").getStr?
+  let value ← match j.getObjVal? "value" with
+    | .ok .null => pure none
+    | .ok v     => some <$> v.getStr?
+    | .error _  => pure none
+  let isLet ← match j.getObjVal? "is_let" with
+    | .ok v    => v.getBool?
+    | .error _ => pure false
+  return { names, type, value, isLet }
+
+instance : FromJson ProofHyp := ⟨fromJson?⟩
+
+end ProofHyp
+
+/-- One goal state: a metavariable's local context and target, rendered.
+
+`pretty` is SYNTHESIZED from `hyps`/`target` rather than obtained by a second
+`Meta.ppGoal` call, so the two can never disagree. It is therefore
+infoview-*shaped* (`h : T` lines then `⊢ target`) rather than byte-identical to
+the infoview. -/
+structure ProofGoal where
+  /-- Position in the record's `goals` table; steps reference goals by this. -/
+  id     : Nat
+  /-- The goal metavariable's name, e.g. `"_uniq.412"`. Diagnostic only: the same
+  metavariable renders differently under different `MetavarContext` snapshots, so
+  this is NOT an identity key (interning is by rendered content). -/
+  mvar   : String
+  /-- The goal's local context, aux and implementation-detail decls excluded. -/
+  hyps   : Array ProofHyp
+  /-- Pretty-printed target type. -/
+  target : String
+  /-- The whole goal as one block: hypothesis lines then `⊢ target`. -/
+  pretty : String
+  deriving Inhabited, BEq
+
+namespace ProofGoal
+
+def toJson (g : ProofGoal) : Json :=
+  Json.mkObj [
+    ("id",     Json.num (JsonNumber.fromNat g.id)),
+    ("mvar",   Json.str g.mvar),
+    ("hyps",   Json.arr (g.hyps.map ProofHyp.toJson)),
+    ("target", Json.str g.target),
+    ("pretty", Json.str g.pretty)
+  ]
+
+instance : ToJson ProofGoal := ⟨toJson⟩
+
+def fromJson? (j : Json) : Except String ProofGoal := do
+  let id ← (Lean.fromJson? (← j.getObjVal? "id") : Except String Nat)
+  let mvar ← (← j.getObjVal? "mvar").getStr?
+  let hyps ← do
+    let v ← j.getObjVal? "hyps"
+    let arr ← v.getArr?
+    arr.mapM ProofHyp.fromJson?
+  let target ← (← j.getObjVal? "target").getStr?
+  let pretty ← (← j.getObjVal? "pretty").getStr?
+  return { id, mvar, hyps, target, pretty }
+
+instance : FromJson ProofGoal := ⟨fromJson?⟩
+
+end ProofGoal
+
+/-- One author-written tactic and its effect on the goal state.
+
+`children` carries the tactics a combinator composed: `induction … with` holds its
+per-alternative tactics, `t <;> u` holds `t` and `u`, `·` holds its focused block.
+That nesting mirrors the source structure.
+
+Byte offsets are file-relative and make a step locatable inside the existing
+corpus schema without re-elaborating:
+`start_byte - ProofStateRecord.proofStartByte` is the step's offset within that
+theorem's `ConstRecord.body`. -/
+structure ProofStep where
+  /-- Pre-order index, dense within one record. -/
+  index       : Nat
+  /-- Nesting depth; top-level tactics are 0. -/
+  depth       : Nat
+  /-- VERBATIM source text of the tactic, sliced from the file — never
+  pretty-printed or `reprint`ed, so it is exactly what the author wrote. For a
+  combinator this spans the whole construct, children included. -/
+  tactic      : String
+  /-- Syntax node kind, e.g. `"Lean.Parser.Tactic.induction"`. Always a member of
+  the `tactic` or `conv` parser category. -/
+  tacticKind  : String
+  /-- The elaborator that ran it (`TacticInfo.elaborator`). -/
+  elaborator  : String
+  startLine   : Nat
+  startCol    : Nat
+  endLine     : Nat
+  endCol      : Nat
+  /-- File-relative byte offset of the tactic's first character. -/
+  startByte   : Nat
+  /-- File-relative byte offset one past the tactic's last character. -/
+  endByte     : Nat
+  /-- Indices into the record's `goals` table: the goals this tactic ran on. -/
+  goalsBefore : Array Nat
+  /-- Indices into `goals`: the goals remaining after it ran. Empty means the
+  tactic closed everything it was given. -/
+  goalsAfter  : Array Nat
+  /-- How many times this syntax was invoked. `> 1` means a combinator
+  (`all_goals`, `<;>`, `repeat`) re-ran it once per goal, and `goals_before` /
+  `goals_after` are the unions across those invocations. -/
+  invocations : Nat
+  /-- Tactics this one composed, in source order. -/
+  children    : Array ProofStep
+  deriving Inhabited
+
+namespace ProofStep
+
+/-- Manual JSON encoder, snake_case keys. `partial` because `ProofStep` is
+recursive through `children`. -/
+partial def toJson (s : ProofStep) : Json :=
+  Json.mkObj [
+    ("index",        Json.num (JsonNumber.fromNat s.index)),
+    ("depth",        Json.num (JsonNumber.fromNat s.depth)),
+    ("tactic",       Json.str s.tactic),
+    ("tactic_kind",  Json.str s.tacticKind),
+    ("elaborator",   Json.str s.elaborator),
+    ("start_line",   Json.num (JsonNumber.fromNat s.startLine)),
+    ("start_col",    Json.num (JsonNumber.fromNat s.startCol)),
+    ("end_line",     Json.num (JsonNumber.fromNat s.endLine)),
+    ("end_col",      Json.num (JsonNumber.fromNat s.endCol)),
+    ("start_byte",   Json.num (JsonNumber.fromNat s.startByte)),
+    ("end_byte",     Json.num (JsonNumber.fromNat s.endByte)),
+    ("goals_before", Json.arr (s.goalsBefore.map (Json.num ∘ JsonNumber.fromNat))),
+    ("goals_after",  Json.arr (s.goalsAfter.map (Json.num ∘ JsonNumber.fromNat))),
+    ("invocations",  Json.num (JsonNumber.fromNat s.invocations)),
+    ("children",     Json.arr (s.children.map toJson))
+  ]
+
+instance : ToJson ProofStep := ⟨toJson⟩
+
+private def getNat (j : Json) (k : String) : Except String Nat := do
+  (Lean.fromJson? (← j.getObjVal? k) : Except String Nat)
+
+private def getNatArr (j : Json) (k : String) : Except String (Array Nat) := do
+  let v ← j.getObjVal? k
+  let arr ← v.getArr?
+  arr.mapM fun x => (Lean.fromJson? x : Except String Nat)
+
+partial def fromJson? (j : Json) : Except String ProofStep := do
+  let children ← do
+    match j.getObjVal? "children" with
+    | .ok v    => (← v.getArr?).mapM fromJson?
+    | .error _ => pure #[]
+  return {
+    index       := ← getNat j "index"
+    depth       := ← getNat j "depth"
+    tactic      := ← (← j.getObjVal? "tactic").getStr?
+    tacticKind  := ← (← j.getObjVal? "tactic_kind").getStr?
+    elaborator  := ← (← j.getObjVal? "elaborator").getStr?
+    startLine   := ← getNat j "start_line"
+    startCol    := ← getNat j "start_col"
+    endLine     := ← getNat j "end_line"
+    endCol      := ← getNat j "end_col"
+    startByte   := ← getNat j "start_byte"
+    endByte     := ← getNat j "end_byte"
+    goalsBefore := ← getNatArr j "goals_before"
+    goalsAfter  := ← getNatArr j "goals_after"
+    invocations := ← getNat j "invocations"
+    children    := children
+  }
+
+instance : FromJson ProofStep := ⟨fromJson?⟩
+
+end ProofStep
+
+/-- One tactic-proved theorem's trajectory. Theorems proved by a bare term
+(`:= rfl`, no `by`) produce no tactic nodes and are NOT emitted — they are counted
+as skipped instead, so a consumer never sees a row with an empty `steps`. -/
+structure ProofStateRecord where
+  /-- Fully-qualified theorem name; joins to the `theorems` config. -/
+  name           : String
+  /-- The module that elaborated it. -/
+  module         : String
+  /-- Source path relative to `--source-root`, from discovery. -/
+  file           : Option String
+  /-- 1-based start line of the declaration's full source range. -/
+  startLine      : Option Nat
+  /-- 0-based start column. -/
+  startCol       : Option Nat
+  /-- 1-based end line. -/
+  endLine        : Option Nat
+  /-- 0-based end column. -/
+  endCol         : Option Nat
+  /-- `"theorem"` or `"private theorem"`, matching the corpus `kind`. -/
+  declKind       : String
+  /-- File-relative byte offset of the proof value (the `by …` term). -/
+  proofStartByte : Nat
+  /-- File-relative byte offset one past the proof value. -/
+  proofEndByte   : Nat
+  /-- VERBATIM proof source, `by` included — the same bytes as the corpus
+  record's `body`, restated here so this dataset stands alone. -/
+  proofSource    : String
+  /-- For a `where` / `let rec` AUXILIARY, the enclosing declaration's source name;
+  `none` for a top-level theorem.
+
+  An auxiliary is lifted by Lean into its own separately-checked constant and gets
+  its own record, because it is frequently the substantive lemma (the parent's proof
+  being a one-line `exact aux …`). This field is what lets a consumer group a proof
+  with its auxiliaries, or filter them out.
+
+  Derived from the SOURCE syntax, not by splitting the constant's name: an auxiliary
+  is named `<parent>.<aux>`, but so is any namespaced theorem, so name-splitting
+  would misclassify ordinary declarations as auxiliaries. -/
+  parentDecl     : Option String
+  /-- The interned goal table. `ProofGoal.id` equals the index. -/
+  goals          : Array ProofGoal
+  /-- Indices into `goals`: the goal state the proof opened with. -/
+  initialGoals   : Array Nat
+  /-- The tactic tree, top-level tactics in source order. -/
+  steps          : Array ProofStep
+  /-- Total steps including nested children. -/
+  stepCount      : Nat
+  /-- Deepest nesting level reached (0 for a flat proof). -/
+  maxDepth       : Nat
+  /-- Sorted distinct `tactic_kind`s in the proof, for cheap filtering. -/
+  tacticKinds    : Array String
+  /-- `true` iff the theorem's transitive axioms include `sorryAx`. -/
+  hasSorry       : Bool
+  /-- `"ok"` / `"skipped_large"` / `"deadline_skipped"` / `"error"`. Anything but
+  `"ok"` means `steps` is empty and the trajectory was not captured. -/
+  outcome        : String
+  /-- `true` iff the theorem is `private`. -/
+  isPrivate      : Bool
+  deriving Inhabited
+
+namespace ProofStateRecord
+
+/-- Manual JSON encoder, snake_case keys (mirrors `GrindInProofRecord.toJson`). -/
+def toJson (r : ProofStateRecord) : Json :=
+  Json.mkObj [
+    ("name",             Json.str r.name),
+    ("module",           Json.str r.module),
+    ("file",             Lean.toJson r.file),
+    ("start_line",       Lean.toJson r.startLine),
+    ("start_col",        Lean.toJson r.startCol),
+    ("end_line",         Lean.toJson r.endLine),
+    ("end_col",          Lean.toJson r.endCol),
+    ("decl_kind",        Json.str r.declKind),
+    ("proof_start_byte", Json.num (JsonNumber.fromNat r.proofStartByte)),
+    ("proof_end_byte",   Json.num (JsonNumber.fromNat r.proofEndByte)),
+    ("proof_source",     Json.str r.proofSource),
+    ("parent_decl",      Lean.toJson r.parentDecl),
+    ("goals",            Json.arr (r.goals.map ProofGoal.toJson)),
+    ("initial_goals",    Json.arr (r.initialGoals.map (Json.num ∘ JsonNumber.fromNat))),
+    ("steps",            Json.arr (r.steps.map ProofStep.toJson)),
+    ("step_count",       Json.num (JsonNumber.fromNat r.stepCount)),
+    ("max_depth",        Json.num (JsonNumber.fromNat r.maxDepth)),
+    ("tactic_kinds",     Json.arr (r.tacticKinds.map Json.str)),
+    ("has_sorry",        Json.bool r.hasSorry),
+    ("outcome",          Json.str r.outcome),
+    ("is_private",       Json.bool r.isPrivate)
+  ]
+
+instance : ToJson ProofStateRecord := ⟨toJson⟩
+
+/-- Decoder, primarily for round-trip tests and golden-fixture checks. -/
+def fromJson? (j : Json) : Except String ProofStateRecord := do
+  let getOptNat (k : String) : Except String (Option Nat) :=
+    match j.getObjVal? k with
+    | .ok .null => .ok none
+    | .ok v     => (Lean.fromJson? v : Except String Nat).map some
+    | .error _  => .ok none
+  let getNat (k : String) : Except String Nat := do
+    (Lean.fromJson? (← j.getObjVal? k) : Except String Nat)
+  let getNatArr (k : String) : Except String (Array Nat) := do
+    let v ← j.getObjVal? k
+    (← v.getArr?).mapM fun x => (Lean.fromJson? x : Except String Nat)
+  return {
+    name           := ← (← j.getObjVal? "name").getStr?
+    module         := ← (← j.getObjVal? "module").getStr?
+    file           := ← (match j.getObjVal? "file" with
+                          | .ok .null => .ok none
+                          | .ok v     => v.getStr?.map some
+                          | .error _  => .ok none)
+    startLine      := ← getOptNat "start_line"
+    startCol       := ← getOptNat "start_col"
+    endLine        := ← getOptNat "end_line"
+    endCol         := ← getOptNat "end_col"
+    declKind       := ← (← j.getObjVal? "decl_kind").getStr?
+    proofStartByte := ← getNat "proof_start_byte"
+    proofEndByte   := ← getNat "proof_end_byte"
+    proofSource    := ← (← j.getObjVal? "proof_source").getStr?
+    parentDecl     := ← (match j.getObjVal? "parent_decl" with
+                          | .ok .null => .ok none
+                          | .ok v     => v.getStr?.map some
+                          | .error _  => .ok none)
+    goals          := ← (do let v ← j.getObjVal? "goals"
+                            (← v.getArr?).mapM ProofGoal.fromJson?)
+    initialGoals   := ← getNatArr "initial_goals"
+    steps          := ← (do let v ← j.getObjVal? "steps"
+                            (← v.getArr?).mapM ProofStep.fromJson?)
+    stepCount      := ← getNat "step_count"
+    maxDepth       := ← getNat "max_depth"
+    tacticKinds    := ← (do let v ← j.getObjVal? "tactic_kinds"
+                            (← v.getArr?).mapM (·.getStr?))
+    hasSorry       := ← (← j.getObjVal? "has_sorry").getBool?
+    outcome        := ← (← j.getObjVal? "outcome").getStr?
+    isPrivate      := ← (← j.getObjVal? "is_private").getBool?
+  }
+
+instance : FromJson ProofStateRecord := ⟨fromJson?⟩
+
+end ProofStateRecord
+
+/-- Summary of a proof-state extraction run. File-level counters plus per-theorem
+outcome counts. `theoremsSkippedTerm` counts term-proved theorems (no `by`), which
+are deliberately not emitted. -/
+structure ProofStateRunStats where
+  filesTotal          : Nat := 0
+  filesOk             : Nat := 0
+  filesEmpty          : Nat := 0
+  filesError          : Nat := 0
+  theoremsOk          : Nat := 0
+  theoremsSkippedTerm : Nat := 0
+  theoremsSkippedLarge : Nat := 0
+  theoremsDeadline    : Nat := 0
+  theoremsError       : Nat := 0
+  totalSteps          : Nat := 0
+  deriving Inhabited
+
 /-- Summary of a grind-extraction run (shared by both the whole-statement and
 in-proof modes). File-level counters plus per-item outcome counts. -/
 structure GrindRunStats where

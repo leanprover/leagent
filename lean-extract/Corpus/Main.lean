@@ -7,6 +7,7 @@ import Corpus.Discover
 import Corpus.WorkerExtract
 import Corpus.GrindExtract
 import Corpus.GrindInProofExtract
+import Corpus.ProofStatesExtract
 import Corpus.DeclClosure
 import Corpus.Artifact
 
@@ -90,6 +91,11 @@ structure CliArgs where
   set, this REPLACES the corpus extraction. Mutually exclusive with
   `--grind-manifest`. -/
   grindInProof       : Bool := false
+  /-- Emit the per-step proof-state dataset (`data/proof-states/train.jsonl`):
+  for every tactic-proved theorem, the nested tree of author-written tactics with
+  the goal state before and after each one. When set, this REPLACES the corpus
+  extraction. Mutually exclusive with the grind modes. -/
+  proofStates        : Bool := false
   /-- Single-declaration mode: extract each named declaration plus its transitive
   owned dependency closure into its own per-target directory under `--output`.
   Repeatable. When non-empty, this REPLACES corpus extraction. -/
@@ -107,7 +113,7 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--reverse-elab] [--closers] [--skip-reverse <decl>]
                      [--reverse-timeout <seconds>]
                      [--jobs <n>] [--no-isolate-files] [--resume]
-                     [--grind-manifest] [--grind-in-proof]
+                     [--grind-manifest] [--grind-in-proof] [--proof-states]
                      [--decl <Name> ...] [--strict-closure]
                      [--split-by-tag <key>] [--seed <n>]
                      [--dataset-card-config <path>]
@@ -158,6 +164,15 @@ by its proof). Repeat --decl for several targets; the union of needed source fil
 is elaborated once. This REPLACES corpus extraction, and is mutually exclusive
 with the grind modes. --strict-closure turns the closure-member-has-no-record
 warning into an error.
+
+--proof-states captures the INTERIOR of every tactic proof: for each
+tactic-proved theorem it walks the elaborated proof and writes one record to
+data/proof-states/train.jsonl holding the nested tree of author-written tactics,
+each step carrying the goal states before and after it ran (hypotheses + target,
+structured and pretty-printed). Theorems proved by a bare term (`:= rfl`) have no
+tactics and are counted, not emitted. Records join to the theorems config by name,
+and each step's byte offsets locate it inside that theorem's proof source.
+REPLACES corpus extraction; mutually exclusive with the grind modes and --decl.
 
 --grind-in-proof instead captures grind data at the grind CALL SITES inside
 existing proofs: it walks each proof, re-runs instrumented grind on every
@@ -330,6 +345,8 @@ where
         go xs { acc with grindManifest := true }
     | "--grind-in-proof" :: xs, acc =>
         go xs { acc with grindInProof := true }
+    | "--proof-states" :: xs, acc =>
+        go xs { acc with proofStates := true }
     | "--decl" :: v :: xs, acc =>
         if v.startsWith "--" then .error "--decl expects a declaration name"
         else go xs { acc with decls := acc.decls.push v.toName }
@@ -337,14 +354,28 @@ where
         go xs { acc with strictClosure := true }
     | x :: _, _ => .error s!"unknown argument: {x}"
 
+/-- The alternate extraction modes: each REPLACES corpus extraction and owns its
+own output layout, so at most one may be requested. Each is an early-return branch
+in `runCli`, which means a silently-accepted combination would run only the first
+and misreport what the run produced. -/
+private def alternateModes (cli : CliArgs) : List (String × Bool) :=
+  [("--grind-manifest", cli.grindManifest),
+   ("--grind-in-proof", cli.grindInProof),
+   ("--proof-states",   cli.proofStates)]
+
+/-- The requested alternate modes, by flag name. -/
+private def requestedAlternateModes (cli : CliArgs) : List String :=
+  (alternateModes cli).filterMap fun (name, on) => if on then some name else none
+
 /-- The first reason `--decl` cannot run with these arguments, if any. Returns
 `none` when the combination is valid (including when `--decl` is absent, except
 for flags that require it). Pure, so the guard set is readable as a table. -/
 private def declModeComplaint? (cli : CliArgs) : Option String :=
   if cli.decls.isEmpty then
     if cli.strictClosure then some "--strict-closure requires --decl" else none
-  else if cli.grindManifest || cli.grindInProof then
-    some "--decl is mutually exclusive with --grind-manifest and --grind-in-proof"
+  else if !(requestedAlternateModes cli).isEmpty then
+    some s!"--decl is mutually exclusive with \
+      {", ".intercalate (requestedAlternateModes cli)}"
   else if cli.listOrphans then
     some "--decl is mutually exclusive with --list-orphans"
   else if cli.enumerate != .glob then
@@ -586,7 +617,7 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       return 1
     if cli.resume &&
         (cli.enumerate != .glob || !cli.isolateFiles || cli.listOrphans ||
-          cli.grindManifest || cli.grindInProof) then
+          cli.grindManifest || cli.grindInProof || cli.proofStates) then
       IO.eprintln "corpus-extract: --resume requires isolated corpus extraction with --enumerate glob"
       IO.eprintln usage
       return 1
@@ -658,11 +689,12 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       catch e =>
         IO.eprintln e.toString
         return 1
-    -- The two grind modes are distinct extractions with distinct plugins/outputs;
-    -- since each is an early-return guard, setting both would silently run only
-    -- one. Reject the combination explicitly.
-    if cli.grindManifest && cli.grindInProof then
-      IO.eprintln "corpus-extract: --grind-manifest and --grind-in-proof are mutually exclusive"
+    -- The alternate modes are distinct extractions with distinct outputs; since
+    -- each is an early-return branch below, setting several would silently run
+    -- only the first. Reject the combination explicitly.
+    let requested := requestedAlternateModes cli
+    if requested.length > 1 then
+      IO.eprintln s!"corpus-extract: {", ".intercalate requested} are mutually exclusive"
       IO.eprintln usage
       return 1
     -- `--grind-manifest`: re-prove every theorem with grind and write the grind
@@ -727,6 +759,47 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
       IO.println s!"corpus-extract: wrote {recs.size} in-proof grind records to {grindDir}/train.jsonl \
         ({available.size} available hints)"
+      return 0
+    -- `--proof-states`: capture the interior of every tactic proof (one record per
+    -- tactic-proved theorem, nested tactic tree with per-step goal states).
+    -- REPLACES corpus extraction, parallel to the grind branches above.
+    if cli.proofStates then
+      let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
+      let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
+      let jobs := resolveJobs cli.jobs (isolate := false)
+      IO.println s!"corpus-extract: discovered {files.size} source file(s); \
+        collecting proof states (jobs={jobs})…"
+      let (recs, pstats) ← Corpus.extractProofStatesViaFrontend projectRoot files
+        cli.includePrivate jobs
+      IO.println s!"corpus-extract: {pstats.filesOk} ok, {pstats.filesEmpty} empty, \
+        {pstats.filesError} error (of {pstats.filesTotal}); \
+        theorems: {pstats.theoremsOk} captured, \
+        {pstats.theoremsSkippedTerm} term-proved (no tactics), \
+        {pstats.theoremsSkippedLarge} too large, \
+        {pstats.theoremsDeadline} past deadline, {pstats.theoremsError} error; \
+        {pstats.totalSteps} step(s) total"
+      if pstats.filesError > 0 then
+        throw <| IO.userError s!"proof-state extraction failed for {pstats.filesError} file(s)"
+      let psDir : System.FilePath := outDir / "data" / "proof-states"
+      IO.FS.createDirAll psDir
+      writeJsonl (psDir / "train.jsonl") recs
+      let metaJson := Json.mkObj [
+        ("toolVersion",          Json.str toolVersion),
+        ("mode",                 Json.str "proof-states"),
+        ("totalRecords",         Json.num (Lean.JsonNumber.fromNat recs.size)),
+        ("totalSteps",           Json.num (Lean.JsonNumber.fromNat pstats.totalSteps)),
+        ("theoremsCaptured",     Json.num (Lean.JsonNumber.fromNat pstats.theoremsOk)),
+        ("theoremsTermProved",   Json.num (Lean.JsonNumber.fromNat pstats.theoremsSkippedTerm)),
+        ("theoremsSkippedLarge", Json.num (Lean.JsonNumber.fromNat pstats.theoremsSkippedLarge)),
+        ("theoremsDeadline",     Json.num (Lean.JsonNumber.fromNat pstats.theoremsDeadline)),
+        ("theoremsError",        Json.num (Lean.JsonNumber.fromNat pstats.theoremsError)),
+        ("stepCeiling",          Json.num (Lean.JsonNumber.fromNat Corpus.ProofStates.stepCeiling)),
+        ("includePrivate",       Json.bool cli.includePrivate),
+        ("rootModules",          Json.arr (cli.modules.map (fun n => Json.str n.toString)))
+      ]
+      IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
+      IO.println s!"corpus-extract: wrote {recs.size} proof-state record(s) to \
+        {psDir}/train.jsonl"
       return 0
     -- Ensure output + data subdirs exist.
     IO.FS.createDirAll outDir

@@ -22,3 +22,7 @@ lean_exe resume_tests where
 
 lean_exe decl_closure_tests where
   root := `DeclClosureTests
+
+lean_exe proof_states_tests where
+  root := `ProofStatesTests
+  supportInterpreter := true

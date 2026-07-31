@@ -92,6 +92,55 @@ def proofRange? (cmdStx : Syntax) : Option (DeclValueKind × Lean.Syntax.Range) 
     | .equations | .whereBody => value.getRange?
   return (kind, range)
 
+/-! ## `where` / `let rec` auxiliaries
+
+An auxiliary declared in a `where` clause or by `let rec` is lifted by Lean into
+its OWN constant, separately kernel-checked, with its own
+`findDeclarationRanges?`. But syntactically it is not a `Command.declaration` — it
+is a term-level `Term.letRecDecl` nested inside its parent's `whereDecls`:
+
+```text
+Command.declaration
+  Command.theorem
+    Command.declValSimple          ← `proofRange?` finds this: the PARENT's proof
+    Termination.suffix
+    null
+      Term.whereDecls
+        Term.letRecDecl            ← the auxiliary
+```
+
+So `proofRange?` applied to the enclosing command yields the parent's value, and an
+auxiliary needs its own range function. -/
+
+/-- The value forms of a `where` / `let rec` auxiliary. -/
+def auxValueKinds : List SyntaxNodeKind :=
+  [``Lean.Parser.Term.letIdDecl, ``Lean.Parser.Term.letEqnsDecl]
+
+/-- The range replaced when erasing a `letRecDecl`'s value — the auxiliary analogue
+of `proofRange?`.
+
+In both forms the value is the LAST child, per the parsers in `Lean/Parser/Term.lean`:
+
+```text
+letIdDecl   := letIdLhs >> " := " >> termParser
+letEqnsDecl := letIdLhs >> (" := " <|> matchAlts)
+```
+
+which on 4.31 lay out as `[letId, null, null(type), «:=», value]` (5 args) and
+`[letId, null, null(type), matchAlts]` (4 args) respectively. `letIdDecl` maps to
+`.simple` (the range is the bare term, like `:= term`) and `letEqnsDecl` to
+`.equations` (the range spans the alternatives), matching how `proofRange?`
+classifies the corresponding top-level forms. -/
+def auxProofRange? (lrd : Syntax) : Option (DeclValueKind × Lean.Syntax.Range) := do
+  let d ← findByKind lrd auxValueKinds
+  guard (d.getNumArgs > 0)
+  let value := d.getArg (d.getNumArgs - 1)
+  let kind := if d.getKind == ``Lean.Parser.Term.letIdDecl then
+      DeclValueKind.simple
+    else
+      DeclValueKind.equations
+  return (kind, ← value.getRange?)
+
 /-- Position key for a syntax node's leading source position. -/
 def syntaxKey? (fileMap : FileMap) (stx : Syntax) : Option (Nat × Nat) := do
   let rawPos ← stx.getPos?
