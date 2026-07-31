@@ -12,7 +12,7 @@ any tagging rules are all supplied on the command line.
 
 ## Extraction modes
 
-Three things the tool can produce. They are mutually exclusive:
+Four things the tool can produce. They are mutually exclusive:
 
 - **Corpus** (default) — one record per theorem/definition across the whole
   project, split into `theorems` and `definitions` configs.
@@ -20,6 +20,9 @@ Three things the tool can produce. They are mutually exclusive:
   owned dependency closure, in its own directory, with each record annotated by
   cone. Composes with `reassemble` into a standalone Lean unit. See
   [Single-declaration mode](#single-declaration-mode).
+- **Proof states** (`--proof-states`) — the *interior* of every tactic proof: one
+  record per tactic-proved theorem holding the nested tactic tree with the goal
+  state before and after each step. See [Proof-state mode](#proof-state-mode).
 - **Grind** (`--grind-manifest` / `--grind-in-proof`) — AlphaGrind datasets;
   each replaces corpus extraction with its own schema and output directory.
 
@@ -114,6 +117,7 @@ Make sure the target project is built first (`cd ../sqlite && lake build`) so th
 | `--no-private` | no | Skip `private` declarations. Default: include them. |
 | `--decl <Name>` | no | **Single-declaration mode.** Extract this declaration plus its transitive owned dependency closure into its own per-target directory. Repeatable; the union of needed files is elaborated once. See [Single-declaration mode](#single-declaration-mode). |
 | `--strict-closure` | no | With `--decl`, fail instead of warning when a closure member has no emitted record (constructors, recursors, generated lemmas). |
+| `--proof-states` | no | **Proof-state mode.** Emit one record per tactic-proved theorem with the nested tactic tree and per-step goal states, to `data/proof-states/train.jsonl`. Replaces corpus extraction. See [Proof-state mode](#proof-state-mode). |
 | `--split-by-tag <key>` | no | Stratified 80/10/10 train/valid/test split of theorems keyed on a tag value. Definitions are always one split. |
 | `--seed <n>` | no | Deterministic split seed (default 0). |
 | `--dataset-card-config <path>` | no | JSON describing dataset identity; generates the HF dataset card (`README.md`). |
@@ -334,9 +338,63 @@ count even though usually only the target's `proof_script` is wanted.
   drop an error.
 - A target in an orphan file (one no root module imports) is rejected — check
   `--list-orphans`.
-- Mutually exclusive with the grind modes and `--list-orphans`;
-  `--split-by-tag` and `--dataset-card-config` are rejected as meaningless
-  per-target.
+- Mutually exclusive with the grind modes, `--proof-states`, and
+  `--list-orphans`; `--split-by-tag` and `--dataset-card-config` are rejected as
+  meaningless per-target.
+
+## Proof-state mode
+
+`--proof-states` captures the **interior** of every tactic proof. The corpus's two
+proof representations are both whole-proof — `body` is a source slice,
+`proof_script` is a reverse-elaborated string — so neither can express *given this
+goal, the author applied this tactic, and the goal became that*. This mode does.
+
+```bash
+./.lake/build/bin/lean_extract \
+    --modules      LambdaCalc \
+    --source-root  ../LambdaCalc \
+    --proof-states \
+    --output       ./ps-out
+```
+
+```text
+ps-out/
+  metadata.json                      # mode: "proof-states", run counters
+  data/proof-states/train.jsonl      # one record per tactic-proved theorem
+```
+
+One record per theorem, joining to the `theorems` config by `name`:
+
+| Field | Meaning |
+|---|---|
+| `steps` | The tactic tree. Each step: verbatim `tactic` text, `tactic_kind`, line/col **and byte** range, `goals_before` / `goals_after`, `invocations`, and `children`. |
+| `goals` | Interned goal table. Each goal: `hyps` (`names`/`type`/`value`/`is_let`), `target`, and a `pretty` block. Steps reference goals by index. |
+| `initial_goals` | The state the proof opened in — always goal `0`. |
+| `parent_decl` | For a `where` / `let rec` **auxiliary**, the enclosing declaration; `null` for a top-level theorem. An auxiliary is a separately-checked constant and gets its own record — often it is the substantive lemma, the parent's proof being one `exact`. |
+| `proof_source`, `proof_start_byte`, `proof_end_byte` | The proof's verbatim text and file byte span. |
+| `step_count`, `max_depth`, `tactic_kinds` | Shape summary, for filtering without walking. |
+| `outcome` | `ok` / `skipped_large` / `deadline_skipped` / `error`. Non-`ok` means `steps` is empty. |
+
+Combinators become **parent** steps whose children are the tactics they composed,
+so `induction … with`, `<;>`, `all_goals`, and `·` keep their source structure. A
+combinator that re-runs one tactic per goal yields a single step with
+`invocations > 1` and the union of the goals it ran on.
+
+Each step's byte offsets locate it inside the corpus schema without re-elaborating:
+
+```text
+step.start_byte - record.proof_start_byte  =  offset within ConstRecord.body
+```
+
+Theorems proved by a bare term (`:= rfl`) have no tactics; they are **counted**
+(`theoremsTermProved`), not emitted as empty rows.
+
+On `ProofBenchData/generated/LambdaCalc` (11 files): 64 records, 480 steps (max 53
+in one theorem), 447 distinct goals from 735 references, depth up to 5, 511 KB, no
+errors and no unhandled-form warnings.
+
+Mutually exclusive with `--decl` and the grind modes. `--resume` does not apply.
+Design and validation: [`docs/proof-state-extraction.md`](../docs/proof-state-extraction.md).
 
 ## Architecture
 
@@ -358,12 +416,15 @@ Everything is one package; `lean-extract` hosts Lean's frontend directly:
  ├─ Corpus/DeclClosure/Emit.lean   phase 2: order, project, render, write
  ├─ Corpus/GrindManifest.lean   the grind-manifest collector (grindManifestCore)
  ├─ Corpus/GrindInProof.lean    the in-proof grind collector (grindInProofCore)
+ ├─ Corpus/ProofStates.lean     --proof-states: the InfoTree walk, tree algebra,
+ │                              goal rendering + interning (proofStatesCore)
  ├─ Corpus/ReverseElab.lean     proof-term → verified tactic script
  ├─ Corpus/WorkerExtract.lean   isolated/shared driver, resume staging, record mapping
  ├─ Corpus/GrindExtract.lean    the grind-manifest driver
  ├─ Corpus/GrindInProofExtract.lean  the in-proof grind driver
+ ├─ Corpus/ProofStatesExtract.lean   the proof-state driver
  ├─ Corpus/Extract.lean         the legacy import-and-walk backend (--enumerate=import)
- ├─ Corpus/Records.lean         the ConstRecord / grind JSONL schema + encoders
+ ├─ Corpus/Records.lean         the ConstRecord / grind / proof-state schemas + encoders
  ├─ Corpus/Tags.lean            tag-rule matching
  └─ Corpus/Card.lean            HF dataset-card rendering
 ```
