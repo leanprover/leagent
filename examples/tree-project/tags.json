@@ -1,0 +1,8 @@
+{
+  "rules": [
+    { "match": "Trees.Basic",   "tags": { "layer": "base",    "topic": "tree" } },
+    { "match": "Trees.ListSum", "tags": { "layer": "base",    "topic": "list" } },
+    { "match": "Trees.Flatten", "tags": { "layer": "middle",  "topic": "bridge" } },
+    { "match": "Trees.Mirror",  "tags": { "layer": "top",     "topic": "tree" } }
+  ]
+}

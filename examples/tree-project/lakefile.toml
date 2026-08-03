@@ -1,0 +1,6 @@
+name = "TreeExample"
+version = "0.1.0"
+defaultTargets = ["Trees"]
+
+[[lean_lib]]
+name = "Trees"
