@@ -698,33 +698,4 @@ instance : FromJson ProofStateRecord := ⟨fromJson?⟩
 
 end ProofStateRecord
 
-/-- Summary of a proof-state extraction run. File-level counters plus per-theorem
-outcome counts. `theoremsSkippedTerm` counts term-proved theorems (no `by`), which
-are deliberately not emitted. -/
-structure ProofStateRunStats where
-  filesTotal          : Nat := 0
-  filesOk             : Nat := 0
-  filesEmpty          : Nat := 0
-  filesError          : Nat := 0
-  theoremsOk          : Nat := 0
-  theoremsSkippedTerm : Nat := 0
-  theoremsSkippedLarge : Nat := 0
-  theoremsDeadline    : Nat := 0
-  theoremsError       : Nat := 0
-  totalSteps          : Nat := 0
-  deriving Inhabited
-
-/-- Summary of a grind-extraction run (shared by both the whole-statement and
-in-proof modes). File-level counters plus per-item outcome counts. -/
-structure GrindRunStats where
-  filesTotal   : Nat := 0
-  filesOk      : Nat := 0
-  filesEmpty   : Nat := 0
-  filesError   : Nat := 0
-  closed       : Nat := 0
-  stuck        : Nat := 0
-  errored      : Nat := 0
-  skipped      : Nat := 0
-  deriving Inhabited
-
 end Corpus

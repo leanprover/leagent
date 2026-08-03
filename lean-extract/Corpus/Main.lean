@@ -2,8 +2,9 @@ import Lean
 import Corpus.Records
 import Corpus.Tags
 import Corpus.Card
-import Corpus.Extract
+import Corpus.CollectCommon
 import Corpus.Discover
+import Corpus.Reexec
 import Corpus.WorkerExtract
 import Corpus.GrindExtract
 import Corpus.GrindInProofExtract
@@ -50,16 +51,12 @@ open Corpus.Artifact (writeJsonl partitionByConfig)
 /-- Tool version, bumped manually as the schema evolves. -/
 def toolVersion : String := "0.2.0"
 
-/-- How to enumerate the declarations to extract.
-  * `glob`   — drive Lean's frontend over source files discovered under the
-               `--modules` roots. Each file is elaborated in its true context
-               and collected in an isolated process by default.
-  * `import` — the legacy path: `importModules` the `--modules` roots and walk
-               the resulting `Environment`. Misses orphan files. -/
-inductive EnumerateMode where
-  | glob
-  | import
-  deriving Inhabited, BEq
+/-- Per-kind counters for the corpus `metadata.json`. -/
+structure RunStats where
+  total   : Nat := 0
+  byKind  : List (String × Nat) := []
+  modules : List String := []
+  deriving Inhabited
 
 structure CliArgs where
   modules            : Array Name := #[]
@@ -78,7 +75,6 @@ structure CliArgs where
   splitByTag         : Option String := none
   seed               : Nat := 0
   datasetCardConfig  : Option System.FilePath := none
-  enumerate          : EnumerateMode := .glob
   listOrphans        : Bool := false
   /-- Emit the AlphaGrind grind manifest (`data/grind/train.jsonl`): re-prove
   every theorem with `grind`'s default strategy and record what it did. Uses the
@@ -105,9 +101,19 @@ structure CliArgs where
   strictClosure      : Bool := false
   deriving Inhabited
 
+/-- The per-file collection knobs these arguments select. Everything downstream —
+the drivers, the isolated child, the collectors — takes this one value rather than
+the five flags separately. -/
+def CliArgs.opts (cli : CliArgs) : CollectOptions :=
+  { includeInternal := cli.includeInternal
+    includePrivate  := cli.includePrivate
+    reverseElab     := cli.reverseElab
+    reverseClosers  := cli.reverseClosers
+    reverseSkip     := cli.reverseSkip }
+
 private def usage : String := "\
 Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
-                     [--enumerate glob|import] [--list-orphans]
+                     [--list-orphans]
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
                      [--reverse-elab] [--closers] [--skip-reverse <decl>]
@@ -123,10 +129,9 @@ If --source-root (or, failing that, the current directory) contains a
 lakefile.lean or lakefile.toml, the tool re-execs itself under `lake env`
 from that directory so LEAN_PATH resolves to the project's built .oleans.
 
---enumerate glob (default) drives Lean's frontend over the source files found on
-disk under the --modules roots (orphan-safe). --enumerate import uses the legacy
-importModules + Environment walk. --list-orphans prints the modules on disk that
-are not in the import closure of the declared roots, then exits.
+The tool drives Lean's frontend over the source files found on disk under the
+--modules roots (orphan-safe). --list-orphans prints the modules on disk that are
+not in the import closure of the declared roots, then exits.
 
 --grind-manifest re-proves every theorem with `grind`'s default strategy and
 writes data/grind/train.jsonl (the interactive script, the `grind only`
@@ -202,82 +207,43 @@ private def resolveJobs (jobs? : Option Nat) (isolate : Bool) : Nat :=
       Frontend.defaultMaxConcurrent
 
 
-structure ReverseOneArgs where
-  sourceFile : Option System.FilePath := none
-  moduleName : Option Name := none
-  declName   : Option Name := none
-  closers    : Bool := false
-  deriving Inhabited
+/-- Internal child mode: reverse-elaborate ONE theorem and print its `ScriptResult`
+as JSON. The request arrives as a single JSON argument
+(`Corpus.ReverseOneRequest`) — one encoding shared with the parent. -/
+private def parseReverseOneRequest? (args : List String)
+    : Option (Except String ReverseOneRequest) :=
+  match args with
+  | [flag, payload] =>
+      if flag == reverseOneFlag then some (Json.parse payload >>= fromJson?) else none
+  | _ => none
 
-private def parseReverseOneArgs? (args : List String) : Option (Except String ReverseOneArgs) :=
-  if !args.contains "--internal-reverse-one" then none else some (go args {})
-where
-  go : List String → ReverseOneArgs → Except String ReverseOneArgs
-    | [], acc =>
-        if acc.sourceFile.isNone then .error "--internal-reverse-one expects --source-file"
-        else if acc.moduleName.isNone then .error "--internal-reverse-one expects --module"
-        else if acc.declName.isNone then .error "--internal-reverse-one expects --decl"
-        else .ok acc
-    | "--internal-reverse-one" :: xs, acc => go xs acc
-    | "--source-file" :: v :: xs, acc => go xs { acc with sourceFile := some v }
-    | "--module" :: v :: xs, acc => go xs { acc with moduleName := some v.toName }
-    | "--decl" :: v :: xs, acc => go xs { acc with declName := some v.toName }
-    | "--closers" :: xs, acc => go xs { acc with closers := true }
-    | x :: _, _ => .error s!"unknown --internal-reverse-one argument: {x}"
-
-private unsafe def runReverseOneCli (cfg : ReverseOneArgs) : IO UInt32 := do
-  let some sourceFile := cfg.sourceFile | return 2
-  let some moduleName := cfg.moduleName | return 2
-  let some declName := cfg.declName | return 2
-  let r ← Corpus.reverseOneInFile sourceFile moduleName declName cfg.closers
+private unsafe def runReverseOneCli (request : ReverseOneRequest) : IO UInt32 := do
+  let r ← Corpus.reverseOneInFile request.sourceFile request.module request.decl
+    request.closers
   IO.println (Lean.toJson r).compress
   return 0
 
+/-- Internal child mode: extract ONE file and print its records as JSONL.
 
-structure ExtractOneArgs where
-  sourceFile      : Option System.FilePath := none
-  moduleName      : Option Name := none
-  relPath         : Option String := none
-  config          : Option System.FilePath := none
-  includeInternal : Bool := false
-  includePrivate  : Bool := true
-  reverseElab     : Bool := false
-  reverseClosers  : Bool := false
-  reverseSkip     : Array String := #[]
-  deriving Inhabited
+The request arrives as a single JSON argument (`Corpus.ExtractOneRequest`), so the
+parent's encoding and this decode are the same one — there is no flag writer/parser
+pair to drift. Returns `none` when this is not a child invocation. -/
+private def parseExtractOneRequest? (args : List String)
+    : Option (Except String ExtractOneRequest) :=
+  match args with
+  | [flag, payload] =>
+      if flag == extractOneFlag then
+        some (Json.parse payload >>= fromJson?)
+      else none
+  | _ => none
 
-private def parseExtractOneArgs? (args : List String) : Option (Except String ExtractOneArgs) :=
-  if !args.contains "--internal-extract-one" then none else some (go args {})
-where
-  go : List String → ExtractOneArgs → Except String ExtractOneArgs
-    | [], acc =>
-        if acc.sourceFile.isNone then .error "--internal-extract-one expects --source-file"
-        else if acc.moduleName.isNone then .error "--internal-extract-one expects --module"
-        else if acc.relPath.isNone then .error "--internal-extract-one expects --rel-path"
-        else .ok acc
-    | "--internal-extract-one" :: xs, acc => go xs acc
-    | "--source-file" :: v :: xs, acc => go xs { acc with sourceFile := some v }
-    | "--module" :: v :: xs, acc => go xs { acc with moduleName := some v.toName }
-    | "--rel-path" :: v :: xs, acc => go xs { acc with relPath := some v }
-    | "--config" :: v :: xs, acc => go xs { acc with config := some v }
-    | "--include-internal" :: xs, acc => go xs { acc with includeInternal := true }
-    | "--no-private" :: xs, acc => go xs { acc with includePrivate := false }
-    | "--reverse-elab" :: xs, acc => go xs { acc with reverseElab := true }
-    | "--closers" :: xs, acc => go xs { acc with reverseElab := true, reverseClosers := true }
-    | "--skip-reverse" :: v :: xs, acc => go xs { acc with reverseSkip := acc.reverseSkip.push v }
-    | x :: _, _ => .error s!"unknown --internal-extract-one argument: {x}"
-
-private unsafe def runExtractOneCli (cfg : ExtractOneArgs) : IO UInt32 := do
-  let some sourceFile := cfg.sourceFile | return 2
-  let some moduleName := cfg.moduleName | return 2
-  let some relPath := cfg.relPath | return 2
-  let tagConfig ← match cfg.config with
+private unsafe def runExtractOneCli (request : ExtractOneRequest) : IO UInt32 := do
+  let tagConfig ← match request.config with
     | none => pure TagConfig.empty
     | some path => Corpus.loadConfig path
-  let df : Corpus.Discover.DiscoveredFile := { absPath := sourceFile, module := moduleName, relPath := relPath }
-  let recs ← Corpus.extractOneFileViaFrontend "." df tagConfig cfg.includeInternal cfg.includePrivate
-    cfg.reverseElab cfg.reverseClosers cfg.reverseSkip
-  for r in recs do
+  let df : Corpus.Discover.DiscoveredFile :=
+    { absPath := request.sourceFile, module := request.module, relPath := request.relPath }
+  for r in (← Corpus.extractOneFileViaFrontend df tagConfig request.opts) do
     IO.println (Lean.toJson r).compress
   return 0
 
@@ -334,11 +300,6 @@ where
         | none   => .error s!"--seed expects a non-negative integer, got: {v}"
     | "--dataset-card-config" :: v :: xs, acc =>
         go xs { acc with datasetCardConfig := some v }
-    | "--enumerate" :: v :: xs, acc =>
-        match v with
-        | "glob"   => go xs { acc with enumerate := .glob }
-        | "import" => go xs { acc with enumerate := .import }
-        | _        => .error s!"--enumerate expects glob|import, got: {v}"
     | "--list-orphans" :: xs, acc =>
         go xs { acc with listOrphans := true }
     | "--grind-manifest" :: xs, acc =>
@@ -367,27 +328,50 @@ private def alternateModes (cli : CliArgs) : List (String × Bool) :=
 private def requestedAlternateModes (cli : CliArgs) : List String :=
   (alternateModes cli).filterMap fun (name, on) => if on then some name else none
 
-/-- The first reason `--decl` cannot run with these arguments, if any. Returns
-`none` when the combination is valid (including when `--decl` is absent, except
-for flags that require it). Pure, so the guard set is readable as a table. -/
-private def declModeComplaint? (cli : CliArgs) : Option String :=
-  if cli.decls.isEmpty then
-    if cli.strictClosure then some "--strict-closure requires --decl" else none
-  else if !(requestedAlternateModes cli).isEmpty then
-    some s!"--decl is mutually exclusive with \
-      {", ".intercalate (requestedAlternateModes cli)}"
-  else if cli.listOrphans then
-    some "--decl is mutually exclusive with --list-orphans"
-  else if cli.enumerate != .glob then
-    some "--decl requires --enumerate glob (the import path cannot reconstruct source)"
-  else if cli.splitByTag.isSome then
-    some "--split-by-tag is meaningless with --decl (each target is a single \
-      closure, not a dataset split)"
-  else if cli.datasetCardConfig.isSome then
-    some "--dataset-card-config is meaningless with --decl (the card renders \
-      whole-corpus statistics)"
-  else
-    none
+/-- Every mode-compatibility rule, as `(violated?, complaint)` pairs.
+
+A flat list, deliberately: each rule is evaluated independently of the others, so a
+rule can never be shadowed by an earlier branch returning first. An earlier nested
+version had exactly that bug — the `--decl` rules formed their own `if` chain, so
+`--decl --resume --no-isolate-files` skipped the `--resume` rule and RAN instead of
+being rejected.
+
+`modeComplaint?` reports the first violated rule, so order here is only the reporting
+priority; the rejection itself does not depend on it. Rejecting rather than ignoring a
+bad combination matters because each mode is an early-return branch in `runCli`: a
+silently-accepted combination would run only the first branch and misreport what the
+run produced.
+
+Pure, so the rules are checkable without running an extraction. -/
+private def modeRules (cli : CliArgs) : List (Bool × String) :=
+  let requested := requestedAlternateModes cli
+  let decl := !cli.decls.isEmpty
+  [ -- At most one alternate mode: each owns its own output layout.
+    (requested.length > 1,
+      s!"{", ".intercalate requested} are mutually exclusive"),
+    -- `--decl` is its own extraction with per-target output.
+    (decl && !requested.isEmpty,
+      s!"--decl is mutually exclusive with {", ".intercalate requested}"),
+    (decl && cli.listOrphans,
+      "--decl is mutually exclusive with --list-orphans"),
+    (decl && cli.splitByTag.isSome,
+      "--split-by-tag is meaningless with --decl (each target is a single \
+        closure, not a dataset split)"),
+    (decl && cli.datasetCardConfig.isSome,
+      "--dataset-card-config is meaningless with --decl (the card renders \
+        whole-corpus statistics)"),
+    -- Flags that require a mode they were not given with.
+    (cli.strictClosure && !decl,
+      "--strict-closure requires --decl"),
+    -- `--resume` only stages shards on the isolated path (corpus or `--decl`).
+    (cli.resume && (!cli.isolateFiles || cli.listOrphans || !requested.isEmpty),
+      "--resume requires isolated extraction") ]
+
+/-- The first violated rule's complaint, if any; `none` when the combination is
+valid. See `modeRules`. -/
+private def modeComplaint? (cli : CliArgs) : Option String :=
+  (modeRules cli).findSome? fun (violated, complaint) =>
+    if violated then some complaint else none
 
 /-- Render the extractor's own `metadata.json` payload. -/
 private def renderStats (stats : Corpus.RunStats) (modulesIn : Array Name)
@@ -523,73 +507,57 @@ private def pickDefinitionExample (rs : Array ConstRecord) : Option ConstRecord 
   let withSrc := rs.find? fun r => hasNonEmpty r.signature
   withSrc.orElse (fun _ => rs[0]?)
 
+/-- Write one alternate mode's output: its records as JSONL under
+`data/<subdir>/train.jsonl`, plus `metadata.json`.
+
+The three alternate modes (`--grind-manifest`, `--grind-in-proof`,
+`--proof-states`) each REPLACE corpus extraction and own their output directory, but
+lay it down identically; only `subdir` and the mode-specific metadata keys differ.
+`toolVersion`, `mode`, `totalRecords`, and `rootModules` are common to all three and
+supplied here, so a mode cannot forget one.
+
+`Json.mkObj` sorts keys, so appending `extraMeta` cannot change the field order of
+the rendered file. -/
+private def writeAltMode [ToJson α] (outDir : System.FilePath) (mode subdir : String)
+    (modules : Array Name) (records : Array α)
+    (extraMeta : List (String × Json)) : IO System.FilePath := do
+  let dir := outDir / "data" / subdir
+  IO.FS.createDirAll dir
+  let path := dir / "train.jsonl"
+  writeJsonl path records
+  let metaJson := Json.mkObj ([
+    ("toolVersion",  Json.str toolVersion),
+    ("mode",         Json.str mode),
+    ("totalRecords", Json.num (Lean.JsonNumber.fromNat records.size)),
+    ("rootModules",  Json.arr (modules.map (fun n => Json.str n.toString)))
+  ] ++ extraMeta)
+  IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
+  return path
+
+/-- Count as a JSON number, the shape every run-summary metadata field takes. -/
+private def jnat (n : Nat) : Json := Json.num (Lean.JsonNumber.fromNat n)
+
 /-- Marker env var used to break the auto re-exec loop. When set, the
 running process is the child invocation under `lake env` and should
 just do the work. -/
 private def reexecMarker : String := "CORPUS_EXTRACT_REEXEC"
 
-/-- Resolve a path against `base` if it isn't already absolute. -/
-private def absolutize (base : System.FilePath) (p : System.FilePath) :
-    System.FilePath :=
-  if p.isAbsolute then p else base / p
-
-/-- True if `dir` looks like a Lake project root (has a `lakefile.lean`
-or `lakefile.toml`). -/
-private def isLakeProject (dir : System.FilePath) : IO Bool := do
-  let lean := dir / "lakefile.lean"
-  let toml := dir / "lakefile.toml"
-  pure ((← lean.pathExists) || (← toml.pathExists))
-
-/-- Re-exec ourselves under `lake env` from inside `project`, with
-relative user paths absolutized against the original cwd. Returns the
-child's exit code. -/
-private unsafe def reexecUnderLake (project : System.FilePath)
-    (rawArgs : List String) : IO UInt32 := do
-  let cwd ← IO.currentDir
-  let self ← IO.appPath
-  let projectAbs := absolutize cwd project
-  -- Walk the original arg list and absolutize every flag value that is a
-  -- filesystem path, because the child runs with `cwd := projectAbs` and would
-  -- otherwise resolve a relative path against the PROJECT rather than the
-  -- directory the user invoked us from.
-  --
-  -- Advance ONE token at a time, consuming a value only for a flag known to take
-  -- one. An earlier version stepped in pairs, which silently broke parity after
-  -- any bare flag (`--no-private`, `--reverse-elab`, `--strict-closure`, …): a
-  -- following `--output out` was then read as a (value, flag) pair, so `out` was
-  -- never absolutized and the run wrote into the source tree instead of the cwd.
-  let pathFlags : List String :=
-    ["--output", "--config", "--source-root", "--dataset-card-config"]
-  let rec rebuild : List String → List String
-    | [] => []
-    | f :: v :: xs =>
-      if pathFlags.contains f then
-        f :: (absolutize cwd v).toString :: rebuild xs
-      else
-        f :: rebuild (v :: xs)
-    | [x] => [x]
-  let childArgs : Array String :=
-    #["env", self.toString] ++ (rebuild rawArgs).toArray
-  let child ← IO.Process.spawn {
-    cmd  := "lake"
-    args := childArgs
-    cwd  := some projectAbs
-    env  := #[(reexecMarker, some "1")]
-  }
-  child.wait
+/-- Flags whose values are filesystem paths, absolutized before re-exec. -/
+private def reexecPathFlags : List String :=
+  ["--output", "--config", "--source-root", "--dataset-card-config"]
 
 /-- Real entry point. Loads search path, imports modules, runs extraction,
 applies filters/splits, then writes JSONL files, metadata, and (optionally)
 a HF dataset card. -/
 unsafe def runCli (args : List String) : IO UInt32 := do
-  match parseExtractOneArgs? args with
-  | some (.ok cfg) => return (← runExtractOneCli cfg)
+  match parseExtractOneRequest? args with
+  | some (.ok request) => return (← runExtractOneCli request)
   | some (.error e) =>
       IO.eprintln s!"corpus-extract: {e}"
       return 2
   | none => pure ()
-  match parseReverseOneArgs? args with
-  | some (.ok cfg) => return (← runReverseOneCli cfg)
+  match parseReverseOneRequest? args with
+  | some (.ok request) => return (← runReverseOneCli request)
   | some (.error e) =>
       IO.eprintln s!"corpus-extract: {e}"
       return 2
@@ -609,22 +577,17 @@ unsafe def runCli (args : List String) : IO UInt32 := do
     let alreadyReexec := (← IO.getEnv reexecMarker).isSome
     if !alreadyReexec then
       let candidate := cli.sourceRoot.getD (← IO.currentDir)
-      if (← isLakeProject candidate) then
-        return (← reexecUnderLake candidate args)
+      if (← Corpus.Reexec.isLakeProject candidate) then
+        return (← Corpus.Reexec.reexecUnderLake reexecMarker reexecPathFlags candidate args)
     if cli.modules.isEmpty then
       IO.eprintln "corpus-extract: --modules is required"
       IO.eprintln usage
       return 1
-    if cli.resume &&
-        (cli.enumerate != .glob || !cli.isolateFiles || cli.listOrphans ||
-          cli.grindManifest || cli.grindInProof || cli.proofStates) then
-      IO.eprintln "corpus-extract: --resume requires isolated corpus extraction with --enumerate glob"
-      IO.eprintln usage
-      return 1
-    -- `--decl` is a distinct extraction with its own per-target output. Reject the
-    -- flags that belong to a different mode or are meaningless per-target rather
-    -- than ignoring them, which would misrepresent what the run produced.
-    if let some complaint := declModeComplaint? cli then
+    -- Every mode-compatibility rule, in one table (`modeComplaint?`). Rejecting a
+    -- bad combination rather than ignoring it matters because each mode is an
+    -- early-return branch below: a silently-accepted combination would run only the
+    -- first and misreport what the run produced.
+    if let some complaint := modeComplaint? cli then
       IO.eprintln s!"corpus-extract: {complaint}"
       IO.eprintln usage
       return 1
@@ -674,11 +637,7 @@ unsafe def runCli (args : List String) : IO UInt32 := do
           roots            := cli.modules
           tagConfig        := tagConfig
           configPath?      := cli.config
-          includeInternal  := cli.includeInternal
-          includePrivate   := cli.includePrivate
-          reverseElab      := cli.reverseElab
-          reverseClosers   := cli.reverseClosers
-          reverseSkip      := cli.reverseSkip
+          opts             := cli.opts
           reverseTimeoutMs := cli.reverseTimeoutMs
           jobs             := resolveJobs cli.jobs cli.isolateFiles
           isolateFiles     := cli.isolateFiles
@@ -689,14 +648,6 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       catch e =>
         IO.eprintln e.toString
         return 1
-    -- The alternate modes are distinct extractions with distinct outputs; since
-    -- each is an early-return branch below, setting several would silently run
-    -- only the first. Reject the combination explicitly.
-    let requested := requestedAlternateModes cli
-    if requested.length > 1 then
-      IO.eprintln s!"corpus-extract: {", ".intercalate requested} are mutually exclusive"
-      IO.eprintln usage
-      return 1
     -- `--grind-manifest`: re-prove every theorem with grind and write the grind
     -- dataset. This REPLACES corpus extraction (its own worker plugin + output).
     if cli.grindManifest then
@@ -704,28 +655,21 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
       IO.println s!"corpus-extract: discovered {files.size} source file(s); running grind…"
       let (recs, available, gstats) ←
-        Corpus.extractGrindViaFrontend projectRoot files cli.includePrivate
+        Corpus.extractGrindViaFrontend files cli.includePrivate
       IO.println s!"corpus-extract: {gstats.filesOk} ok, {gstats.filesEmpty} empty, \
         {gstats.filesError} error (of {gstats.filesTotal}); \
-        theorems: {gstats.closed} closed, {gstats.stuck} stuck, \
-        {gstats.errored} error, {gstats.skipped} skipped"
-      let grindDir : System.FilePath := outDir / "data" / "grind"
-      IO.FS.createDirAll grindDir
-      writeJsonl (grindDir / "train.jsonl") recs
+        theorems: {gstats.outcome Outcome.closed} closed, {gstats.outcome Outcome.stuck} stuck, \
+        {gstats.outcomesOther Corpus.grindOutcomeLabels} error, \
+        {gstats.outcome Outcome.deadlineSkipped} skipped"
       -- metadata.json: run summary + the env-wide available-hint set.
-      let metaJson := Json.mkObj [
-        ("toolVersion",     Json.str toolVersion),
-        ("mode",            Json.str "grind-manifest"),
-        ("totalRecords",    Json.num (Lean.JsonNumber.fromNat recs.size)),
-        ("theoremsClosed",  Json.num (Lean.JsonNumber.fromNat gstats.closed)),
-        ("theoremsStuck",   Json.num (Lean.JsonNumber.fromNat gstats.stuck)),
-        ("theoremsError",   Json.num (Lean.JsonNumber.fromNat gstats.errored)),
-        ("theoremsSkipped", Json.num (Lean.JsonNumber.fromNat gstats.skipped)),
-        ("rootModules",     Json.arr (cli.modules.map (fun n => Json.str n.toString))),
+      let path ← writeAltMode outDir "grind-manifest" "grind" cli.modules recs [
+        ("theoremsClosed",  jnat (gstats.outcome Outcome.closed)),
+        ("theoremsStuck",   jnat (gstats.outcome Outcome.stuck)),
+        ("theoremsError",   jnat (gstats.outcomesOther Corpus.grindOutcomeLabels)),
+        ("theoremsSkipped", jnat (gstats.outcome Outcome.deadlineSkipped)),
         ("availableHints",  Json.arr (available.map Json.str))
       ]
-      IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
-      IO.println s!"corpus-extract: wrote {recs.size} grind records to {grindDir}/train.jsonl \
+      IO.println s!"corpus-extract: wrote {recs.size} grind records to {path} \
         ({available.size} available hints)"
       return 0
     -- `--grind-in-proof`: capture grind data at grind call sites inside existing
@@ -736,28 +680,21 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
       IO.println s!"corpus-extract: discovered {files.size} source file(s); running in-proof grind…"
       let (recs, available, gstats) ←
-        Corpus.extractGrindInProofViaFrontend projectRoot files cli.includePrivate
+        Corpus.extractGrindInProofViaFrontend files cli.includePrivate
       IO.println s!"corpus-extract: {gstats.filesOk} ok, {gstats.filesEmpty} empty, \
         {gstats.filesError} error (of {gstats.filesTotal}); \
-        call sites: {gstats.closed} closed, {gstats.stuck} stuck, \
-        {gstats.errored} error, {gstats.skipped} skipped"
-      let grindDir : System.FilePath := outDir / "data" / "grind-in-proof"
-      IO.FS.createDirAll grindDir
-      writeJsonl (grindDir / "train.jsonl") recs
+        call sites: {gstats.outcome Outcome.closed} closed, {gstats.outcome Outcome.stuck} stuck, \
+        {gstats.outcomesOther Corpus.grindOutcomeLabels} error, \
+        {gstats.outcome Outcome.deadlineSkipped} skipped"
       -- metadata.json: run summary + the env-wide available-hint set.
-      let metaJson := Json.mkObj [
-        ("toolVersion",    Json.str toolVersion),
-        ("mode",           Json.str "grind-in-proof"),
-        ("totalRecords",   Json.num (Lean.JsonNumber.fromNat recs.size)),
-        ("callsClosed",    Json.num (Lean.JsonNumber.fromNat gstats.closed)),
-        ("callsStuck",     Json.num (Lean.JsonNumber.fromNat gstats.stuck)),
-        ("callsError",     Json.num (Lean.JsonNumber.fromNat gstats.errored)),
-        ("callsSkipped",   Json.num (Lean.JsonNumber.fromNat gstats.skipped)),
-        ("rootModules",    Json.arr (cli.modules.map (fun n => Json.str n.toString))),
+      let path ← writeAltMode outDir "grind-in-proof" "grind-in-proof" cli.modules recs [
+        ("callsClosed",    jnat (gstats.outcome Outcome.closed)),
+        ("callsStuck",     jnat (gstats.outcome Outcome.stuck)),
+        ("callsError",     jnat (gstats.outcomesOther Corpus.grindOutcomeLabels)),
+        ("callsSkipped",   jnat (gstats.outcome Outcome.deadlineSkipped)),
         ("availableHints", Json.arr (available.map Json.str))
       ]
-      IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
-      IO.println s!"corpus-extract: wrote {recs.size} in-proof grind records to {grindDir}/train.jsonl \
+      IO.println s!"corpus-extract: wrote {recs.size} in-proof grind records to {path} \
         ({available.size} available hints)"
       return 0
     -- `--proof-states`: capture the interior of every tactic proof (one record per
@@ -769,37 +706,29 @@ unsafe def runCli (args : List String) : IO UInt32 := do
       let jobs := resolveJobs cli.jobs (isolate := false)
       IO.println s!"corpus-extract: discovered {files.size} source file(s); \
         collecting proof states (jobs={jobs})…"
-      let (recs, pstats) ← Corpus.extractProofStatesViaFrontend projectRoot files
+      let (recs, pstats, pextra) ← Corpus.extractProofStatesViaFrontend files
         cli.includePrivate jobs
       IO.println s!"corpus-extract: {pstats.filesOk} ok, {pstats.filesEmpty} empty, \
         {pstats.filesError} error (of {pstats.filesTotal}); \
-        theorems: {pstats.theoremsOk} captured, \
-        {pstats.theoremsSkippedTerm} term-proved (no tactics), \
-        {pstats.theoremsSkippedLarge} too large, \
-        {pstats.theoremsDeadline} past deadline, {pstats.theoremsError} error; \
-        {pstats.totalSteps} step(s) total"
+        theorems: {pstats.outcome Outcome.ok} captured, \
+        {pextra.theoremsTermProved} term-proved (no tactics), \
+        {pstats.outcome Outcome.skippedLarge} too large, \
+        {pstats.outcome Outcome.deadlineSkipped} past deadline, \
+        {pstats.outcomesOther Corpus.proofStateOutcomeLabels} error; \
+        {pextra.totalSteps} step(s) total"
       if pstats.filesError > 0 then
         throw <| IO.userError s!"proof-state extraction failed for {pstats.filesError} file(s)"
-      let psDir : System.FilePath := outDir / "data" / "proof-states"
-      IO.FS.createDirAll psDir
-      writeJsonl (psDir / "train.jsonl") recs
-      let metaJson := Json.mkObj [
-        ("toolVersion",          Json.str toolVersion),
-        ("mode",                 Json.str "proof-states"),
-        ("totalRecords",         Json.num (Lean.JsonNumber.fromNat recs.size)),
-        ("totalSteps",           Json.num (Lean.JsonNumber.fromNat pstats.totalSteps)),
-        ("theoremsCaptured",     Json.num (Lean.JsonNumber.fromNat pstats.theoremsOk)),
-        ("theoremsTermProved",   Json.num (Lean.JsonNumber.fromNat pstats.theoremsSkippedTerm)),
-        ("theoremsSkippedLarge", Json.num (Lean.JsonNumber.fromNat pstats.theoremsSkippedLarge)),
-        ("theoremsDeadline",     Json.num (Lean.JsonNumber.fromNat pstats.theoremsDeadline)),
-        ("theoremsError",        Json.num (Lean.JsonNumber.fromNat pstats.theoremsError)),
-        ("stepCeiling",          Json.num (Lean.JsonNumber.fromNat Corpus.ProofStates.stepCeiling)),
-        ("includePrivate",       Json.bool cli.includePrivate),
-        ("rootModules",          Json.arr (cli.modules.map (fun n => Json.str n.toString)))
+      let path ← writeAltMode outDir "proof-states" "proof-states" cli.modules recs [
+        ("totalSteps",           jnat pextra.totalSteps),
+        ("theoremsCaptured",     jnat (pstats.outcome Outcome.ok)),
+        ("theoremsTermProved",   jnat pextra.theoremsTermProved),
+        ("theoremsSkippedLarge", jnat (pstats.outcome Outcome.skippedLarge)),
+        ("theoremsDeadline",     jnat (pstats.outcome Outcome.deadlineSkipped)),
+        ("theoremsError",        jnat (pstats.outcomesOther Corpus.proofStateOutcomeLabels)),
+        ("stepCeiling",          jnat Corpus.ProofStates.stepCeiling),
+        ("includePrivate",       Json.bool cli.includePrivate)
       ]
-      IO.FS.writeFile (outDir / "metadata.json") ((metaJson.render.pretty) ++ "\n")
-      IO.println s!"corpus-extract: wrote {recs.size} proof-state record(s) to \
-        {psDir}/train.jsonl"
+      IO.println s!"corpus-extract: wrote {recs.size} proof-state record(s) to {path}"
       return 0
     -- Ensure output + data subdirs exist.
     IO.FS.createDirAll outDir
@@ -811,60 +740,32 @@ unsafe def runCli (args : List String) : IO UInt32 := do
     let tagConfig ← match cli.config with
       | none      => pure TagConfig.empty
       | some path => Corpus.loadConfig path
-    -- Obtain the records either via the worker/plugin path (default, orphan-safe)
-    -- or the legacy import-and-walk path. Both produce `Array ConstRecord` +
-    -- per-kind counts; everything downstream (split/write/metadata/card) is shared.
-    -- Clean staging only after all final outputs are written.
+    -- Drive the frontend over the discovered source files. Clean staging only
+    -- after all final outputs are written.
     let cleanupShardsRef ← IO.mkRef false
-    let records : Array ConstRecord ← match cli.enumerate with
-      | .glob => do
-          let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
-          let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
-          let jobs := resolveJobs cli.jobs cli.isolateFiles
-          let mode := if cli.isolateFiles then "isolated" else "in-process"
-          IO.println s!"corpus-extract: discovered {files.size} source file(s); driving frontend ({mode}, jobs={jobs})…"
-          let (recs, wstats) ←
-            if cli.isolateFiles then
-              Corpus.extractViaFrontendIsolated projectRoot files tagConfig
-                cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers cli.config
-                cli.reverseSkip jobs cli.reverseTimeoutMs outDir cli.resume
-            else
-              Corpus.extractViaFrontend projectRoot files tagConfig
-                cli.includeInternal cli.includePrivate cli.reverseElab cli.reverseClosers
-                cli.reverseSkip jobs
-          IO.println s!"corpus-extract: {wstats.filesOk} ok, {wstats.filesEmpty} empty, \
-            {wstats.filesError} error (of {wstats.filesTotal})"
-          if wstats.filesError > 0 then
-            let resumeHint := if cli.isolateFiles then "; staged shards were retained for --resume" else ""
-            throw <| IO.userError s!"extraction failed for {wstats.filesError} file(s){resumeHint}"
-          if cli.isolateFiles then
-            cleanupShardsRef.set true
-          pure recs
-      | .import => do
-          -- Bring up Lean's search path and import the requested modules.
-          Lean.enableInitializersExecution
-          Lean.initSearchPath (← Lean.findSysroot)
-          let imports : Array Import := cli.modules.map (fun n => { module := n })
-          -- `loadExts := true` is REQUIRED on Lean 4.31: it loads imported modules'
-          -- environment-extension state, which includes the tactic-elaborator
-          -- registration table. Without it, reverse-elaboration's `runTactic` fails
-          -- with "Tactic `rfl` has not been implemented".
-          let env ← Lean.importModules imports {} (trustLevel := 1024) (loadExts := true)
-          let opts : ExtractOptions := {
-            rootModules     := cli.modules
-            tagConfig       := tagConfig
-            includeInternal := cli.includeInternal
-            includePrivate  := cli.includePrivate
-            sourceRoot      := cli.sourceRoot.getD "."
-            reverseElab     := cli.reverseElab
-            reverseClosers  := cli.reverseClosers
-          }
-          let (recs, _stats) ← Corpus.runMetaOnEnv env (Corpus.extractAllBuffered env opts)
-          pure recs
-    -- Derive `total`/`modules` from the records themselves rather than from a
-    -- per-path RunStats: the worker (`.glob`) path returns WorkerRunStats and the
-    -- legacy (`.import`) path's RunStats is discarded, so neither reaches here.
-    -- Computing from `records` keeps metadata.json correct and path-independent.
+    let records : Array ConstRecord ← do
+      let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
+      let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
+      let jobs := resolveJobs cli.jobs cli.isolateFiles
+      let mode := if cli.isolateFiles then "isolated" else "in-process"
+      IO.println s!"corpus-extract: discovered {files.size} source file(s); driving frontend ({mode}, jobs={jobs})…"
+      let (recs, wstats) ←
+        if cli.isolateFiles then
+          Corpus.extractViaFrontendIsolated projectRoot files cli.opts
+            cli.config jobs cli.reverseTimeoutMs outDir cli.resume
+        else
+          Corpus.extractViaFrontend files tagConfig cli.opts jobs
+      IO.println s!"corpus-extract: {wstats.filesOk} ok, {wstats.filesEmpty} empty, \
+        {wstats.filesError} error (of {wstats.filesTotal})"
+      if wstats.filesError > 0 then
+        let resumeHint := if cli.isolateFiles then "; staged shards were retained for --resume" else ""
+        throw <| IO.userError s!"extraction failed for {wstats.filesError} file(s){resumeHint}"
+      if cli.isolateFiles then
+        cleanupShardsRef.set true
+      pure recs
+    -- Derive `total`/`modules` from the records themselves: the driver returns a
+    -- WorkerRunStats (file counters), so `metadata.json`'s record-level counts are
+    -- computed here from `records`.
     let emittedModules :=
       (records.map (·.module)).toList.eraseDups.mergeSort (fun a b => a < b)
     let stats : Corpus.RunStats :=

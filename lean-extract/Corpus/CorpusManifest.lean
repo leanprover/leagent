@@ -12,6 +12,8 @@ import Corpus.ReverseElab
 import Corpus.Frontend
 import Corpus.SourceSyntax
 import Corpus.Verify
+import Corpus.ChildProcess
+import Corpus.Options
 
 /-!
 The corpus collector: for each user declaration in an elaborated file, computes
@@ -20,20 +22,15 @@ pretty-printed type and (for defs/theorems) value, direct dependencies,
 transitive axioms/premises, source signature/body, and (optionally) a verified
 reverse-elaborated `proofScript`.
 
-This is the in-process form of what was the `$/lean/corpusManifest` FileWorker
-request. The per-constant computation (the `CoreM` fold below) is UNCHANGED from
-the plugin — it runs in the file's TRUE post-elaboration environment either way.
-What changed is how that environment is obtained: instead of a worker answering
-an LSP request against `doc.cmdSnaps`, `Corpus.Frontend.runCollectorOn` runs this
-fold directly against the frontend-elaborated environment (see
-`corpusManifestCore`, the entry point the driver calls). The `source` string and
-per-command `Syntax` array the source reconstruction needs
-(`buildSourceMap`/`buildSimpArgMap`) come straight from `Frontend.ElabResult`.
+`corpusManifestCore` is the entry point the driver calls: it runs the `CoreM` fold
+below against a frontend-elaborated environment via `Corpus.Frontend.runCollectorOn`
+(so the fold sees the file's TRUE post-elaboration environment). The `source` string
+and per-command `Syntax` array the source reconstruction needs
+(`buildSourceMap`/`buildSimpArgMap`) come from `Frontend.ElabResult`.
 
-Terminology in the comments below still refers to "the worker" for the pathology
-it guards against (a pathological proof pinning a compute thread); that hazard is
-the same in-process, only now it pins one of the parallel file threads rather than
-a subprocess.
+A pathological proof term can pin the compute thread it runs on; the size and
+wall-clock guards below bound that (see `reverseNodeCeiling` and the
+cheap-first/deadline scheduling in `foldCorpusEntries`).
 -/
 
 namespace Corpus
@@ -110,9 +107,8 @@ structure CorpusManifestEntry where
   e.g. `by intro h; exact …`. Populated only for theorems; `none` otherwise.
   Every emitted script is VERIFIED to re-elaborate to a defeq proof with the
   `errToSorry := false` + `Expr.hasSorry` guards (so `sorry`/partial scripts are
-  rejected, not stored). Running inside the worker means re-elaboration happens
-  in the file's TRUE context with registered tactics — the import-based extractor
-  could not reproduce that. -/
+  rejected, not stored). Re-elaboration happens in the file's TRUE context with
+  registered tactics. -/
   proofScript : Option String
   /-- Which reverse-elaboration rung produced `proofScript`: `structural`,
   `rfl`, `exact`, `intro_rfl`, `intro_exact` (genuine decompositions);
@@ -141,7 +137,6 @@ structure CorpusManifestEntry where
   endLine     : Option Nat
   /-- 0-based end column. -/
   endCol      : Option Nat
-  deriving FromJson, ToJson
 
 open Lean.PrettyPrinter
 
@@ -152,12 +147,12 @@ private def ppExpr120 (e : Expr) : CoreM String := do
 
 /-- Proof-term size ceiling (distinct sub-expressions, `ReverseElab.distinctNodes`)
 above which reverse-elaboration is SKIPPED outright, emitting `proofMethod :=
-"skipped_large"`. This is the primary guard against pathological proofs pinning
-the worker.
+"skipped_large"`. This is the primary guard against a pathological proof pinning
+the compute thread it runs on.
 
-Why a size pre-filter rather than a time/heartbeat budget: on the worker path
-proof terms are freshly elaborated (vs the import path's compacted oleans), and
-re-elaborating + `isDefEq`-checking a candidate against a huge term can run for
+Why a size pre-filter rather than a time/heartbeat budget: proof terms are freshly
+elaborated, and re-elaborating + `isDefEq`-checking a candidate against a huge term
+can run for
 *minutes* of wall time. Neither bound the latency reliably — heartbeats track
 work not wall time (a giant `isDefEq` accrues few), and cooperative cancellation
 (`IO.CancelToken`) does not preempt a single in-flight `isDefEq`/tactic call
@@ -432,22 +427,24 @@ because a single `isDefEq` on an automation-heavy term can otherwise pin the
 collector in wall time despite heartbeat limits. -/
 def reverseInProcessNodeCeiling : Nat := 250
 
-private partial def waitChildWithTimeout {cfg : IO.Process.StdioConfig}
-    (child : IO.Process.Child cfg) (started timeoutMs : Nat) : IO (Option UInt32) := do
-  match (← child.tryWait) with
-  | some code => return some code
-  | none =>
-      if (← IO.monoMsNow) - started ≥ timeoutMs then
-        try child.kill catch _ => pure ()
-        let _ ← child.wait
-        return none
-      IO.sleep (100 : UInt32)
-      waitChildWithTimeout child started timeoutMs
-
 private def parseScriptResult (stdout : String) : Option ReverseElab.ScriptResult :=
   match Json.parse stdout.trimAscii.toString >>= fromJson? with
   | .ok r => some r
   | .error _ => none
+
+/-- The complete request for one reverse-elaboration child: which theorem, in which
+file, and whether to try closers. Serialized as ONE JSON argument, so parent and
+child share a single encoding (see `Corpus.ExtractOneRequest` for the same pattern on
+the file-extraction child). -/
+structure ReverseOneRequest where
+  sourceFile : System.FilePath
+  module     : Name
+  decl       : Name
+  closers    : Bool := false
+  deriving Inhabited, ToJson, FromJson
+
+/-- The flag that carries a `ReverseOneRequest` to the child. -/
+def reverseOneFlag : String := "--internal-reverse-one"
 
 /-- Internal child-process entry point: elaborate one file, reverse-elaborate one
 theorem in-process, print the `ScriptResult` as JSON in `Main.lean`. -/
@@ -486,12 +483,10 @@ def reverseProofInChild (file : Frontend.ElabResult) (declName : Name)
     (enableClosers : Bool) (timeoutMs : Nat := reverseProofTimeoutMs)
     : CoreM ReverseElab.ScriptResult := do
   let exe ← IO.appPath
-  let args :=
-    #["--internal-reverse-one",
-      "--source-file", file.file.absPath.toString,
-      "--module", file.file.module.toString,
-      "--decl", declName.toString] ++
-    (if enableClosers then #["--closers"] else #[])
+  let request : ReverseOneRequest := {
+    sourceFile := file.file.absPath, module := file.file.module
+    decl := declName, closers := enableClosers }
+  let args := #[reverseOneFlag, (toJson request).compress]
   let child ← IO.Process.spawn {
     cmd := exe.toString
     args := args
@@ -503,7 +498,7 @@ def reverseProofInChild (file : Frontend.ElabResult) (declName : Name)
   let stdoutTask ← IO.asTask child.stdout.readToEnd Task.Priority.dedicated
   let stderrTask ← IO.asTask child.stderr.readToEnd Task.Priority.dedicated
   let started ← IO.monoMsNow
-  match (← waitChildWithTimeout child started timeoutMs) with
+  match (← ChildProcess.waitWithDeadline child started timeoutMs) with
   | none =>
       let _ ← IO.wait stdoutTask
       let _ ← IO.wait stderrTask
@@ -541,11 +536,23 @@ private def shouldSkipReverse (reverseSkip : Array String) (info : ConstantInfo)
   let displayName := (CollectCommon.displayName info.name).toString
   reverseSkip.any fun skip => skip == rawName || skip == displayName
 
-private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
-    (declSrcMap : Std.HashMap (Nat × Nat) String)
-    (scopeMap : Std.HashMap (Nat × Nat) DeclScope)
-    (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
-    (reverseElab closers : Bool) (reverseSkip : Array String) (info : ConstantInfo)
+/-- The per-file source maps every entry is built against, keyed by the declaration's
+selection position. Derived once per file from `Frontend.ElabResult` (see
+`SourceMaps.of`) and read for every constant, so they travel as one value rather than
+four positional arguments. -/
+structure SourceMaps where
+  /-- Position → (signature, body) source slices. -/
+  sig        : Std.HashMap (Nat × Nat) (Option String × Option String) := {}
+  /-- Position → the full declaration command's source. -/
+  declSource : Std.HashMap (Nat × Nat) String := {}
+  /-- Position → the enclosing namespace + live scope commands. -/
+  scope      : Std.HashMap (Nat × Nat) DeclScope := {}
+  /-- Position → `simp [..]` argument lists harvested from that proof, for
+  `--closers`. Empty unless closers are enabled (building it walks every proof). -/
+  simpArgs   : Std.HashMap (Nat × Nat) (Array String) := {}
+
+private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
+    (info : ConstantInfo)
     (attemptReverse : Bool := true) (reverseFile? : Option Frontend.ElabResult := none)
     : CoreM CorpusManifestEntry := do
   let env ← getEnv
@@ -556,8 +563,8 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
   let axs ← Lean.collectAxioms info.name
   let allAxStrs := (axs.map toString).qsort (· < ·)
   let hasSorry := allAxStrs.contains (toString ``sorryAx)
-  -- Only theorems report their axioms in the corpus schema (matching the
-  -- import-based extractor); `hasSorry` is still derived from the full set.
+  -- Only theorems report their axioms in the corpus schema; `hasSorry` is still
+  -- derived from the full set.
   let axStrs := match info with
     | .thmInfo _ => allAxStrs
     | _          => #[]
@@ -568,20 +575,19 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
     | none     => env.mainModule.toString
   -- Declaration ranges, fetched once. `selectionRange` (the name token) keys the
   -- sig/body map; `range` (the whole decl, doc-comment-inclusive) gives the
-  -- start/end line-cols, matching the import-based extractor (Extract.lean uses
-  -- `range`, not `selectionRange`, for start*/end*).
+  -- start/end line-cols.
   let ranges? ← Lean.findDeclarationRanges? info.name
   let (signature, body) :=
     match ranges? with
-    | some r => srcMap.getD (r.selectionRange.pos.line, r.selectionRange.pos.column) (none, none)
+    | some r => maps.sig.getD (r.selectionRange.pos.line, r.selectionRange.pos.column) (none, none)
     | none   => (none, none)
   let declSource :=
     match ranges? with
-    | some r => declSrcMap[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
+    | some r => maps.declSource[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
     | none   => none
   let declScope :=
     match ranges? with
-    | some r => scopeMap[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
+    | some r => maps.scope[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
     | none   => none
   let (startLine, startCol, endLine, endCol) :=
     match ranges? with
@@ -595,7 +601,7 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
     | _             => false
   -- Transitive premise cone (project-owned constants). Only meaningful for
   -- declarations carrying a term — theorems and defs; axioms/opaques/inductives/
-  -- ctors/recs/quots get an empty list (matching the import-based extractor).
+  -- ctors/recs/quots get an empty list.
   let premises := match info with
     | .thmInfo _ | .defnInfo _ =>
         let root := CollectCommon.projectRoot env
@@ -611,8 +617,8 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
   -- candidates (keyed, like sig/body, by the decl's selection position).
   let (proofScript, proofMethod) ← match info with
     | .thmInfo _ =>
-        if reverseElab then
-          if shouldSkipReverse reverseSkip info then
+        if opts.reverseElab then
+          if shouldSkipReverse opts.reverseSkip info then
             pure (none, some "skipped_requested")
           else
           -- Once the fold's wall-clock deadline has passed, `attemptReverse` is
@@ -623,14 +629,15 @@ private def buildEntry (srcMap : Std.HashMap (Nat × Nat) (Option String × Opti
             pure (none, some "deadline_skipped")
           else match info.value? (allowOpaque := true) with
           | some v =>
-              let extraClosers := if closers then
+              let extraClosers := if opts.reverseClosers then
                   match ranges? with
-                  | some r => simpArgMap.getD (r.selectionRange.pos.line, r.selectionRange.pos.column) #[]
+                  | some r => maps.simpArgs.getD (r.selectionRange.pos.line, r.selectionRange.pos.column) #[]
                   | none   => #[]
                 else #[]
               let r ← match reverseFile? with
-                | some file => reverseProofHybrid file info.name info.type v closers extraClosers
-                | none      => reverseProofGuarded info.type v closers extraClosers
+                | some file =>
+                    reverseProofHybrid file info.name info.type v opts.reverseClosers extraClosers
+                | none => reverseProofGuarded info.type v opts.reverseClosers extraClosers
               pure (if r.script.isEmpty then none else some r.script, some r.method)
           | none => pure (none, none)
         else pure (none, none)
@@ -686,10 +693,8 @@ private def theoremProgressStep (total : Nat) : Nat :=
   else 25
 
 /-- Fold `buildEntry` over the module-local user constants that also pass the
-corpus-eligibility filter (`corpusEligible`), so the manifest matches the
-import-based extractor's record set. Unlike `Common.foldUserConstants`, this
-applies the extra parity filter and threads the params' `includeInternal` /
-`includePrivate` knobs.
+corpus-eligibility filter (`corpusEligible`), threading the params'
+`includeInternal` / `includePrivate` knobs.
 
 When `reverseElab` and `deadlineMs > 0`, entries are processed CHEAP-FIRST (by
 `reverseCost`) under a wall-clock budget: once `deadlineMs` ms have elapsed, the
@@ -700,12 +705,8 @@ the loss of only the expensive tail, while the many cheap proofs land their
 scripts. The output is re-sorted by name, so ordering is unchanged; only WHICH
 theorems get a script depends on the schedule. `deadlineMs = 0` disables all of
 this (process in name order, always attempt — the historical behavior). -/
-private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String × Option String))
-    (declSrcMap : Std.HashMap (Nat × Nat) String)
-    (scopeMap : Std.HashMap (Nat × Nat) DeclScope)
-    (simpArgMap : Std.HashMap (Nat × Nat) (Array String))
-    (includeInternal includePrivate reverseElab closers : Bool)
-    (reverseSkip : Array String := #[]) (deadlineMs : Nat := 0)
+private def foldCorpusEntries (maps : SourceMaps) (opts : CollectOptions)
+    (deadlineMs : Nat := 0)
     (fileLabel : String := "") (reverseFile? : Option Frontend.ElabResult := none)
     : CoreM (Array CorpusManifestEntry) := do
   let env ← getEnv
@@ -723,7 +724,7 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
   -- flagged `has_sorry`); only its `proof_script` would be forgone.
   let mut eligible : Array Verify.VerifiedConst := #[]
   for vc in (← Verify.verifiedFileConstants) do
-    if (← corpusEligible env includeInternal includePrivate vc.info.name vc.info) then
+    if (← corpusEligible env opts.includeInternal opts.includePrivate vc.info.name vc.info) then
       eligible := eligible.push vc
   let theoremTotal := eligible.foldl (fun n vc => if isTheoremInfo vc.info then n + 1 else n) 0
   let logPrefix :=
@@ -731,11 +732,11 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
     else s!"corpus-extract: theorem extraction {fileLabel}"
   if theoremTotal > 0 then
     IO.eprintln s!"{logPrefix}: 0/{theoremTotal} theorem(s) starting \
-      ({eligible.size} total record(s), reverse-elab={reverseElab})"
+      ({eligible.size} total record(s), reverse-elab={opts.reverseElab})"
   -- Cheap-first scheduling only matters when we actually reverse-elaborate under a
   -- deadline; otherwise keep the original (name) order to minimize behavior change.
   let scheduled :=
-    if reverseElab && deadlineMs > 0 then
+    if opts.reverseElab && deadlineMs > 0 then
       eligible.qsort (fun a b => reverseCost a.info < reverseCost b.info)
     else eligible
   let startMs ← IO.monoMsNow
@@ -745,7 +746,7 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
   for vc in scheduled do
     -- Past the budget, keep emitting records but stop attempting reverse-elab.
     let attemptReverse := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
-    let entry ← buildEntry srcMap declSrcMap scopeMap simpArgMap reverseElab closers reverseSkip vc.info attemptReverse reverseFile?
+    let entry ← buildEntry maps opts vc.info attemptReverse reverseFile?
     out := out.push entry
     if isTheoremInfo vc.info then
       theoremDone := theoremDone + 1
@@ -755,27 +756,30 @@ private def foldCorpusEntries (srcMap : Std.HashMap (Nat × Nat) (Option String 
           last={entry.name} proof_method={method}"
   return out.qsort (fun a b => a.name < b.name)
 
-/-- The in-process corpus-collector entry point: build the corpus manifest entries
-for one frontend-elaborated file. Replaces the `$/lean/corpusManifest` request
-handler — same `CoreM` fold, run via `Frontend.runCollectorOn` against `r`'s
-post-elaboration environment (with the file's real `FileMap`, so source positions
-line up). `source`/`commands` for the sig/body reconstruction come from `r`.
+/-- Derive the per-file source maps from an elaborated file.
+
+The simp-arg map is built ONLY when closers are enabled: constructing it walks every
+proof's syntax, and nothing reads it otherwise. -/
+def SourceMaps.of (r : Frontend.ElabResult) (closers : Bool) : CoreM SourceMaps := do
+  return {
+    sig        := buildSourceMap r.source r.commands
+    declSource := buildDeclSourceMap r.source r.commands
+    scope      := buildScopeMap r.source r.commands
+    simpArgs   := ← if closers then buildSimpArgMap r.source r.commands else pure {} }
+
+/-- The corpus-collector entry point: build the corpus manifest entries for one
+frontend-elaborated file. The `CoreM` fold runs via `Frontend.runCollectorOn` against
+`r`'s post-elaboration environment (with the file's real `FileMap`, so source
+positions line up); `source`/`commands` for the sig/body reconstruction come from `r`.
 
 `reverseDeadlineMs` gives the fold an internal wall-clock budget (cheap-first,
 tail-shed to `deadline_skipped`); the driver sets it below its own per-file bound.
 See `foldCorpusEntries` for the scheduling contract. -/
-def corpusManifestCore (r : Frontend.ElabResult)
-    (includeInternal includePrivate reverseElab closers : Bool)
-    (reverseDeadlineMs : Nat := 0) (reverseSkip : Array String := #[])
+def corpusManifestCore (r : Frontend.ElabResult) (opts : CollectOptions)
+    (reverseDeadlineMs : Nat := 0)
     : IO (Array CorpusManifestEntry) :=
   Frontend.runCollectorOn r do
-    let srcMap := buildSourceMap r.source r.commands
-    let declSrcMap := buildDeclSourceMap r.source r.commands
-    let scopeMap := buildScopeMap r.source r.commands
-    -- Only build the simp-arg map when closers are on (it walks every proof's
-    -- syntax); otherwise it is unused.
-    let simpArgMap ← if closers then buildSimpArgMap r.source r.commands else pure {}
-    foldCorpusEntries srcMap declSrcMap scopeMap simpArgMap
-      includeInternal includePrivate reverseElab closers reverseSkip reverseDeadlineMs r.file.relPath (some r)
+    let maps ← SourceMaps.of r opts.reverseClosers
+    foldCorpusEntries maps opts reverseDeadlineMs r.file.relPath (some r)
 
 end Corpus

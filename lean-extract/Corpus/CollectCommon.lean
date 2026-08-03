@@ -130,8 +130,8 @@ def moduleOf? (env : Environment) (n : Name) : Option Name :=
 /-- True iff `modName` sits under one of the `--modules` root prefixes.
 
 This is the ROOT-PREFIX notion of ownership, used wherever the `--modules` roots
-are the authority: the legacy import walk (`Corpus.Extract`) and single-declaration
-closure computation (`Corpus.DeclClosure`). It differs from `isOwnedName`, which
+are the authority: single-declaration closure computation (`Corpus.DeclClosure`).
+It differs from `isOwnedName`, which
 keys on the elaborating file's own project root (`projectRoot`) and is what the
 per-file collector uses for the `premises` field. The two agree for a single-root
 project and diverge for a multi-root run; `--decl` records both in its
@@ -196,5 +196,20 @@ def collectStatementPremises (env : Environment) (owned : Name → Bool)
   match env.find? root with
   | none        => #[]
   | some rootCi => collectPremisesFrom env owned root rootCi.type.getUsedConstantsAsSet.toArray
+
+/-- Build a `MetaM` runner over an environment and execute `act`. Only the
+environment matters; all other contexts are default.
+
+`maxHeartbeats := 0` disables the global deterministic-timeout budget: a batch
+walk over an entire environment would otherwise trip the default 200k cumulative
+ceiling partway through a large project. Per-proof verification cost is bounded
+locally instead (see `ReverseElab.tryElab`), so removing the global ceiling does
+not let any single proof hang. -/
+def runMetaOnEnv {α} (env : Environment) (act : MetaM α) : IO α := do
+  let coreCtx : Core.Context :=
+    { fileName := "<corpus-extract>", fileMap := default, maxHeartbeats := 0 }
+  let coreSt  : Core.State   := { env := env }
+  let (a, _, _) ← act.toIO coreCtx coreSt
+  return a
 
 end Corpus.CollectCommon

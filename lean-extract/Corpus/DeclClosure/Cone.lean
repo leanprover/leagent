@@ -5,7 +5,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 import Lean
 import Corpus.Discover
 import Corpus.CollectCommon
-import Corpus.Extract
+import Corpus.Options
 
 /-!
 Phase 1 of single-declaration extraction: resolve a target and compute its
@@ -36,9 +36,6 @@ diverge for multi-root runs, which is why `metadata.json` records both.
 -/
 
 namespace Corpus.DeclClosure
-
-open Lean
-
 
 open Lean
 
@@ -172,7 +169,7 @@ Deliberately mirrors `CorpusManifest.corpusEligible` + `CollectCommon.alwaysSkip
 but reports WHICH rule applies instead of a bare bool. Order matters: the most
 specific structural reason wins, so a generated `match_1` is reported as
 `internal` rather than the vaguer `generated`. -/
-def dropReasonFor (env : Environment) (includeInternal includePrivate : Bool)
+def dropReasonFor (env : Environment) (opts : CollectOptions)
     (name : Name) : Option DropReason :=
   match env.find? name with
   | none => some unexplainedDrop
@@ -183,8 +180,8 @@ def dropReasonFor (env : Environment) (includeInternal includePrivate : Bool)
     else if env.isProjectionFn name then some "projections"
     else if CollectCommon.hasGeneratedTag name
          || CollectCommon.isGeneratedTheoremSuffix name then some "generated_companions"
-    else if !includePrivate && Lean.isPrivateName name then some "private_excluded"
-    else if !includeInternal then
+    else if !opts.includePrivate && Lean.isPrivateName name then some "private_excluded"
+    else if !opts.includeInternal then
       -- The internal-detail rule, with private user decls exempted exactly as
       -- `corpusEligible` exempts them.
       let genuinePrivate :=
@@ -205,7 +202,7 @@ private def isRangeless (name : Name) : CoreM Bool := do
 private-name map, and why each ineligible member will be dropped. Runs against
 the import-only environment. -/
 def computeClosure (env : Environment) (roots : Array Name) (target : Target)
-    (includeInternal includePrivate : Bool) : IO Closure := do
+    (opts : CollectOptions) : IO Closure := do
   let owned := CollectCommon.isOwnedByRoots env roots
   let proofCone := CollectCommon.collectPremises env owned target.resolved
   let stmtCone := CollectCommon.collectStatementPremises env owned target.resolved
@@ -246,7 +243,7 @@ def computeClosure (env : Environment) (roots : Array Name) (target : Target)
     roles := roles.insert display (if stmtSet.contains raw then .statement else .proof)
     -- Record up front why an ineligible member can never produce a record, so the
     -- projection can summarize rather than dump a raw name list.
-    if let some reason := dropReasonFor env includeInternal includePrivate raw then
+    if let some reason := dropReasonFor env opts raw then
       dropReasons := dropReasons.insert display reason
     if Lean.isPrivateName raw then
       let modStr := (CollectCommon.moduleOf? env raw).map Lean.Name.toString |>.getD ""
@@ -257,7 +254,7 @@ def computeClosure (env : Environment) (roots : Array Name) (target : Target)
         modules := modules.push m
   -- Range-less synthetic theorems need `CoreM`; fold them in as a second pass over
   -- only the members not already explained by a pure rule.
-  let synthetic ← runMetaOnEnv env do
+  let synthetic ← CollectCommon.runMetaOnEnv env do
     let mut out : Array String := #[]
     for (display, raw) in rawByDisplay.toList do
       unless display == targetDisplay || dropReasons.contains display do

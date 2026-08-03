@@ -237,8 +237,6 @@ Tier-3 we deliberately don't attempt).
   is the intended home: the worker is a real frontend, so the tactics the
   candidates use (`cases`, `rfl`, `simp`, …) are registered and re-elaboration
   happens in the file's true context.
-- the legacy import-based extractor in `lean-extract` (`Corpus/Extract.lean`),
-  via the same entry point.
 
 Both share **one copy** of this code precisely because the verify-and-fallback
 guards are soundness-critical and must never diverge between callers.

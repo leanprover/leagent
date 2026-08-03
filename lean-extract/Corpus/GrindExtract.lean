@@ -2,23 +2,22 @@ import Lean
 import Corpus.Records
 import Corpus.Discover
 import Corpus.Frontend
+import Corpus.FileDriver
 import Corpus.GrindManifest
 
 /-!
-Frontend-driven grind-manifest extraction: the in-process AlphaGrind data collector.
+Frontend-driven grind-manifest extraction: the AlphaGrind data collector.
 
-Parallel to `Corpus.WorkerExtract`, but runs the grind collector
-(`grindManifestCore`) instead of the corpus collector. For each source file it
-elaborates the file in-process (`Frontend.elaborateFile`) then asks the collector
-to RE-PROVE every theorem with `grind`'s default strategy and report what grind
-did. Each `GrindManifestEntry` becomes a `GrindGoalRecord` (adding the `file` path
-from discovery). The file-level `available` hint set is merged into a single
-env-wide set by the caller.
+Runs the grind collector (`grindManifestCore`) over each elaborated file, asking it
+to RE-PROVE every theorem with `grind`'s default strategy and report what grind did.
+Each `GrindManifestEntry` becomes a `GrindGoalRecord` (adding the `file` path from
+discovery); the per-file `available` hint sets are merged into one env-wide set.
 
-The per-goal `grindHeartbeats` backstop (in `Corpus.GrindManifest`) bounds each
-grind run cooperatively, and the per-file `grindDeadlineMs` sheds the expensive
-tail — together the in-process substitute for the killable worker. The
-`extractGrind*` names are kept for source compatibility with `Main.lean`.
+The per-goal `grindHeartbeats` backstop (in `Corpus.GrindManifest`) bounds each grind
+run cooperatively, and the per-file deadline sheds the expensive tail.
+
+The driving, per-file error containment, and file/outcome counting are shared with
+the other modes via `Corpus.FileDriver.driveFiles`.
 -/
 
 namespace Corpus
@@ -46,52 +45,38 @@ def grindEntryToRecord (e : GrindManifestEntry) (relFile : String)
     isPrivate       := e.isPrivate
     sourceUsesGrind := sourceUsesGrind }
 
-
-/-- Per-file grind timeout (ms). The per-file fold bounds itself with
-`grindDeadlineMs` set to 80% of this (cheap-first, tail-shed to
-`deadline_skipped`); the 20% headroom is unused wall-clock slack now that there is
-no request transport. -/
+/-- Per-file grind timeout (ms). The fold bounds itself with 80% of this
+(`FileDriver.deadlineFor`), cheap-first with the tail shed to `deadline_skipped`. -/
 def grindFileTimeoutMs : Nat := 600000
 
-/-- Drive every discovered file through the frontend (in parallel) and collect
-`GrindGoalRecord`s plus the merged env-wide `available` hint set. Per-file errors
-are logged to stderr and skipped (one bad file never aborts the run).
+/-- The outcome labels the grind run summary reports individually; anything else is
+counted as an error. Shared with the in-proof mode. -/
+def grindOutcomeLabels : List String :=
+  [Outcome.closed, Outcome.stuck, Outcome.deadlineSkipped]
+
+/-- Merge per-file hint sets into one sorted env-wide set. -/
+def mergeHints (perFile : Array (Array String)) : Array String := Id.run do
+  let mut merged : Std.HashSet String := {}
+  for hints in perFile do
+    for h in hints do
+      merged := merged.insert h
+  return (merged.toList.mergeSort (· < ·)).toArray
+
+/-- Drive every discovered file through the frontend and collect `GrindGoalRecord`s
+plus the merged env-wide `available` hint set. Per-file errors are logged and
+skipped (one bad file never aborts the run).
 
 `unsafe` because in-process elaboration runs imported modules' interpreted
 `initialize` code (see `Frontend.elaborateFile`). -/
-unsafe def extractGrindViaFrontend (projectRoot : System.FilePath)
-    (files : Array Discover.DiscoveredFile) (includePrivate : Bool)
-    : IO (Array GrindGoalRecord × Array String × GrindRunStats) := do
-  let _ := projectRoot  -- parity with the old signature; discovery already resolved paths
-  Frontend.initFrontend
-  let grindDeadlineMs := grindFileTimeoutMs * 4 / 5
-  let results ← Frontend.elaborateFiles files fun importLock df => do
-    let r ← Frontend.elaborateFile importLock df
-    let (avail, entries) ← grindManifestCore r includePrivate grindDeadlineMs
-    pure (df, avail, entries)
-  let mut recs      : Array GrindGoalRecord := #[]
-  let mut available : Std.HashSet String := {}
-  let mut stats     : GrindRunStats := { filesTotal := files.size }
-  for res in results do
-    match res with
-    | .ok (df, avail, entries) =>
-      for a in avail do
-        available := available.insert a
-      if entries.isEmpty then
-        stats := { stats with filesEmpty := stats.filesEmpty + 1 }
-      else
-        stats := { stats with filesOk := stats.filesOk + 1 }
-      for e in entries do
-        recs := recs.push (grindEntryToRecord e df.relPath)
-        stats := match e.outcome with
-          | "closed"           => { stats with closed  := stats.closed + 1 }
-          | "stuck"            => { stats with stuck   := stats.stuck + 1 }
-          | "deadline_skipped" => { stats with skipped := stats.skipped + 1 }
-          | _                  => { stats with errored := stats.errored + 1 }
-    | .error msg =>
-      stats := { stats with filesError := stats.filesError + 1 }
-      IO.eprintln s!"corpus-extract: {msg}"
-  let availArr := (available.toList.mergeSort (· < ·)).toArray
-  return (recs, availArr, stats)
+unsafe def extractGrindViaFrontend (files : Array Discover.DiscoveredFile)
+    (includePrivate : Bool)
+    : IO (Array GrindGoalRecord × Array String × FileDriver.FileStats) := do
+  let deadlineMs := FileDriver.deadlineFor grindFileTimeoutMs
+  let (results, stats) ← FileDriver.driveFiles files
+    (collect := fun r => grindManifestCore r includePrivate deadlineMs)
+    (outcomeOf := (some ·.outcome))
+  let recs := results.flatMap fun fr =>
+    fr.entries.map fun e => grindEntryToRecord e fr.file.relPath
+  return (recs, mergeHints (results.map (·.extra)), stats)
 
 end Corpus

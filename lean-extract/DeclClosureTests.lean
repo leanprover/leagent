@@ -1,4 +1,5 @@
 import Corpus.DeclClosure
+import Corpus.TestAssert
 
 /-!
 Unit tests for single-declaration extraction (`--decl`).
@@ -20,10 +21,7 @@ namespace DeclClosureTests
 
 open Corpus Corpus.DeclClosure
 open Corpus.Artifact (safeName)
-
-private def assert (condition : Bool) (message : String) : IO Unit :=
-  unless condition do
-    throw <| IO.userError message
+open Corpus.TestAssert (assert)
 
 /-- A minimal record; tests override only the fields they exercise. -/
 private def rec (name : String) (kind : String := "theorem")

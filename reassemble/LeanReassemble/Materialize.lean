@@ -18,17 +18,6 @@ structure MaterializeConfig where
   producing the compilable reference state of the same records. See `ProofMode`. -/
   proofMode : ProofMode := .replace
 
-private def fail {α} (message : String) : IO α :=
-  throw <| IO.userError s!"lean-reassemble: {message}"
-
-private def normalizeRelativePath (path : String) : String :=
-  ((path.dropPrefix "./").copy.dropPrefix ".\\").copy
-
-private def isWithin (root path : System.FilePath) : Bool :=
-  let root := root.normalize.toString
-  let path := path.normalize.toString
-  path == root || path.startsWith (root ++ "/") || path.startsWith (root ++ "\\")
-
 private def artifactPath (path : System.FilePath) : String :=
   path.toString.replace "\\" "/"
 

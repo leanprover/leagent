@@ -6,6 +6,7 @@ Authors: Paul Govereau
 -/
 import Lean
 import Corpus.CollectCommon
+import Corpus.Options
 import Corpus.Frontend
 import Corpus.Verify
 
@@ -51,10 +52,9 @@ strategy `Action.mkFinish` directly. Per theorem:
    `mkGrindOnlyTactics`/`mkFinishTactic` (grind-only), read `Result.counters`
    (activated), and walk the proof term for used-origins.
 
-Running inside the worker means grind sees the file's TRUE context — the real
-imported `@[grind]` set, instances, `open`s — which the import path cannot
-reproduce. This is a SIBLING of `CorpusManifest` (shares `Common`), not an
-extension: it re-proves rather than reads existing proofs.
+Grind sees the file's TRUE post-elaboration context — the real imported `@[grind]`
+set, instances, `open`s. This is a SIBLING of `CorpusManifest`, not an extension:
+it re-proves rather than reads existing proofs.
 -/
 
 namespace Corpus
@@ -102,7 +102,6 @@ structure GrindManifestEntry where
   startLine   : Option Nat
   /-- `true` iff the theorem's name is `private`. -/
   isPrivate   : Bool
-  deriving FromJson, ToJson
 
 open Lean.Meta Lean.Meta.Grind
 
@@ -266,7 +265,7 @@ this. -/
 def runGrindCore (goalTypeStr : String) (goalMVar : MVarId)
     (params : Grind.Params) : MetaM GrindManifestEntry := do
   let base : GrindManifestEntry := {
-    name := "", module := "", goalType := goalTypeStr, outcome := "error",
+    name := "", module := "", goalType := goalTypeStr, outcome := Outcome.error,
     interactive := none, grindOnly := none, hasSorry := false,
     activated := #[], used := #[], coverageGap := 0, startLine := none,
     isPrivate := false }
@@ -288,7 +287,7 @@ def runGrindCore (goalTypeStr : String) (goalMVar : MVarId)
         let a ← mkFinishNoCheck
         match (← a.run goal) with
         | .stuck _ =>
-          out.set (some { base with outcome := "stuck" })
+          out.set (some { base with outcome := Outcome.stuck })
           throwError "grind-manifest: stuck (sentinel)"
         | .closed seq => do
           -- Interactive artifact. Rendering is wrapped so a parenthesizer
@@ -319,7 +318,7 @@ def runGrindCore (goalTypeStr : String) (goalMVar : MVarId)
             | some n => used := used.push n
             | none   => gap := gap + 1
           out.set (some { base with
-            outcome := "closed"
+            outcome := Outcome.closed
             interactive := if hasSorry then none else interactiveStr
             grindOnly := if hasSorry then none else grindOnlyStr
             hasSorry
@@ -334,7 +333,7 @@ def runGrindCore (goalTypeStr : String) (goalMVar : MVarId)
     -- aborts the fold.
     match (← out.get) with
     | some e => return e
-    | none   => return { base with outcome := "error" }
+    | none   => return { base with outcome := Outcome.error }
 
 /-- Run grind on one theorem `type` (whole-statement mode). Builds a fresh goal
 from the type and default-extension params, then delegates to `runGrindCore`. -/
@@ -347,7 +346,7 @@ private def runGrindOn (type : Expr) : MetaM GrindManifestEntry := do
   -- Bound this goal by the finite `grindHeartbeats` backstop; a runaway grind
   -- degrades to `stuck` rather than pinning the thread (the in-process substitute
   -- for the killable worker).
-  runGrindGuarded { goalType := goalTypeStr, outcome := "stuck",
+  runGrindGuarded { goalType := goalTypeStr, outcome := Outcome.stuck,
                     interactive := none, grindOnly := none, hasSorry := false,
                     name := "", module := "", activated := #[], used := #[],
                     coverageGap := 0, startLine := none, isPrivate := false }
@@ -356,8 +355,9 @@ private def runGrindOn (type : Expr) : MetaM GrindManifestEntry := do
 /-! ## The file-level fold -/
 
 /-- The available-hint set: fully-qualified names of every `@[grind]` E-matching
-theorem active in the environment (`.decl` origins). Env-level, computed once. -/
-private def availableHints (env : Environment) : Array String := Id.run do
+theorem active in the environment (`.decl` origins). Env-level, computed once.
+Shared with the in-proof collector. -/
+def availableHints (env : Environment) : Array String := Id.run do
   let st := grindExt.getState env
   let mut out : Array String := #[]
   for o in st.ematch.getOrigins do
@@ -396,7 +396,7 @@ private def foldGrindEntries (includePrivate : Bool) (deadlineMs : Nat)
       if !attempt then
         let e : GrindManifestEntry :=
           { name := name.toString, module := modStr, goalType := "",
-            outcome := "deadline_skipped", interactive := none, grindOnly := none,
+            outcome := Outcome.deadlineSkipped, interactive := none, grindOnly := none,
             hasSorry := false, activated := #[], used := #[], coverageGap := 0,
             startLine := startLine, isPrivate := isPriv }
         pure e
@@ -422,11 +422,5 @@ def grindManifestCore (r : Frontend.ElabResult) (includePrivate : Bool)
     let available := availableHints env
     let entries ← Meta.MetaM.run' (foldGrindEntries includePrivate grindDeadlineMs)
     return (available, entries)
-
-/-- Public wrapper over `runGrindOn` (whole-statement grind on one type). -/
-def runGrindOnPublic (type : Expr) : MetaM GrindManifestEntry := runGrindOn type
-
-/-- Public wrapper over `availableHints` for the env-wide hint set. -/
-def availableHintsPublic (env : Environment) : Array String := availableHints env
 
 end Corpus

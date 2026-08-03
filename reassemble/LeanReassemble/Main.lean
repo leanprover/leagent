@@ -1,4 +1,5 @@
 import LeanReassemble
+import Corpus.Reexec
 
 namespace LeanReassemble
 
@@ -100,31 +101,7 @@ private def parseArgs : List String → Except String Command
 
 private def reexecMarker := "LEAN_REASSEMBLE_REEXEC"
 
-private def absolutize (cwd : System.FilePath) (path : System.FilePath) : System.FilePath :=
-  if path.isAbsolute then path else cwd / path
-
-private unsafe def reexecUnderLake (sourceRoot : System.FilePath)
-    (rawArgs : List String) : IO UInt32 := do
-  let cwd ← IO.currentDir
-  let self ← IO.appPath
-  let root := absolutize cwd sourceRoot
-  let pathFlags := ["--source-root", "--records", "--output"]
-  let rec rebuild : List String → List String
-    | [] => []
-    | flag :: value :: rest =>
-        if pathFlags.contains flag then
-          flag :: (absolutize cwd value).toString :: rebuild rest
-        else
-          flag :: rebuild (value :: rest)
-    | [value] => [value]
-  let child ← IO.Process.spawn {
-    cmd := "lake"
-    args := #["env", self.toString] ++ (rebuild rawArgs).toArray
-    cwd := some root
-    env := #[(reexecMarker, some "1")]
-    setsid := false
-  }
-  child.wait
+private def reexecPathFlags := ["--source-root", "--records", "--output"]
 
 private unsafe def execute : Command → IO Unit
   | .rewriteFile config => rewriteFile config
@@ -144,10 +121,10 @@ unsafe def runCli (args : List String) : IO UInt32 := do
     if (← IO.getEnv reexecMarker).isNone then
       if command.requiresManifest then
         let cwd ← IO.currentDir
-        let root := absolutize cwd command.sourceRoot
+        let root := Corpus.Reexec.absolutize cwd command.sourceRoot
         if !(← (root / "lake-manifest.json").pathExists) then
           throw <| IO.userError s!"lean-reassemble: lake-manifest.json does not exist in {root}"
-      return (← reexecUnderLake command.sourceRoot args)
+      return (← Corpus.Reexec.reexecUnderLake reexecMarker reexecPathFlags command.sourceRoot args)
     execute command
     return 0
   catch error =>
