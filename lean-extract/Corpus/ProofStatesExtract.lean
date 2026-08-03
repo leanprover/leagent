@@ -6,26 +6,38 @@ import Lean
 import Corpus.Records
 import Corpus.Discover
 import Corpus.Frontend
+import Corpus.FileDriver
 import Corpus.ProofStates
 
 /-!
 Frontend-driven proof-state extraction: the per-file driver.
 
-Parallel to `Corpus.GrindInProofExtract`, but runs the proof-state collector
-(`ProofStates.proofStatesCore`) instead of a grind one. For each source file it
-elaborates the file in-process (`Frontend.elaborateFile`), then asks the collector
-to walk that file's `InfoTree`s and return one entry per tactic-proved theorem.
-Each `ProofStateEntry` becomes a `ProofStateRecord` by attaching the discovery
-relative path.
+Runs the proof-state collector (`ProofStates.proofStatesCore`) over each elaborated
+file, which walks that file's `InfoTree`s and returns one entry per tactic-proved
+theorem. Each `ProofStateEntry` becomes a `ProofStateRecord` by attaching the
+discovery relative path.
 
-See `Corpus.GrindExtract` for the shared per-file bounding rationale; here the
-per-file budget only sheds the goal-rendering tail (`deadline_skipped`), never a
-file's records.
+The driving, per-file error containment, and file/outcome counting are shared with
+the other modes via `Corpus.FileDriver.driveFiles`. Here the per-file budget only
+sheds the goal-rendering tail (`deadline_skipped`), never a file's records.
 -/
 
 namespace Corpus
 
 open Lean
+
+/-- The two counters specific to proof-state extraction: term-proved theorems (which
+have no tactics and so are counted rather than emitted) and total steps across every
+emitted record. Everything else this mode reports is in `FileDriver.FileStats`. -/
+structure ProofStateExtras where
+  theoremsTermProved : Nat := 0
+  totalSteps         : Nat := 0
+  deriving Inhabited
+
+/-- The outcome labels the proof-state run summary reports individually; anything
+else is counted as an error. -/
+def proofStateOutcomeLabels : List String :=
+  [Outcome.ok, Outcome.skippedLarge, Outcome.deadlineSkipped]
 
 /-- Map one collector entry to a wire record. `relFile` is the project-relative
 source path from discovery — the one thing the collector cannot know. -/
@@ -65,43 +77,24 @@ the other drivers keep).
 
 `unsafe` because in-process elaboration runs imported modules' interpreted
 `initialize` code (see `Frontend.elaborateFile`). -/
-unsafe def extractProofStatesViaFrontend (projectRoot : System.FilePath)
-    (files : Array Discover.DiscoveredFile) (includePrivate : Bool)
-    (jobs : Nat := Frontend.defaultMaxConcurrent)
-    : IO (Array ProofStateRecord × ProofStateRunStats) := do
-  let _ := projectRoot  -- discovery already resolved paths; kept for signature parity
-  Frontend.initFrontend
-  -- Leave headroom below the per-file bound so the tail sheds rather than dies.
-  let deadlineMs := proofStateFileTimeoutMs * 4 / 5
-  let results ← Frontend.elaborateFiles files (fun importLock df => do
-    let r ← Frontend.elaborateFile importLock df
-    let (entries, skippedTerm) ← ProofStates.proofStatesCore r includePrivate deadlineMs
-    pure (df, entries, skippedTerm)) (maxConcurrent := jobs)
-  let mut recs  : Array ProofStateRecord := #[]
-  let mut stats : ProofStateRunStats := { filesTotal := files.size }
-  for res in results do
-    match res with
-    | .ok (df, entries, skippedTerm) =>
-      if entries.isEmpty then
-        stats := { stats with filesEmpty := stats.filesEmpty + 1 }
-      else
-        stats := { stats with filesOk := stats.filesOk + 1 }
-      stats := { stats with
-        theoremsSkippedTerm := stats.theoremsSkippedTerm + skippedTerm }
-      for e in entries do
-        recs := recs.push (proofStateEntryToRecord e df.relPath)
-        stats := { stats with totalSteps := stats.totalSteps + e.stepCount }
-        stats := match e.outcome with
-          | "ok"               => { stats with theoremsOk := stats.theoremsOk + 1 }
-          | "skipped_large"    => { stats with
-              theoremsSkippedLarge := stats.theoremsSkippedLarge + 1 }
-          | "deadline_skipped" => { stats with
-              theoremsDeadline := stats.theoremsDeadline + 1 }
-          | _                  => { stats with
-              theoremsError := stats.theoremsError + 1 }
-    | .error msg =>
-      stats := { stats with filesError := stats.filesError + 1 }
-      IO.eprintln s!"corpus-extract: {msg}"
-  return (recs, stats)
+unsafe def extractProofStatesViaFrontend (files : Array Discover.DiscoveredFile)
+    (includePrivate : Bool) (jobs : Nat := Frontend.defaultMaxConcurrent)
+    : IO (Array ProofStateRecord × FileDriver.FileStats × ProofStateExtras) := do
+  let deadlineMs := FileDriver.deadlineFor proofStateFileTimeoutMs
+  let (results, stats) ← FileDriver.driveFiles files
+    (collect := fun r => do
+      let (entries, skippedTerm) ← ProofStates.proofStatesCore r includePrivate deadlineMs
+      pure (skippedTerm, entries))
+    (outcomeOf := (some ·.outcome))
+    (jobs := jobs)
+  let recs := results.flatMap fun fr =>
+    fr.entries.map fun e => proofStateEntryToRecord e fr.file.relPath
+  -- The two counters that are this mode's own: term-proved theorems (per file, and
+  -- deliberately not emitted as records) and total steps (per entry).
+  let extras : ProofStateExtras := {
+    theoremsTermProved := results.foldl (init := 0) fun acc fr => acc + fr.extra
+    totalSteps := results.foldl (init := 0) fun acc fr =>
+      fr.entries.foldl (init := acc) fun a e => a + e.stepCount }
+  return (recs, stats, extras)
 
 end Corpus

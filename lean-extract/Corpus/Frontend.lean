@@ -7,6 +7,7 @@ Authors: Paul Govereau
 import Lean
 import Std.Sync.Mutex
 import Corpus.Discover
+import Corpus.ChildProcess
 
 /-!
 In-process frontend driver: the substrate that REPLACES the `lean --worker`
@@ -96,8 +97,7 @@ its imports simply yields no records rather than aborting the run. Genuine
 exceptions propagate to the caller (`elaborateFiles*` catches them per file).
 
 `unsafe` because `enableInitializersExecution` is `unsafe` (it runs imported
-modules' interpreted `initialize`/`@[init]` code — the same reason the legacy
-import path's `runCli` is `unsafe`). -/
+modules' interpreted `initialize`/`@[init]` code). -/
 unsafe def elaborateFile (importLock : ImportLock) (df : Discover.DiscoveredFile)
     : IO ElabResult := do
   let source ← IO.FS.readFile df.absPath
@@ -230,19 +230,8 @@ unsafe def elaborateFiles {α} (files : Array Discover.DiscoveredFile)
     -- batch. Order is input order.
     files.mapM fun df => (f importLock df).toBaseIO
   else
-    -- Parallel path. Run bounded batches so `--jobs N` never creates more than N
+    -- Parallel path: bounded batches, so `--jobs N` never creates more than N
     -- dedicated file tasks at a time.
-    let mut out : Array (Except IO.Error α) := #[]
-    let mut i := 0
-    while i < files.size do
-      let stop := Nat.min files.size (i + maxConcurrent)
-      let batch := files.extract i stop
-      let tasks ← batch.mapM fun df =>
-        IO.asTask (prio := .dedicated) do
-          f importLock df
-      let results ← tasks.mapM fun t => IO.wait t
-      out := out ++ results
-      i := stop
-    return out
+    batchedMap files maxConcurrent (fun _ df => f importLock df)
 
 end Corpus.Frontend

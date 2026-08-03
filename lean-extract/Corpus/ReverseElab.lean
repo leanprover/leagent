@@ -34,11 +34,9 @@ Tiers:
 
 All API used here is verified against Lean 4.14.0 core sources (ported to 4.31).
 
-The single in-process source of truth for reverse-elaboration: consumed by the
-in-process corpus collector (`Corpus.CorpusManifest`, which drives the frontend
-directly) and by the legacy import-based extractor (`Corpus.Extract`). The
-verify-and-fallback soundness guards here were once 31% wrong (commit history)
-and must not be duplicated. Pure helpers (no `initialize` block).
+The single source of truth for reverse-elaboration, consumed by the corpus
+collector (`Corpus.CorpusManifest`). The verify-and-fallback soundness guards here
+were once 31% wrong (commit history) and must not be duplicated.
 -/
 
 namespace Corpus.ReverseElab
@@ -155,7 +153,7 @@ decompositions into false fails. 12M clears the worst observed success.
 
 Crucially this does NOT make normal fails slow: a fail "fails" by trying its ~9
 candidates and having none verify, which costs their natural total (~2.4M median
-on the import path) — nowhere near 12M. Only a GIANT-term proof approaches the
+measured) — nowhere near 12M. Only a GIANT-term proof approaches the
 ceiling, and those accrue heartbeats slowly relative to wall time, so they are
 bounded by the caller's wall-clock guard (`reverseProofGuarded`) long before this
 heartbeat ceiling would bite. Re-measure if recognizers/corpus change. -/

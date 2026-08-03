@@ -1,13 +1,12 @@
 import Lean
 
 /-!
-Orphan-safe file discovery for the worker-driven extraction path.
+Orphan-safe file discovery for the frontend extraction path.
 
-The import-based extractor (`Corpus.Extract`) only ever sees declarations in the
-transitive import closure of the `--modules` roots, so a `.lean` file that no
-imported module pulls in ("orphan") is invisible. The worker path drives one
-`lean --worker` per *source file*, so it must enumerate files from what is ON
-DISK under the project's library roots — NOT the import graph.
+Because the extractor drives Lean's frontend over one *source file* at a time, it
+enumerates files from what is ON DISK under the project's library roots — NOT the
+import graph. That catches a `.lean` file no imported module pulls in ("orphan"),
+which an import-closure walk would miss.
 
 We enumerate every `.lean` file beneath the project root (hard-excluding any
 `.lake/` build directory), keep those whose derived module name sits under one
@@ -27,17 +26,20 @@ def enumerateLeanFiles (root : FilePath) : IO (Array FilePath) := do
   let all ← root.walkDir (enter := fun p => pure (p.fileName != some ".lake"))
   return all.filter (fun p => p.extension == some "lean")
 
+/-- `path` with the `root` prefix and the following separator removed, i.e. the
+project-relative form the corpus `file` field stores. The one implementation of
+this, so the record path, the shard path, and the module name all agree. -/
+def relativeTo (root : FilePath) (path : FilePath) : String :=
+  let rel := (path.toString.dropPrefix root.toString).copy
+  ((rel.dropPrefix "/").copy.dropPrefix "\\").copy
+
 /-- Convert a `.lean` file path to its module `Name`, relative to `projectRoot`.
 `projectRoot/LeanSQLite/Journal/Program.lean` → `LeanSQLite.Journal.Program`.
 Returns `none` if the path is not under `projectRoot` or is not a `.lean` file.
 The top-level `projectRoot/LeanSQLite.lean` maps to the single-component
 `LeanSQLite`. -/
 def filePathToModule (projectRoot : FilePath) (file : FilePath) : Option Name := do
-  let rootStr := projectRoot.toString
-  let fileStr := file.toString
-  -- Strip the project-root prefix and the leading separator.
-  let rel0 := (fileStr.dropPrefix rootStr).copy
-  let rel := ((rel0.dropPrefix "/").copy.dropPrefix "\\").copy
+  let rel := relativeTo projectRoot file
   guard (rel.endsWith ".lean")
   let noExt := (rel.dropEnd 5).copy  -- ".lean"
   -- Path separators (POSIX `/`, Windows `\`) → name dots.
@@ -71,8 +73,7 @@ def discoverFiles (projectRoot : FilePath) (libRoots : Array Name)
     let underRoot := libRoots.isEmpty ||
       libRoots.any (fun r => r == mod || r.isPrefixOf mod)
     if underRoot then
-      let relPath := ((abs.toString.dropPrefix root.toString).copy.dropPrefix "/").copy
-      out := out.push { absPath := abs, module := mod, relPath }
+      out := out.push { absPath := abs, module := mod, relPath := relativeTo root abs }
   return out.qsort (fun a b => a.relPath < b.relPath)
 
 /-- Orphans = discovered modules on disk that are NOT in `importClosure` (the set

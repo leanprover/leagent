@@ -6,4 +6,3 @@
 import Corpus.Records
 import Corpus.Tags
 import Corpus.Card
-import Corpus.Extract

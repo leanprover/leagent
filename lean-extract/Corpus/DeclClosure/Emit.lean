@@ -4,6 +4,8 @@ Released under Apache 2.0 license as described in the file LICENSE.
 -/
 import Corpus.DeclClosure.Cone
 import Corpus.Artifact
+import Corpus.Tags
+import Corpus.Options
 
 /-!
 Phase 2 of single-declaration extraction: turn a closure plus a pool of elaborated
@@ -108,11 +110,8 @@ structure RunConfig where
   roots            : Array Name
   tagConfig        : TagConfig
   configPath?      : Option System.FilePath
-  includeInternal  : Bool
-  includePrivate   : Bool
-  reverseElab      : Bool
-  reverseClosers   : Bool
-  reverseSkip      : Array String
+  /-- The per-file collection knobs, shared with every other extraction mode. -/
+  opts             : CollectOptions
   reverseTimeoutMs : Nat
   jobs             : Nat
   isolateFiles     : Bool
@@ -282,10 +281,10 @@ def renderMetadata (closure : Closure) (p : Projection) (cfg : RunConfig)
     ("modulesWithoutSource", nameArr missingModules),
     ("filesElaborated",      strArr filesElaborated),
     ("extractionFlags",      Json.mkObj [
-                                ("includeInternal", Json.bool cfg.includeInternal),
-                                ("includePrivate",  Json.bool cfg.includePrivate),
-                                ("reverseElab",     Json.bool cfg.reverseElab),
-                                ("reverseClosers",  Json.bool cfg.reverseClosers),
+                                ("includeInternal", Json.bool cfg.opts.includeInternal),
+                                ("includePrivate",  Json.bool cfg.opts.includePrivate),
+                                ("reverseElab",     Json.bool cfg.opts.reverseElab),
+                                ("reverseClosers",  Json.bool cfg.opts.reverseClosers),
                                 ("strictClosure",   Json.bool cfg.strictClosure)])
   ]
 

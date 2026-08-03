@@ -56,15 +56,19 @@ private structure Candidate where
   start : Nat × Nat
   deriving Inhabited
 
-private def fail {α} (message : String) : IO α :=
+/-- Fail with the tool's diagnostic prefix. Shared across the reassembler. -/
+def fail {α} (message : String) : IO α :=
   throw <| IO.userError s!"lean-reassemble: {message}"
 
-private def normalizeRelativePath (path : String) : String :=
+/-- Strip a leading `./` or `.\` so record paths and CLI `--file` compare equal. -/
+def normalizeRelativePath (path : String) : String :=
   ((path.dropPrefix "./").copy.dropPrefix ".\\").copy
 
-private def isWithin (root path : System.FilePath) : Bool :=
-  let root := root.toString
-  let path := path.toString
+/-- True iff `path` is `root` or lives beneath it. Both sides are normalized, so
+callers need not pre-`realPath`. -/
+def isWithin (root path : System.FilePath) : Bool :=
+  let root := root.normalize.toString
+  let path := path.normalize.toString
   path == root || path.startsWith (root ++ "/") || path.startsWith (root ++ "\\")
 
 /-- Read and decode one JSON object per nonempty input line. Shares the extractor's

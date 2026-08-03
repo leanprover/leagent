@@ -42,7 +42,7 @@ only ever touches files that actually define closure members. The union across
 all targets is elaborated once, which is what makes several `--decl` flags
 cheaper than several invocations. -/
 unsafe def run (cfg : RunConfig) : IO UInt32 := do
-  if !cfg.includePrivate then
+  if !cfg.opts.includePrivate then
     IO.eprintln "corpus-extract: warning: --no-private with --decl yields \
       structurally incomplete closures — proofs routinely use private lemmas, and \
       those holes are not recoverable from imports."
@@ -55,7 +55,7 @@ unsafe def run (cfg : RunConfig) : IO UInt32 := do
   let mut closures : Array Closure := #[]
   for name in cfg.targets do
     let target ← resolveTarget env name
-    let closure ← computeClosure env cfg.roots target cfg.includeInternal cfg.includePrivate
+    let closure ← computeClosure env cfg.roots target cfg.opts
     IO.println s!"corpus-extract: {target.display}: closure of {closure.roles.size} \
       declaration(s) across {closure.modules.size} module(s)"
     closures := closures.push closure
@@ -80,13 +80,10 @@ unsafe def run (cfg : RunConfig) : IO UInt32 := do
     {closures.size} target(s) ({mode}, jobs={cfg.jobs})…"
   let (pool, wstats) ←
     if cfg.isolateFiles then
-      extractViaFrontendIsolated cfg.projectRoot files cfg.tagConfig
-        cfg.includeInternal cfg.includePrivate cfg.reverseElab cfg.reverseClosers
-        cfg.configPath? cfg.reverseSkip cfg.jobs cfg.reverseTimeoutMs cfg.outDir cfg.resume
+      extractViaFrontendIsolated cfg.projectRoot files cfg.opts
+        cfg.configPath? cfg.jobs cfg.reverseTimeoutMs cfg.outDir cfg.resume
     else
-      extractViaFrontend cfg.projectRoot files cfg.tagConfig
-        cfg.includeInternal cfg.includePrivate cfg.reverseElab cfg.reverseClosers
-        cfg.reverseSkip cfg.jobs
+      extractViaFrontend files cfg.tagConfig cfg.opts cfg.jobs
   IO.println s!"corpus-extract: {wstats.filesOk} ok, {wstats.filesEmpty} empty, \
     {wstats.filesError} error (of {wstats.filesTotal})"
   if wstats.filesError > 0 then

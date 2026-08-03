@@ -1,6 +1,7 @@
 import Corpus.ProofStates
 import Corpus.Artifact
 import Corpus.SourceSyntax
+import Corpus.TestAssert
 
 /-!
 Tests for per-step proof-state extraction.
@@ -22,9 +23,7 @@ open Corpus.ProofStates
 
 namespace ProofStatesTests
 
-private def assert (condition : Bool) (message : String) : IO Unit :=
-  unless condition do
-    throw <| IO.userError message
+open Corpus.TestAssert (assert)
 
 /-- A `RawStep` builder: only the fields a given test cares about. -/
 private def raw (startByte endByte : Nat) (kind : String)

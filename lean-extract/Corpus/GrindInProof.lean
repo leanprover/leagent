@@ -6,6 +6,7 @@ Authors: Paul Govereau
 -/
 import Lean
 import Corpus.CollectCommon
+import Corpus.Options
 import Corpus.Frontend
 import Corpus.GrindManifest
 
@@ -94,10 +95,9 @@ structure GrindInProofEntry where
   coverageGap : Nat
   /-- `true` iff the enclosing declaration's name is `private`. -/
   isPrivate   : Bool
-  deriving FromJson, ToJson
 
 open Lean.Meta Lean.Meta.Grind Lean.Elab Lean.Elab.Tactic
--- `mkGrindConfig` / `runGrindCore` / `availableHintsPublic` / `grindHeartbeats` /
+-- `mkGrindConfig` / `runGrindCore` / `availableHints` / `grindHeartbeats` /
 -- `runGrindGuarded` are siblings in `namespace Corpus` (from `Corpus.GrindManifest`),
 -- so they resolve directly here without an `open`.
 
@@ -180,7 +180,7 @@ private def rerunGrindOnGoal (mvarId : MVarId) (only : Bool)
   -- Bound this VC by the finite `grindHeartbeats` backstop (same as the whole-
   -- statement path); a runaway grind degrades to `stuck`. The caller's own
   -- `tryCatchRuntimeEx` is a second net for a throw from the prologue above.
-  runGrindGuarded { goalType := goalTypeStr, outcome := "stuck",
+  runGrindGuarded { goalType := goalTypeStr, outcome := Outcome.stuck,
                     interactive := none, grindOnly := none, hasSorry := false,
                     name := "", module := "", activated := #[], used := #[],
                     coverageGap := 0, startLine := none, isPrivate := false }
@@ -238,13 +238,13 @@ private def foldGrindSites (trees : Array Elab.InfoTree) (includePrivate : Bool)
     let base : GrindInProofEntry := {
       enclosingTheorem := enclosing, module := ctx.env.mainModule.toString,
       startLine, startCol, goalType := "", authorHints, authorOnly := only,
-      outcome := "error", interactive := none, grindOnly := none,
+      outcome := Outcome.error, interactive := none, grindOnly := none,
       hasSorry := false, activated := #[], used := #[], coverageGap := 0,
       isPrivate := isPriv }
     -- Past the budget: keep a placeholder, don't run grind.
     let attempt := deadlineMs == 0 || (← IO.monoMsNow) - startMs < deadlineMs
     if !attempt then
-      out := out.push { base with outcome := "deadline_skipped" }
+      out := out.push { base with outcome := Outcome.deadlineSkipped }
       continue
     -- The one goal this grind invocation ran on. Under all_goals/<;> this is a
     -- single-element list. Skip empty (grind reached with no goals) or a goal
@@ -267,14 +267,14 @@ private def foldGrindSites (trees : Array Elab.InfoTree) (includePrivate : Bool)
       tryCatchRuntimeEx
         (do
           if (← mvarId.isAssigned) then
-            return { base with outcome := "error" }
+            return { base with outcome := Outcome.error }
           let e ← rerunGrindOnGoal mvarId only authorPs
           return { base with
             goalType := e.goalType, outcome := e.outcome,
             interactive := e.interactive, grindOnly := e.grindOnly,
             hasSorry := e.hasSorry, activated := e.activated, used := e.used,
             coverageGap := e.coverageGap })
-        (fun _ => pure { base with outcome := "error" })
+        (fun _ => pure { base with outcome := Outcome.error })
     out := out.push entry
   return out
 
@@ -290,13 +290,8 @@ def grindInProofCore (r : Frontend.ElabResult) (includePrivate : Bool)
     (grindDeadlineMs : Nat := 0) : IO (Array String × Array GrindInProofEntry) :=
   Frontend.runCollectorOn r do
     let env ← getEnv
-    let available := availableHintsPublic env
+    let available := availableHints env
     let entries ← foldGrindSites r.trees.toArray includePrivate grindDeadlineMs
     return (available, entries)
-
-/-- Public wrapper over `rerunGrindOnGoal` (re-run grind on one captured VC). -/
-def rerunGrindOnGoalPublic (mvarId : MVarId) (only : Bool)
-    (authorPs : TSyntaxArray ``Lean.Parser.Tactic.grindParam)
-    : MetaM GrindManifestEntry := rerunGrindOnGoal mvarId only authorPs
 
 end Corpus

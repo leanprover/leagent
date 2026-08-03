@@ -1,12 +1,11 @@
 import Corpus.WorkerExtract
+import Corpus.TestAssert
 
 open Lean
 
 namespace ResumeTests
 
-private def assert (condition : Bool) (message : String) : IO Unit :=
-  unless condition do
-    throw <| IO.userError message
+open Corpus.TestAssert (assert)
 
 private def writeProject (root : System.FilePath) : IO Unit := do
   IO.FS.createDirAll (root / "A")

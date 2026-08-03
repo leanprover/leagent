@@ -4,6 +4,7 @@ Released under Apache 2.0 license as described in the file LICENSE.
 -/
 import Lean
 import Corpus.CollectCommon
+import Corpus.Options
 import Corpus.Frontend
 import Corpus.Records
 import Corpus.SourceSyntax
@@ -581,8 +582,8 @@ def buildEntry (src : String) (name : String) (module : String) (declKind : Stri
   let slice := fun (a b : Nat) =>
     (String.Pos.Raw.extract src ⟨a⟩ ⟨b⟩).trimAsciiEnd.copy
   let normalized := normalize forest
-  let emit := outcome == "ok" && countRaw normalized ≤ stepCeiling
-  let outcome := if outcome == "ok" && !emit then "skipped_large" else outcome
+  let emit := outcome == Outcome.ok && countRaw normalized ≤ stepCeiling
+  let outcome := if outcome == Outcome.ok && !emit then Outcome.skippedLarge else outcome
   let (steps0, _) := if emit then toProofSteps slice 0 0 normalized else (#[], 0)
   -- Renumber into pre-order so goal 0 is the state the proof opened in, rather
   -- than whatever the bottom-up walk interned last.
@@ -669,7 +670,7 @@ def collectFile (r : Frontend.ElabResult) (includePrivate : Bool)
       env.mainModule.toString
       (if isPrivate then "private theorem" else "theorem")
       isPrivate (!vc.isSorryFree) ranges proofRange forest table
-      (if pastDeadline then "deadline_skipped" else "ok")
+      (if pastDeadline then Outcome.deadlineSkipped else Outcome.ok)
   return (out.qsort (fun a b => a.name < b.name), skippedTerm)
 
 /-- The in-process proof-state entry point: for one frontend-elaborated file, walk
