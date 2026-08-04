@@ -195,7 +195,11 @@ private def testManifestParity (result : Corpus.Frontend.ElabResult)
   let legacyDecl := legacyDeclSourceMap result.source result.commands
   assertIO (declSourceMapsEqual sharedDecl legacyDecl)
     "declaration source map changed during refactor"
-  let manifest ← Corpus.corpusManifestCore result false true false false
+  -- Defaults except `includePrivate`, which the fixture relies on: it contains a
+  -- `private` theorem whose manifest entry the loop below requires.
+  let manifest ← Corpus.corpusManifestCore result
+    { includeInternal := false, includePrivate := true, reverseElab := false,
+      reverseClosers := false, reverseSkip := #[] }
   for record in records do
     let some entry := manifest.find? (·.name == record.name)
       | throw <| IO.userError s!"manifest entry missing: {record.name}"
