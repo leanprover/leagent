@@ -55,9 +55,22 @@ also what the `gatedGrind` macro branches on. -/
 def grindSupported : Bool :=
   Lean.version.major > 4 || (Lean.version.major == 4 && Lean.version.minor ≥ 31)
 
-/-- Human-readable refusal used by the grind CLI modes on old toolchains. -/
+/-- Stable marker embedded in `grindUnsupportedMsg`, for callers that need to
+recognise this specific refusal rather than any failure — CI asserts the gate
+fires by grepping for it.
+
+Separate from the prose because matching on a sentence is too fragile: CI first
+grepped for "requires Lean v4.31.0 or newer" against a message that says
+"require" (plural subject — two flags are listed), so the assertion failed on
+exactly the toolchains the gate was working correctly on. Change the wording
+above freely; keep this token, or update both together. -/
+def grindUnsupportedMarker : String := "grind-unsupported-toolchain"
+
+/-- Human-readable refusal used by the grind CLI modes on old toolchains. Carries
+`grindUnsupportedMarker` so the reason is machine-checkable. -/
 def grindUnsupportedMsg : String :=
-  s!"--grind-manifest and --grind-in-proof require Lean v4.31.0 or newer \
+  s!"[{grindUnsupportedMarker}] --grind-manifest and --grind-in-proof require \
+Lean v4.31.0 or newer \
 (running v{Lean.version.major}.{Lean.version.minor}.{Lean.version.patch}): \
 grind's used-lemma data (Grind.State.instanceMap, Config.markInstances) was \
 only exposed in v4.31.0. Re-run on a v4.31+ toolchain; the other extraction \
