@@ -161,6 +161,70 @@ jobs:
             esac
           fi
 
+      # The integration test: run the documented pipeline end to end. The unit
+      # suites cover the pieces, so without this the whole extract -> reassemble
+      # path could break with CI green. `make artifacts` skips the grind modes
+      # below v4.31 itself, so this needs no matrix branching.
+      - name: Build artifacts
+        run: make artifacts
+
+      # `make artifacts` already fails on a non-zero exit, and each
+      # `materialize-*` verifies its own output, so this checks the part an exit
+      # code cannot: that the run actually produced records rather than silently
+      # writing empty files, and that the materializer recorded a PASS rather than
+      # just not crashing.
+      - name: Check artifact shape
+        run: |
+          python3 - <<'PY'
+          import json, sys, pathlib
+          root = pathlib.Path("/tmp/leagent-artifacts")
+          failed = []
+
+          def lines(rel):
+              p = root / rel
+              if not p.is_file():
+                  failed.append(f"missing: {rel}")
+                  return 0
+              return sum(1 for _ in p.open())
+
+          # Record counts for the four always-on modes. The example project has 9
+          # theorems and 13 definitions; a drift here means extraction changed
+          # shape, which is worth a look even when nothing errored.
+          for rel, want in [
+              ("plain/data/theorems/train.jsonl", 9),
+              ("plain/data/definitions.jsonl", 13),
+              ("rev-elab/data/theorems/train.jsonl", 9),
+              ("proof-states/data/proof-states/train.jsonl", 9),
+              ("decl/Trees.Tree.total_mirror/data/target.jsonl", 1),
+          ]:
+              got = lines(rel)
+              if got != want:
+                  failed.append(f"{rel}: expected {want} record(s), got {got}")
+
+          # Every materialized artifact must report verification passed and no
+          # failed rewrites. This is the real assertion: it means the generated
+          # Lean compiled against a pristine .olean cache.
+          for name, replaced in [("repo", 9), ("units", 9), ("decl-unit", 1)]:
+              mf = root / "reasm" / name / "manifest.json"
+              if not mf.is_file():
+                  failed.append(f"missing: {mf.relative_to(root)}")
+                  continue
+              m = json.loads(mf.read_text())
+              status = (m.get("verification") or {}).get("status")
+              if status != "passed":
+                  failed.append(f"{name}: verification status {status!r}, want 'passed'")
+              s = m.get("rewrite_summary") or {}
+              if s.get("failed") != 0:
+                  failed.append(f"{name}: {s.get('failed')} failed rewrite(s)")
+              if s.get("replaced") != replaced:
+                  failed.append(f"{name}: replaced {s.get('replaced')}, want {replaced}")
+
+          for f in failed:
+              print(f"::error::{f}", file=sys.stderr)
+          print(f"{len(failed)} problem(s)")
+          sys.exit(1 if failed else 0)
+          PY
+
       # A stale fixture build tree fails the reassemble suite, and `make test`
       # removes it up front. If one exists here, materialization leaked into the
       # source tree — which is exactly what that suite asserts against.
