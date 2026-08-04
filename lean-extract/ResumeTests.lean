@@ -43,14 +43,20 @@ private def testShardPaths (root : System.FilePath) : IO Unit := do
   let stale ← Corpus.Resume.readValidShard shards left changedHash
   assert stale.isNone "shard was reused after its source content changed"
 
+/-- The collector options these tests fingerprint against. The fingerprint must
+vary with the tag config, the reverse timeout, and project source content, none of
+which live in here — so one fixed bundle is enough, and holding it constant is
+what makes those three assertions meaningful. -/
+private def testOpts : Corpus.CollectOptions :=
+  { includeInternal := false, includePrivate := true, reverseElab := false,
+    reverseClosers := false, reverseSkip := #[] }
+
 private def testFingerprint (root : System.FilePath) : IO Unit := do
   let config := root / "tags.json"
   IO.FS.writeFile config "{\"rules\":[]}\n"
-  let fp1 ← Corpus.Resume.runFingerprint root (some config)
-    false true false false #[] 300000
+  let fp1 ← Corpus.Resume.runFingerprint root (some config) testOpts 300000
   IO.FS.writeFile config "{\"rules\":[{\"match\":\"A\",\"tags\":{\"set\":\"new\"}}]}\n"
-  let fp2 ← Corpus.Resume.runFingerprint root (some config)
-    false true false false #[] 300000
+  let fp2 ← Corpus.Resume.runFingerprint root (some config) testOpts 300000
   assert (fp1 != fp2) "tag config content did not affect the resume fingerprint"
   let outDir := root / "out"
   let shardsDir ← Corpus.Resume.prepareShardsDir outDir false fp1
@@ -60,18 +66,14 @@ private def testFingerprint (root : System.FilePath) : IO Unit := do
   assert (← marker.pathExists) "matching fingerprint discarded staged shards"
   let _ ← Corpus.Resume.prepareShardsDir outDir true fp2
   assert (!(← marker.pathExists)) "changed fingerprint retained staged shards"
-  let fp3 ← Corpus.Resume.runFingerprint root (some config)
-    false true false false #[] 1000
+  let fp3 ← Corpus.Resume.runFingerprint root (some config) testOpts 1000
   assert (fp2 != fp3) "reverse timeout did not affect the resume fingerprint"
-  Corpus.Resume.checkRunFingerprint root (some config)
-    false true false false #[] 1000 fp3
+  Corpus.Resume.checkRunFingerprint root (some config) testOpts 1000 fp3
   IO.FS.writeFile (root / "A__B" / "C.lean") "theorem changed : True := by trivial\n"
-  let fp4 ← Corpus.Resume.runFingerprint root (some config)
-    false true false false #[] 1000
+  let fp4 ← Corpus.Resume.runFingerprint root (some config) testOpts 1000
   assert (fp3 != fp4) "project source content did not affect the resume fingerprint"
   let rejected ← try
-    Corpus.Resume.checkRunFingerprint root (some config)
-      false true false false #[] 1000 fp3
+    Corpus.Resume.checkRunFingerprint root (some config) testOpts 1000 fp3
     pure false
   catch _ =>
     pure true
@@ -86,8 +88,7 @@ private unsafe def testFrontendErrors (root : System.FilePath) : IO Unit := do
     relPath := "Bad.lean"
   }
   let rejected ← try
-    let _ ← Corpus.extractOneFileViaFrontend root df Corpus.TagConfig.empty
-      false true false
+    let _ ← Corpus.extractOneFileViaFrontend df Corpus.TagConfig.empty testOpts
     pure false
   catch _ =>
     pure true

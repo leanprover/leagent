@@ -109,8 +109,8 @@ fields (paths, jobs, timeouts) are irrelevant here. -/
 private def writeOpts : RunConfig :=
   { targets := #[`Fix.bump_pos], projectRoot := ".", outDir := "."
     roots := #[`Fix], tagConfig := Corpus.TagConfig.empty, configPath? := none
-    includeInternal := false, includePrivate := true
-    reverseElab := false, reverseClosers := false, reverseSkip := #[]
+    opts := { includeInternal := false, includePrivate := true
+              reverseElab := false, reverseClosers := false, reverseSkip := #[] }
     reverseTimeoutMs := 0, jobs := 1, isolateFiles := true, resume := false
     strictClosure := false, toolVersion := "test" }
 
