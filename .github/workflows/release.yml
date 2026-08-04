@@ -1,0 +1,129 @@
+# Build lean_extract + lean_reassemble for each supported toolchain and publish
+# them to a rolling "latest" pre-release on every push to main. The release is
+# replaced (not appended), so there is always exactly one set of assets and it
+# always reflects the current main.
+#
+# Assets are named `lean_extract-<slug>` / `lean_reassemble-<slug>` so a consumer
+# can download the pair for the toolchain their project uses. The binaries are
+# statically linked against libc — no Lean shared libraries — but at RUNTIME the
+# extractor drives Lean's frontend in-process, so users still need the matching
+# toolchain installed (elan handles this from their project's lean-toolchain).
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: leanprover/lean4:v4.28.0
+            slug: v4.28.0
+          - toolchain: leanprover/lean4:v4.29.1
+            slug: v4.29.1
+          - toolchain: leanprover/lean4:v4.31.0
+            slug: v4.31.0
+          - toolchain: leanprover/lean4:v4.32.2
+            slug: v4.32.2
+
+    name: build (${{ matrix.slug }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin toolchain
+        run: make set-toolchain TOOLCHAIN=${{ matrix.toolchain }}
+
+      - name: Install elan
+        run: |
+          curl -sSfL \
+            https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz
+          ./elan-init -y --no-modify-path --default-toolchain none
+          rm -f elan-init
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Install Lean ${{ matrix.slug }}
+        run: make toolchain
+
+      - name: Build
+        run: make all
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp "$(readlink -f bin/lean_extract)" "dist/lean_extract-${{ matrix.slug }}"
+          cp "$(readlink -f bin/lean_reassemble)" "dist/lean_reassemble-${{ matrix.slug }}"
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.slug }}
+          path: dist/
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binaries-*
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lh dist/
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Delete the existing release if present (gh release edit cannot
+          # replace assets atomically).
+          gh release delete latest --yes 2>/dev/null || true
+          git tag -f latest
+          git push origin latest --force
+
+          gh release create latest dist/* \
+            --title "Latest ($(date -u +%Y-%m-%d))" \
+            --notes "$(cat <<'EOF'
+          Rolling pre-release from the latest \`main\` commit.
+
+          **Commit:** ${{ github.sha }}
+
+          **Assets per toolchain:**
+
+          | Toolchain | lean\_extract | lean\_reassemble |
+          |---|---|---|
+          | v4.28.0 | \`lean_extract-v4.28.0\` | \`lean_reassemble-v4.28.0\` |
+          | v4.29.1 | \`lean_extract-v4.29.1\` | \`lean_reassemble-v4.29.1\` |
+          | v4.31.0 | \`lean_extract-v4.31.0\` | \`lean_reassemble-v4.31.0\` |
+          | v4.32.2 | \`lean_extract-v4.32.2\` | \`lean_reassemble-v4.32.2\` |
+
+          Download the pair matching your project's \`lean-toolchain\`. The binaries
+          run standalone (only libc), but at runtime the extractor drives Lean's
+          frontend, so the matching toolchain must be installed (\`elan\` handles this).
+
+          The grind modes (\`--grind-manifest\`, \`--grind-in-proof\`) require v4.31.0 or
+          newer; pre-4.31 builds refuse those modes at startup with an explanatory
+          message.
+          EOF
+          )" \
+            --prerelease
