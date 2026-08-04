@@ -135,18 +135,27 @@ jobs:
           rc=$?
           set -e
           echo "$out" | tail -5
+          # Match Corpus.grindUnsupportedMarker, not the prose around it. Grepping
+          # a sentence is how this check first went wrong: it looked for "requires
+          # Lean v4.31.0 or newer" against a message that says "require", so it
+          # failed on the two toolchains where the gate was working correctly.
+          marker="grind-unsupported-toolchain"
           if [ "${{ matrix.grind }}" = "unsupported" ]; then
             if [ $rc -eq 0 ]; then
               echo "::error::expected --grind-manifest to be refused on ${{ matrix.toolchain }}" >&2
               exit 1
             fi
             case "$out" in
-              *"requires Lean v4.31.0 or newer"*) echo "refused as expected" ;;
+              *"$marker"*) echo "refused as expected" ;;
               *) echo "::error::failed, but not with the version refusal" >&2; exit 1 ;;
             esac
           else
+            if [ $rc -ne 0 ]; then
+              echo "::error::--grind-manifest failed on ${{ matrix.toolchain }}, which supports it" >&2
+              exit 1
+            fi
             case "$out" in
-              *"requires Lean v4.31.0 or newer"*)
+              *"$marker"*)
                 echo "::error::grind wrongly refused on ${{ matrix.toolchain }}" >&2; exit 1 ;;
               *) echo "gate correctly inactive" ;;
             esac
