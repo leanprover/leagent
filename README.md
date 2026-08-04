@@ -7,8 +7,17 @@ Tools for using Lean from agents and for training agents to use Lean.
 ```bash
 make              # lean_extract + lean_reassemble, symlinked into bin/
 make example      # build examples/tree-project, needed to run the walkthrough
+make test         # the four test executables
+make artifacts    # run the whole pipeline on the example project
 make help         # all targets
 ```
+
+`make artifacts` is the end-to-end check: it extracts the example project in
+every mode the toolchain supports and materializes the results both ways, which
+is the command sequence in [`examples/quickstart.md`](examples/quickstart.md).
+Output goes to `/tmp/leagent-artifacts` (override with `ARTIFACTS_DIR=`), never
+into the working tree. Because both `materialize-*` commands verify their own
+output, a clean exit means the generated Lean actually compiled.
 
 Everything pins Lean 4.31.0 (`make toolchain` installs it via elan). Each package
 also builds on its own with `lake build`; the Makefile only names the targets and

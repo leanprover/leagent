@@ -5,6 +5,8 @@
 #   make extract       just lean_extract
 #   make reassemble    just lean_reassemble
 #   make example       build examples/tree-project (needed by examples/README.md)
+#   make test          run the four test executables
+#   make artifacts     run the documented extract -> reassemble pipeline
 #   make clean         drop build trees, keep the toolchain
 #   make help          list targets
 #
@@ -35,13 +37,27 @@ TOOLCHAIN := $(shell cat $(EXTRACT_PKG)/lean-toolchain)
 
 BINDIR := bin
 
+# Where `make artifacts` writes. Outside the repo by default: the docs are
+# explicit that the pipeline writes nothing into the working tree, and
+# `materialize-*` refuses an output directory inside the source root anyway.
+ARTIFACTS_DIR ?= /tmp/leagent-artifacts
+
+# The grind modes need Lean v4.31+ (see lean-extract/Corpus/Compat.lean); below
+# that they exit non-zero by design. `make artifacts` skips them there rather
+# than treating a correct refusal as a failure. Compares the minor version, so
+# this holds for 4.31 through 4.99 and any 5.x.
+LEAN_MINOR := $(shell sed -n 's/.*lean4:v4\.\([0-9]*\).*/\1/p' $(EXTRACT_PKG)/lean-toolchain)
+LEAN_MAJOR := $(shell sed -n 's/.*lean4:v\([0-9]*\)\..*/\1/p' $(EXTRACT_PKG)/lean-toolchain)
+GRIND_OK   := $(shell [ "$(LEAN_MAJOR)" -gt 4 ] 2>/dev/null && echo yes || \
+                     { [ "$(LEAN_MAJOR)" = 4 ] && [ "$(LEAN_MINOR)" -ge 31 ] 2>/dev/null && echo yes; })
+
 .DEFAULT_GOAL := all
 
 # reassemble `require`s the sibling packages, so parallel lake invocations would
 # race on shared build trees. Lake parallelises within a package already.
 .NOTPARALLEL:
 
-.PHONY: all extract reassemble example test clean distclean help toolchain set-toolchain
+.PHONY: all extract reassemble example test artifacts clean distclean help toolchain set-toolchain
 
 all: extract reassemble
 
@@ -64,6 +80,60 @@ $(BINDIR):
 # file(s)" rather than anything pointing at the missing build.
 example:
 	cd $(EXAMPLE_PKG) && lake build
+
+# Run the documented pipeline end to end: extract with every mode this toolchain
+# supports, then reassemble the results both ways. This is the integration test
+# for `examples/quickstart.md` — the unit suites cover the pieces in isolation, so
+# without this the whole extract -> reassemble path (and every command in the
+# walkthrough) can break with CI still green.
+#
+# Both `materialize-*` commands verify their own output before exiting, so a
+# silent exit 0 here means the generated Lean actually compiled against a pristine
+# .olean cache. That is the assertion; the files left in $(ARTIFACTS_DIR) are for
+# inspection.
+#
+# Writes outside the tree (see ARTIFACTS_DIR) and rebuilds from scratch each time,
+# because `materialize-*` refuse a pre-existing output directory.
+artifacts: all example
+	rm -rf $(ARTIFACTS_DIR)
+	@echo "=== extract: plain"
+	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
+	    --output $(ARTIFACTS_DIR)/plain
+	@echo "=== extract: reverse-elab"
+	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
+	    --output $(ARTIFACTS_DIR)/rev-elab --reverse-elab
+	@echo "=== extract: decl closure"
+	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
+	    --output $(ARTIFACTS_DIR)/decl --decl Trees.Tree.total_mirror
+	@echo "=== extract: proof states"
+	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
+	    --output $(ARTIFACTS_DIR)/proof-states --proof-states
+ifeq ($(GRIND_OK),yes)
+	@echo "=== extract: grind manifest"
+	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
+	    --output $(ARTIFACTS_DIR)/grind --grind-manifest
+	@echo "=== extract: grind in proof"
+	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
+	    --output $(ARTIFACTS_DIR)/grind-in-proof --grind-in-proof
+else
+	@echo "=== extract: grind modes SKIPPED (needs Lean v4.31+, have $(TOOLCHAIN))"
+endif
+	@echo "=== reassemble: repo (all 9 theorems holed in one project)"
+	./$(BINDIR)/lean_reassemble materialize-repo \
+	    --source-root ./$(EXAMPLE_PKG) \
+	    --records $(ARTIFACTS_DIR)/plain/data/theorems/train.jsonl \
+	    --output $(ARTIFACTS_DIR)/reasm/repo
+	@echo "=== reassemble: units (one task per theorem)"
+	./$(BINDIR)/lean_reassemble materialize-units \
+	    --source-root ./$(EXAMPLE_PKG) \
+	    --records $(ARTIFACTS_DIR)/plain/data/theorems/train.jsonl \
+	    --output $(ARTIFACTS_DIR)/reasm/units
+	@echo "=== reassemble: single task from the decl closure's target"
+	./$(BINDIR)/lean_reassemble materialize-units \
+	    --source-root ./$(EXAMPLE_PKG) \
+	    --records $(ARTIFACTS_DIR)/decl/Trees.Tree.total_mirror/data/target.jsonl \
+	    --output $(ARTIFACTS_DIR)/reasm/decl-unit
+	@echo "=== artifacts in $(ARTIFACTS_DIR)"
 
 # `lake clean` leaves the toolchain and any fetched packages in place.
 clean:
@@ -118,6 +188,7 @@ help:
 	@echo "  reassemble   lean_reassemble only"
 	@echo "  example      build $(EXAMPLE_PKG)"
 	@echo "  test         run all four test executables"
+	@echo "  artifacts    run the full extract -> reassemble pipeline"
 	@echo "  toolchain    install $(TOOLCHAIN) via elan"
 	@echo "  set-toolchain  repoint all packages (make set-toolchain TOOLCHAIN=...)"
 	@echo "  clean        lake clean + drop $(BINDIR)/"
