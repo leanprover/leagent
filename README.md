@@ -14,6 +14,35 @@ Everything pins Lean 4.31.0 (`make toolchain` installs it via elan). Each packag
 also builds on its own with `lake build`; the Makefile only names the targets and
 gives the binaries a stable path.
 
+## Supported Lean versions
+
+| Toolchain | Build + tests | `--grind-manifest`, `--grind-in-proof` |
+|---|---|---|
+| v4.28.0 | yes | no — refused at startup |
+| v4.29.1 | yes | no — refused at startup |
+| v4.31.0 (pinned) | yes | yes |
+| v4.32.2 | yes | yes |
+
+CI covers all four. The grind modes collect which lemmas a successful `grind` run
+actually used, and that data (`Grind.State.instanceMap`, `Config.markInstances`)
+was only exposed in v4.31.0 — before that it lives in search-local state that is
+discarded before the collector can read it. On older toolchains those two modes
+exit non-zero with an explanatory message rather than writing records whose `used`
+field is empty, which would be indistinguishable from "grind used no lemmas".
+Every other mode is unaffected. See [`lean-extract/Corpus/Compat.lean`](lean-extract/Corpus/Compat.lean).
+
+To build against a version other than the pin:
+
+```bash
+lake +leanprover/lean4:v4.32.2 build          # one package, leaves files untouched
+make set-toolchain TOOLCHAIN=leanprover/lean4:v4.32.2   # repoint all five packages
+```
+
+The five packages are one lake workspace (path `require`s), so they must all name
+the same toolchain; `set-toolchain` is the single place that knows the full set.
+Note that the toolchain is a build-trace input, so switching in place forces a
+full rebuild — use a separate git worktree per version when comparing.
+
 New here? [`examples/README.md`](examples/README.md) is a guided tour of the whole
 toolchain on a four-file example project — extract a corpus, reverse-elaborate
 proofs into tactic scripts, capture per-tactic goal states, slice one theorem's
