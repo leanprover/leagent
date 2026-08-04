@@ -23,22 +23,35 @@ jobs:
     # data they collect was only exposed in v4.31.0. `grind` in the matrix below
     # records that expectation per entry. See lean-extract/Corpus/Compat.lean.
     #
-    # `leanprover/lean-action` has no toolchain input: it always uses the
-    # lean-toolchain file of the checked-out tree. So each matrix entry rewrites
-    # those files (via `make set-toolchain`) before the action runs. Doing it
-    # first also gives every entry its own `.lake` cache, because the action keys
-    # that cache on a hash of lean-toolchain + lake-manifest.json.
+    # No toolchain is selectable from the repo root: each of the five packages
+    # carries its own lean-toolchain and the root has none. So each matrix entry
+    # rewrites all five (via `make set-toolchain`) and then installs that
+    # toolchain explicitly with `make toolchain`.
+    #
+    # This deliberately does NOT use `leanprover/lean-action`. That action runs
+    # every step in one `lake-package-directory` (default `.`) and installs elan
+    # with `--default-toolchain none`, then immediately runs `lean --version`
+    # there — which fails with "no default toolchain configured" in a repo whose
+    # root is not itself a lake package. Its `.lake` cache is also scoped to that
+    # single directory, and we have four to cache and one that must NOT be cached
+    # (see the cache step).
+    # `slug` is the toolchain with `/` and `:` removed: those are not legal in a
+    # cache key, and `matrix.toolchain` carries both.
     strategy:
       fail-fast: false
       matrix:
         include:
           - toolchain: leanprover/lean4:v4.28.0
+            slug: v4.28.0
             grind: unsupported
           - toolchain: leanprover/lean4:v4.29.1
+            slug: v4.29.1
             grind: unsupported
           - toolchain: leanprover/lean4:v4.31.0
+            slug: v4.31.0
             grind: supported
           - toolchain: leanprover/lean4:v4.32.2
+            slug: v4.32.2
             grind: supported
 
     name: build (${{ matrix.toolchain }})
@@ -50,14 +63,51 @@ jobs:
       - name: Pin toolchain
         run: make set-toolchain TOOLCHAIN=${{ matrix.toolchain }}
 
-      # The five packages form one lake workspace via path `require`s, but they
-      # have separate roots, so there is no single `lake build` that covers them
-      # all — hence the Makefile targets rather than lean-action's auto-config.
-      # `build: false` keeps the action for its elan setup and .lake caching only.
-      - uses: leanprover/lean-action@v1
+      - name: Install elan
+        run: |
+          curl -sSfL \
+            https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz
+          # `--default-toolchain none` because the toolchain comes from each
+          # package's lean-toolchain, not from a global default. Nothing runs
+          # `lean` before `make toolchain` below, so there is no version to
+          # resolve in between.
+          ./elan-init -y --no-modify-path --default-toolchain none
+          rm -f elan-init
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # Fetch the pinned toolchain up front so a download failure is its own red
+      # step rather than noise inside the first build.
+      - name: Install Lean ${{ matrix.slug }}
+        run: make toolchain
+
+      # Cache the four build trees that are safe to reuse. reassemble/TestProject
+      # is deliberately absent: the reassemble suite asserts that materialization
+      # never creates a build tree in the fixture, so restoring one would fail the
+      # suite. `make test` removes it before running for the same reason.
+      #
+      # The toolchain is part of every build trace, so it must be in the key or a
+      # restored tree would be rebuilt wholesale anyway.
+      - name: Cache build trees
+        uses: actions/cache@v4
         with:
-          auto-config: false
-          build: false
+          path: |
+            lean-extract/.lake
+            workers/.lake
+            reassemble/.lake
+            examples/tree-project/.lake
+          # Explicit paths rather than `**/`: a glob would also match the
+          # lakefiles inside restored .lake/packages trees, making the key depend
+          # on what the cache itself restored.
+          key: lake-${{ runner.os }}-${{ matrix.slug }}-${{ hashFiles('lean-extract/lakefile.lean', 'workers/lakefile.lean', 'reassemble/lakefile.lean', 'examples/tree-project/lakefile.toml', 'lean-extract/lake-manifest.json', 'workers/lake-manifest.json', 'reassemble/lake-manifest.json', 'examples/tree-project/lake-manifest.json') }}-${{ github.sha }}
+          # Falling back to an older tree is safe and usually a big win: lake
+          # revalidates by content hash, so a stale artifact is rebuilt, not
+          # trusted. The `github.sha` suffix on the primary key just means each
+          # commit saves its own entry instead of colliding on a fixed key (which
+          # `actions/cache` will not overwrite once written).
+          restore-keys: |
+            lake-${{ runner.os }}-${{ matrix.slug }}-${{ hashFiles('lean-extract/lakefile.lean', 'workers/lakefile.lean', 'reassemble/lakefile.lean', 'examples/tree-project/lakefile.toml', 'lean-extract/lake-manifest.json', 'workers/lake-manifest.json', 'reassemble/lake-manifest.json', 'examples/tree-project/lake-manifest.json') }}-
+            lake-${{ runner.os }}-${{ matrix.slug }}-
 
       - name: Build tools
         run: make all
