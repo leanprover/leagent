@@ -21,6 +21,15 @@ REASSEMBLE_PKG := reassemble
 # has no target of its own.
 WORKERS_PKG    := workers
 EXAMPLE_PKG    := examples/tree-project
+# reassemble/TestProject is a fixture package the reassemble tests build and
+# extract from; it is a lake package in its own right, so it carries its own
+# lean-toolchain and must move in lockstep with the rest.
+FIXTURE_PKG    := $(REASSEMBLE_PKG)/TestProject
+
+# Every package here is wired to its siblings by path `require`s, so lake
+# resolves them into ONE workspace and they must all name the same toolchain.
+# This list is the single place that knows the full set.
+ALL_PKGS := $(EXTRACT_PKG) $(WORKERS_PKG) $(REASSEMBLE_PKG) $(FIXTURE_PKG) $(EXAMPLE_PKG)
 
 TOOLCHAIN := $(shell cat $(EXTRACT_PKG)/lean-toolchain)
 
@@ -32,7 +41,7 @@ BINDIR := bin
 # race on shared build trees. Lake parallelises within a package already.
 .NOTPARALLEL:
 
-.PHONY: all extract reassemble example clean distclean help toolchain
+.PHONY: all extract reassemble example test clean distclean help toolchain set-toolchain
 
 all: extract reassemble
 
@@ -69,9 +78,38 @@ distclean:
 	rm -rf $(EXTRACT_PKG)/.lake $(REASSEMBLE_PKG)/.lake $(WORKERS_PKG)/.lake \
 	       $(EXAMPLE_PKG)/.lake $(BINDIR)
 
+# Run every test executable. Each `lake exe` builds its target first, so this
+# also serves as the compile check for the test roots, which `make all` (binaries
+# only) does not cover.
+#
+# The reassemble suite asserts that materialization leaves the fixture source
+# tree pristine — specifically that TestProject/.lake does NOT exist. A stale
+# fixture build tree (from someone running `lake build` in there, or an earlier
+# aborted run) therefore fails the suite with "source build cache unchanged"
+# no matter what the code does, so drop it first.
+test:
+	rm -rf $(FIXTURE_PKG)/.lake
+	cd $(EXTRACT_PKG) && lake exe resume_tests
+	cd $(EXTRACT_PKG) && lake exe decl_closure_tests
+	cd $(EXTRACT_PKG) && lake exe proof_states_tests
+	cd $(REASSEMBLE_PKG) && lake exe reassemble_tests
+
 # Fetch the pinned toolchain up front rather than mid-build.
 toolchain:
 	elan toolchain install $(TOOLCHAIN)
+
+# Repoint every package at TOOLCHAIN, e.g.
+#   make set-toolchain TOOLCHAIN=leanprover/lean4:v4.32.2
+# This is what the CI matrix calls to test a version other than the committed
+# pin; locally prefer `lake +<toolchain> build`, or a separate git worktree, since
+# both leave the checked-in files alone. Note that flipping the toolchain in place
+# invalidates every build trace (the toolchain is a trace input), so the next
+# build is a full rebuild.
+set-toolchain:
+	@for pkg in $(ALL_PKGS); do \
+	  echo "$(TOOLCHAIN)" > $$pkg/lean-toolchain; \
+	  echo "$$pkg/lean-toolchain <- $(TOOLCHAIN)"; \
+	done
 
 help:
 	@echo "Targets (Lean toolchain: $(TOOLCHAIN))"
@@ -79,6 +117,8 @@ help:
 	@echo "  extract      lean_extract only"
 	@echo "  reassemble   lean_reassemble only"
 	@echo "  example      build $(EXAMPLE_PKG)"
+	@echo "  test         run all four test executables"
 	@echo "  toolchain    install $(TOOLCHAIN) via elan"
+	@echo "  set-toolchain  repoint all packages (make set-toolchain TOOLCHAIN=...)"
 	@echo "  clean        lake clean + drop $(BINDIR)/"
 	@echo "  distclean    also remove .lake trees"

@@ -360,6 +360,13 @@ private def modeRules (cli : CliArgs) : List (Bool × String) :=
     (decl && cli.datasetCardConfig.isSome,
       "--dataset-card-config is meaningless with --decl (the card renders \
         whole-corpus statistics)"),
+    -- The grind modes read grind internals that only exist on Lean v4.31+. The
+    -- package COMPILES on older toolchains (see `Corpus.Compat`), but the
+    -- used-lemma map is empty there, which would emit `used: []` —
+    -- indistinguishable from "grind used no lemmas" rather than "not collected".
+    -- Refuse rather than write a corpus that is silently wrong.
+    ((cli.grindManifest || cli.grindInProof) && !grindSupported,
+      grindUnsupportedMsg),
     -- Flags that require a mode they were not given with.
     (cli.strictClosure && !decl,
       "--strict-closure requires --decl"),

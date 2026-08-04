@@ -6,6 +6,7 @@ Authors: Paul Govereau
 -/
 import Lean
 import Corpus.CollectCommon
+import Corpus.Compat
 import Corpus.Options
 import Corpus.Frontend
 import Corpus.Verify
@@ -196,9 +197,14 @@ against the DEFAULT strategy: build a fresh goal from the theorem type, enter
 /-- Config for data-collection grind runs: trace on (log the seq), no sorry
 (stuck stays stuck), mark instances (recover used origins), quiet. Public so the
 sibling in-proof collector (`Corpus.GrindInProof`) builds params against the
-same instrumented flags. -/
+same instrumented flags.
+
+`markInstances` only exists on v4.31+ (see `Corpus.Compat`); the pre-4.31 branch
+drops it so the module still compiles, which is sound only because the grind CLI
+modes refuse to run there. -/
 def mkGrindConfig : Grind.Config :=
-  { trace := true, useSorry := false, markInstances := true, verbose := false }
+  gatedGrind { trace := true, useSorry := false, markInstances := true, verbose := false }
+  else { trace := true, useSorry := false, verbose := false }
 
 /-- Finite per-goal grind backstop, in RAW heartbeats (the `maxHeartbeats` option
 is ×1000). This is the IN-PROCESS replacement for the killable worker: grind polls
@@ -304,7 +310,11 @@ def runGrindCore (goalTypeStr : String) (goalMVar : MVarId)
           let result ← mkResult params (failure? := none)
           let activated := result.counters.thm.toList.toArray.map
             (fun (o, c) => s!"{originLabel o}:{c}")
-          let instMap := (← getThe Grind.State).instanceMap
+          -- `Grind.State.instanceMap` is v4.31+ only. The pre-4.31 fallback is an
+          -- empty map, which would yield `used := []`; unreachable in practice
+          -- because the CLI refuses the grind modes there (`Corpus.Compat`).
+          let instMap ← gatedGrind (pure (← getThe Grind.State).instanceMap)
+            else (pure (∅ : EMatch.InstanceMap))
           -- Walk the INNER mvar grind assigned during `k` (the lambda param),
           -- NOT `goalMVar`: `withProtectedMCtx` only assigns the outer `goalMVar`
           -- AFTER this continuation returns, so at this point it is still

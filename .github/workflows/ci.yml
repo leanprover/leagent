@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to a PR makes the in-flight run redundant; matrix builds are not
+# cheap here (each entry is a full from-scratch build of five packages).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    # Supported Lean versions. These are the toolchains the tools are expected to
+    # compile and pass tests under; anything outside this list is unsupported
+    # rather than merely untested.
+    #
+    # v4.28/v4.29 build and pass the full suite, but the two grind modes
+    # (--grind-manifest, --grind-in-proof) refuse to run there: the used-lemma
+    # data they collect was only exposed in v4.31.0. `grind` in the matrix below
+    # records that expectation per entry. See lean-extract/Corpus/Compat.lean.
+    #
+    # `leanprover/lean-action` has no toolchain input: it always uses the
+    # lean-toolchain file of the checked-out tree. So each matrix entry rewrites
+    # those files (via `make set-toolchain`) before the action runs. Doing it
+    # first also gives every entry its own `.lake` cache, because the action keys
+    # that cache on a hash of lean-toolchain + lake-manifest.json.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: leanprover/lean4:v4.28.0
+            grind: unsupported
+          - toolchain: leanprover/lean4:v4.29.1
+            grind: unsupported
+          - toolchain: leanprover/lean4:v4.31.0
+            grind: supported
+          - toolchain: leanprover/lean4:v4.32.2
+            grind: supported
+
+    name: build (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin toolchain
+        run: make set-toolchain TOOLCHAIN=${{ matrix.toolchain }}
+
+      # The five packages form one lake workspace via path `require`s, but they
+      # have separate roots, so there is no single `lake build` that covers them
+      # all — hence the Makefile targets rather than lean-action's auto-config.
+      # `build: false` keeps the action for its elan setup and .lake caching only.
+      - uses: leanprover/lean-action@v1
+        with:
+          auto-config: false
+          build: false
+
+      - name: Build tools
+        run: make all
+
+      # Not covered by `make all`, which builds only the two binaries. The
+      # extractor imports the target project's .oleans, so the example must be
+      # built before the grind-gate step below can run against it.
+      # reassemble/TestProject is deliberately NOT built: the reassemble suite
+      # asserts that materialization never creates a build tree in the fixture.
+      - name: Build example project
+        run: make example
+
+      - name: Run tests
+        run: make test
+
+      # The gate is only meaningful if it actually fires, and only in the
+      # direction this entry expects. `--grind-manifest` needs --modules/--output
+      # to parse, but the version check runs before any extraction work, so a
+      # throwaway output dir is enough to reach it.
+      - name: Check grind gate (${{ matrix.grind }})
+        run: |
+          set +e
+          out=$(bin/lean_extract --modules Trees --output "$(mktemp -d)" \
+                  --source-root examples/tree-project --grind-manifest 2>&1)
+          rc=$?
+          set -e
+          echo "$out" | tail -5
+          if [ "${{ matrix.grind }}" = "unsupported" ]; then
+            if [ $rc -eq 0 ]; then
+              echo "::error::expected --grind-manifest to be refused on ${{ matrix.toolchain }}" >&2
+              exit 1
+            fi
+            case "$out" in
+              *"requires Lean v4.31.0 or newer"*) echo "refused as expected" ;;
+              *) echo "::error::failed, but not with the version refusal" >&2; exit 1 ;;
+            esac
+          else
+            case "$out" in
+              *"requires Lean v4.31.0 or newer"*)
+                echo "::error::grind wrongly refused on ${{ matrix.toolchain }}" >&2; exit 1 ;;
+              *) echo "gate correctly inactive" ;;
+            esac
+          fi
+
+      # A stale fixture build tree fails the reassemble suite, and `make test`
+      # removes it up front. If one exists here, materialization leaked into the
+      # source tree — which is exactly what that suite asserts against.
+      - name: Check fixture tree is clean
+        run: |
+          if [ -e reassemble/TestProject/.lake ]; then
+            echo "::error::reassemble/TestProject/.lake exists after tests" >&2
+            exit 1
+          fi
+
+      # The pin must not drift from the matrix; `git diff` here should only ever
+      # show lean-toolchain files, and only for non-default entries.
+      - name: Show toolchain diff
+        if: always()
+        run: git diff --stat

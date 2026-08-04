@@ -174,9 +174,13 @@ private def rerunGrindOnGoal (mvarId : MVarId) (only : Bool)
     let p ← Term.TermElabM.run' (mkGrindParams config only authorPs mvarId)
     -- Mirror the real tactic's markInstances guard (a no-op here since
     -- mkGrindConfig already sets markInstances := true, but kept for parity).
-    if grind.unusedLemmaThreshold.get (← getOptions) > 0 then
-      pure { p with config.markInstances := true }
-    else pure p
+    -- Both the option and the field are v4.31+ only, so the whole guard is gated
+    -- (see `Corpus.Compat`); pre-4.31 the params pass through untouched.
+    gatedGrind
+      (if grind.unusedLemmaThreshold.get (← getOptions) > 0 then
+        pure { p with config.markInstances := true }
+      else pure p)
+    else (pure p)
   -- Bound this VC by the finite `grindHeartbeats` backstop (same as the whole-
   -- statement path); a runaway grind degrades to `stuck`. The caller's own
   -- `tryCatchRuntimeEx` is a second net for a throw from the prologue above.
