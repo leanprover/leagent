@@ -23,6 +23,42 @@ Everything pins Lean 4.31.0 (`make toolchain` installs it via elan). Each packag
 also builds on its own with `lake build`; the Makefile only names the targets and
 gives the binaries a stable path.
 
+## Prebuilt binaries
+
+Both tools are published as GitHub release assets, named
+`lean_extract-<lean-version>` / `lean_reassemble-<lean-version>`. Take the pair
+matching your project's `lean-toolchain`: the binaries run the target project's
+Lean, so the versions must agree.
+
+| Release | Tag | Stability |
+|---|---|---|
+| Rolling | `latest` | Rebuilt and **replaced** on every push to `main` |
+| Versioned | `vX.Y.Z` | Immutable — safe to pin |
+
+Use `latest` to track main. Use a versioned release when something needs to
+depend on a known build:
+
+```bash
+# pinned — these bytes never change
+curl -sSfLO https://github.com/leanprover/leagent/releases/download/v0.1.0/lean_extract-v4.31.0
+
+# whatever is on main right now
+curl -sSfLO https://github.com/leanprover/leagent/releases/download/latest/lean_extract-v4.31.0
+```
+
+Every release records the commit it was built from and a `SHA256SUMS` asset, so a
+download can be verified and traced back to source.
+
+To cut a versioned release, push a tag — or run the Release workflow manually and
+give it a tag name:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The workflow refuses to overwrite an existing versioned release, so a published
+version can never change underneath a consumer.
+
 ## Supported Lean versions
 
 | Toolchain | Build + tests | `--grind-manifest`, `--grind-in-proof` |

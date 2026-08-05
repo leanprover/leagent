@@ -1,27 +1,95 @@
 # Build lean_extract + lean_reassemble for each supported toolchain and publish
-# them to a rolling "latest" pre-release on every push to main. The release is
-# replaced (not appended), so there is always exactly one set of assets and it
-# always reflects the current main.
+# them as GitHub release assets. Two kinds of release, one workflow:
 #
-# Assets are named `lean_extract-<slug>` / `lean_reassemble-<slug>` so a consumer
-# can download the pair for the toolchain their project uses. The binaries are
-# statically linked against libc — no Lean shared libraries — but at RUNTIME the
-# extractor drives Lean's frontend in-process, so users still need the matching
-# toolchain installed (elan handles this from their project's lean-toolchain).
+#   push to main   -> rolling `latest` pre-release, assets replaced each time.
+#                     Always current, but its contents change under you.
+#   push tag vX.Y.Z -> immutable versioned release. Never rewritten, so a
+#                     consumer can pin a URL and get the same bytes forever.
+#
+# Use `latest` to track main; use a version tag when something needs to depend on
+# a known build. Both carry the same asset set.
+#
+# Assets are named `lean_extract-<lean-version>` / `lean_reassemble-<lean-version>`
+# so a consumer can take the pair matching their project's lean-toolchain. The
+# binaries link only libc, but at RUNTIME the extractor drives Lean's frontend
+# in-process, so the matching toolchain must be installed.
 
 name: Release
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag to create and release (e.g. v0.1.0). Leave empty to refresh `latest`.'
+        required: false
+        type: string
 
+# Rolling releases may cancel each other — only the newest main matters. Tagged
+# releases must never be cancelled: a half-published immutable release is worse
+# than a slow one. Keying the group on the ref keeps tags in their own lanes.
 concurrency:
-  group: release
-  cancel-in-progress: true
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 jobs:
+  # Resolve what we are publishing before spending four build jobs on it.
+  #
+  #   kind=rolling   -> tag `latest`, prerelease, assets replaced
+  #   kind=versioned -> tag vX.Y.Z, real release, refuse to overwrite
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.plan.outputs.kind }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            kind=versioned
+            tag="${{ github.ref_name }}"
+          elif [ -n "$INPUT_TAG" ]; then
+            kind=versioned
+            tag="$INPUT_TAG"
+          else
+            kind=rolling
+            tag=latest
+          fi
+
+          if [ "$kind" = versioned ]; then
+            # Semver-ish shape check. Cheap, and it catches a typo before four
+            # build jobs and a public release.
+            case "$tag" in
+              v[0-9]*.[0-9]*.[0-9]*) ;;
+              *) echo "::error::tag '$tag' must look like vX.Y.Z" >&2; exit 1 ;;
+            esac
+            # An immutable release must not be silently replaced. `gh release
+            # view` is the check that matters — a tag with no release is fine
+            # (someone may have tagged first), a release that already exists is
+            # not.
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "::error::release $tag already exists; pick a new version" >&2
+              exit 1
+            fi
+          fi
+
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"   >> "$GITHUB_OUTPUT"
+          echo "publishing $kind release: $tag"
+
   build:
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +141,7 @@ jobs:
           retention-days: 1
 
   release:
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -88,42 +156,104 @@ jobs:
           pattern: binaries-*
           merge-multiple: true
 
-      - name: List assets
-        run: ls -lh dist/
+      # A release with a missing asset is worse than a failed workflow: consumers
+      # pin URLs against it. Four toolchains x two binaries.
+      - name: Verify asset set
+        run: |
+          set -euo pipefail
+          ls -lh dist/
+          missing=0
+          for slug in v4.28.0 v4.29.1 v4.31.0 v4.32.2; do
+            for tool in lean_extract lean_reassemble; do
+              if [ ! -s "dist/$tool-$slug" ]; then
+                echo "::error::missing or empty asset: $tool-$slug" >&2
+                missing=1
+              fi
+            done
+          done
+          [ "$missing" = 0 ] || exit 1
+          count=$(find dist -type f | wc -l)
+          [ "$count" = 8 ] || { echo "::error::expected 8 assets, found $count" >&2; exit 1; }
 
-      - name: Publish rolling release
+      # Checksums let a consumer verify a download, and give the release notes a
+      # stable record of exactly which bytes shipped under this tag.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum lean_* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Compose release notes
+        env:
+          KIND: ${{ needs.plan.outputs.kind }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          {
+            if [ "$KIND" = rolling ]; then
+              echo "Rolling pre-release built from the latest \`main\` commit."
+              echo
+              echo "**These assets are replaced on every push to main.** If you need bytes"
+              echo "that will not change, use a versioned release instead (\`vX.Y.Z\`)."
+            else
+              echo "Versioned release \`$TAG\`. These assets are immutable — safe to pin."
+            fi
+            echo
+            echo "**Commit:** \`$SHA\`"
+            echo
+            echo "## Assets"
+            echo
+            echo "| Lean toolchain | Extractor | Reassembler |"
+            echo "|---|---|---|"
+            for slug in v4.28.0 v4.29.1 v4.31.0 v4.32.2; do
+              echo "| $slug | \`lean_extract-$slug\` | \`lean_reassemble-$slug\` |"
+            done
+            echo
+            echo "Download the pair matching your project's \`lean-toolchain\`; the binaries"
+            echo "run the target project's Lean, so the versions must agree. The grind modes"
+            echo "(\`--grind-manifest\`, \`--grind-in-proof\`) need v4.31.0 or newer — earlier"
+            echo "builds refuse those two modes at startup and exit non-zero."
+            echo
+            echo "## Checksums"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KIND: ${{ needs.plan.outputs.kind }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
-          # Delete the existing release if present (gh release edit cannot
-          # replace assets atomically).
-          gh release delete latest --yes 2>/dev/null || true
-          git tag -f latest
-          git push origin latest --force
+          set -euo pipefail
 
-          gh release create latest dist/* \
-            --title "Latest ($(date -u +%Y-%m-%d))" \
-            --notes "$(cat <<'EOF'
-          Rolling pre-release from the latest \`main\` commit.
+          if [ "$KIND" = rolling ]; then
+            # Replace, not append: `gh release edit` cannot swap the asset set
+            # atomically, so delete and recreate. The tag is moved to this commit
+            # because nothing pins `latest` for its commit identity — it is a
+            # download anchor, and pointing it at older code would be a lie.
+            gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+            git tag -f "$TAG"
+            git push origin "$TAG" --force
+            gh release create "$TAG" dist/* \
+              --title "Latest — $(date -u +%Y-%m-%d)" \
+              --notes-file notes.md \
+              --prerelease
+          else
+            # Create the tag only if the push did not already carry it (the
+            # workflow_dispatch path). Never force: an immutable release must not
+            # be able to change what it points at.
+            if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              git tag "$TAG"
+              git push origin "$TAG"
+            fi
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --notes-file notes.md
+          fi
 
-          **Commit:** ${{ github.sha }}
-
-          **Assets per toolchain:**
-
-          | Toolchain | lean\_extract | lean\_reassemble |
-          |---|---|---|
-          | v4.28.0 | \`lean_extract-v4.28.0\` | \`lean_reassemble-v4.28.0\` |
-          | v4.29.1 | \`lean_extract-v4.29.1\` | \`lean_reassemble-v4.29.1\` |
-          | v4.31.0 | \`lean_extract-v4.31.0\` | \`lean_reassemble-v4.31.0\` |
-          | v4.32.2 | \`lean_extract-v4.32.2\` | \`lean_reassemble-v4.32.2\` |
-
-          Download the pair matching your project's \`lean-toolchain\`. The binaries
-          run standalone (only libc), but at runtime the extractor drives Lean's
-          frontend, so the matching toolchain must be installed (\`elan\` handles this).
-
-          The grind modes (\`--grind-manifest\`, \`--grind-in-proof\`) require v4.31.0 or
-          newer; pre-4.31 builds refuse those modes at startup with an explanatory
-          message.
-          EOF
-          )" \
-            --prerelease
+          echo "published: $(gh release view "$TAG" --json url --jq .url)"
