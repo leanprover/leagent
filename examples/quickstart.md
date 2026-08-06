@@ -255,6 +255,86 @@ elan run leanprover/lean4:v4.31.0 lean -R "$TASK/src" "$TASK/src/Trees/Mirror.le
 Silent, exit 0. That round trip — extract a theorem, hole it, fill it, check it —
 is the whole point of the pipeline.
 
+### Per-theorem manifest
+
+The runs above apply one action to every theorem. A `--manifest` overrides that per
+theorem: it is a sparse map from theorem name to `keep | sorry | delete`, and any
+theorem it does not name follows `--proofs`. Use it to keep some proofs, hole
+others, and drop the ones you do not want in the artifact at all.
+
+```sh
+cat > /tmp/demo-trees/manifest.json <<'JSON'
+{
+  "format": "lean-reassemble-manifest.v1",
+  "theorems": {
+    "Trees.Tree.total_mirror": "delete",
+    "Trees.Tree.mirror_mirror": "keep"
+  }
+}
+JSON
+
+./bin/lean_reassemble materialize-repo \
+    --source-root ./examples/tree-project \
+    --records     /tmp/demo-trees/plain/data/theorems/train.jsonl \
+    --output      /tmp/demo-trees/reasm/manifest-repo \
+    --manifest    /tmp/demo-trees/manifest.json
+```
+
+Succeeds silently. `total_mirror` is erased, `mirror_mirror` keeps its real proof,
+and the other seven are holed by the `--proofs sorry` default:
+
+```python
+import json
+m = json.load(open("/tmp/demo-trees/reasm/manifest-repo/manifest.json"))
+print(m["verification"], m["rewrite_summary"])
+```
+
+```text
+{'status': 'passed'} {'skipped': 0, 'replaced': 7, 'proof_mode': 'sorry', 'preserved': 1, 'failed': 0, 'eligible': 9, 'deleted': 1}
+```
+
+`delete` does no dependency analysis — `total_mirror` is safe to drop only because
+nothing else references it. Deleting a lemma others build on would break the build,
+and that is on you to avoid. The build shows one warning per holed theorem, none
+for the kept one, and no trace of the deleted one:
+
+```sh
+cd /tmp/demo-trees/reasm/manifest-repo/repos/tree-project && lake build
+```
+
+```text
+warning: Trees/Basic.lean:29:8: declaration uses `sorry`
+…
+Build completed successfully (7 jobs).
+```
+
+Seven `sorry` warnings — `mirror_mirror` at `Basic.lean:33` is silent (kept), and
+`total_mirror` is gone entirely.
+
+### Backing off on failure
+
+`--on-failure` decides what happens when a theorem cannot be reassembled — its
+recorded body no longer matches the source, say, after the project moved on.
+`fail` (the default) aborts the whole run; `skip` leaves that theorem untouched and
+records it; `backoff` deletes it and continues. Both let a run finish past a bad
+theorem instead of stopping at the first one:
+
+```sh
+./bin/lean_reassemble materialize-repo \
+    --source-root ./examples/tree-project \
+    --records     /tmp/demo-trees/plain/data/theorems/train.jsonl \
+    --output      /tmp/demo-trees/reasm/backoff-repo \
+    --on-failure  backoff
+```
+
+With records that match the source, nothing fails, so this is identical to the
+plain repo run — `failed` and `skipped` stay `0`. The policy only changes the
+outcome when a theorem genuinely fails to plan: `skip` bumps `skipped`, `backoff`
+bumps `failed` and drops the theorem from the artifact. A post-rewrite `lake build`
+break still aborts under every policy, because that break lands on a *dependent* of
+a holed or deleted theorem rather than on the theorem itself — there is no safe
+declaration to attribute it to.
+
 ## Data interpretation
 
 

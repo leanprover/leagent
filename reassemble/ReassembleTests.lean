@@ -186,6 +186,89 @@ private def testKeepProofs (result : Corpus.Frontend.ElabResult)
   let sorried ← LeanReassemble.applyEdits result.source sorryEdits
   assertIO (kept != sorried) "keep and sorry produced the same output"
 
+/-- `--proofs delete` erases the WHOLE declaration, not just the proof. Each delete
+edit's range must cover the command (so its slice starts at the `theorem`/attribute
+keyword and ends past the proof), the replacement must be empty, and applying the
+edits must leave none of the deleted names in the output. -/
+private def testDeleteProofs (result : Corpus.Frontend.ElabResult)
+    (records : Array Corpus.ConstRecord) : IO Unit := do
+  let selected ← LeanReassemble.selectTheorems records result.file.relPath
+  let deleteEdits ← LeanReassemble.planEdits result selected .delete
+  assertIO (deleteEdits.size == selected.size) "delete plans one edit per theorem"
+  for edit in deleteEdits do
+    assertIO (edit.replacement == "") s!"delete replacement empty for {edit.declaration}"
+    -- The command range is wider than a proof range: it includes the signature, so
+    -- the slice contains the declared name.
+    let slice := rangeSource result.source edit
+    let short := edit.declaration.splitOn "." |>.getLast!
+    assertIO (slice.contains short)
+      s!"delete range covers the declaration for {edit.declaration}"
+  let deleted ← LeanReassemble.applyEdits result.source deleteEdits
+  -- Every deleted theorem's `theorem <name>` header is gone from the output.
+  for record in selected do
+    let short := record.name.splitOn "." |>.getLast!
+    assertIO (!deleted.contains s!"theorem {short}")
+      s!"deleted declaration {record.name} still present"
+  assertIO (deleted != result.source) "delete produced unchanged source"
+
+/-- The manifest is a sparse override: named theorems take its action, the rest
+follow the default. Planning with a resolver must select the right range machinery
+per theorem (delete → whole command; keep/sorry → proof range). -/
+private def testManifestOverride (result : Corpus.Frontend.ElabResult)
+    (records : Array Corpus.ConstRecord) : IO Unit := do
+  let selected ← LeanReassemble.selectTheorems records result.file.relPath
+  -- Delete one theorem, keep another; the remainder default to sorry.
+  let deleteName := "ReassemblyFixture.termProof"
+  let keepName := "ReassemblyFixture.tacticProof"
+  let json := Lean.Json.mkObj [("theorems", Lean.Json.mkObj [
+    (deleteName, Lean.Json.str "delete"), (keepName, Lean.Json.str "keep")])]
+  let manifest ← match LeanReassemble.Manifest.fromJson? json with
+    | .ok m => pure m
+    | .error e => throw <| IO.userError s!"manifest parse failed: {e}"
+  let modeFor := fun name => manifest.actionFor name .replace
+  let edits ← LeanReassemble.planEdits result selected .replace modeFor
+  assertIO (edits.size == selected.size) "manifest plans one edit per theorem"
+  for edit in edits do
+    let slice := rangeSource result.source edit
+    if edit.declaration == deleteName then
+      assertIO (edit.replacement == "" && slice.contains "termProof")
+        "manifest delete override erases the declaration"
+    else if edit.declaration == keepName then
+      assertIO (edit.replacement == edit.expected)
+        "manifest keep override preserves the proof"
+    else
+      assertIO (edit.replacement.contains "sorry")
+        s!"manifest default (sorry) for {edit.declaration}"
+  -- Typo guard: a manifest key naming no eligible theorem is rejected.
+  let eligible := Std.HashSet.ofArray (selected.map (·.name))
+  expectFailure "manifest typo guard" do
+    let bogus ← match LeanReassemble.Manifest.fromJson?
+      (Lean.Json.mkObj [("theorems", Lean.Json.mkObj [("No.Such.Thm", Lean.Json.str "keep")])]) with
+      | .ok m => pure m
+      | .error e => throw <| IO.userError e
+    bogus.validateKeys eligible
+
+/-- `planEditsCollecting` collects per-record failures instead of aborting — the
+foundation of `--on-failure skip|backoff`. A record whose body disagrees with the
+source is reported as a failure while its well-formed siblings still plan. -/
+private def testCollectingFailures (result : Corpus.Frontend.ElabResult)
+    (records : Array Corpus.ConstRecord) : IO Unit := do
+  let selected ← LeanReassemble.selectTheorems records result.file.relPath
+  assertIO (selected.size ≥ 2) "fixture has at least two theorems"
+  -- Corrupt one record's body so exactly it fails to plan.
+  let victim := selected[0]!.name
+  let corrupted := selected.map fun r =>
+    if r.name == victim then { r with body := some "by\n  admit -- wrong body" } else r
+  let outcome ← LeanReassemble.planEditsCollecting result corrupted .replace
+  assertIO (outcome.failures.size == 1) "exactly one record failed to plan"
+  assertIO (outcome.failures[0]!.1 == victim) "the corrupted record is the failure"
+  assertIO (outcome.edits.size == selected.size - 1) "every other record still planned"
+  -- Backoff retries the failed record as a delete, which succeeds (declaration exists).
+  let retry ← LeanReassemble.planEditsCollecting result
+    (corrupted.filter (·.name == victim)) .delete
+  assertIO (retry.edits.size == 1 && retry.edits[0]!.replacement == "")
+    "backoff re-plans the failed record as a delete"
+
 private def testManifestParity (result : Corpus.Frontend.ElabResult)
     (records : Array Corpus.ConstRecord) : IO Unit := do
   let shared := Corpus.SourceSyntax.buildSourceMap result.source result.commands
@@ -338,11 +421,64 @@ private unsafe def testMaterializers : IO Unit := do
     removeDirIfExists unitsOutput
     removeDirIfExists movedOutput
 
+/-- End-to-end failure policy over the buildable `TestProject`. One record's body
+is corrupted so it cannot plan; the whole artifact then hinges on `--on-failure`:
+`fail` aborts, `skip` leaves that theorem's proof intact, `backoff` deletes it.
+Each surviving artifact must still `lake build`. -/
+private unsafe def testFailurePolicies : IO Unit := do
+  let pid ← IO.Process.getPID
+  let sourceRoot : System.FilePath := "TestProject"
+  let sourcePath := sourceRoot / "Fixture" / "Basic.lean"
+  let original ← IO.FS.readFile sourcePath
+  -- Corrupt `Fixture.first`'s body; `Fixture.second` stays well-formed. `first` is a
+  -- leaf, so deleting it keeps the project buildable.
+  let records ← LeanReassemble.readRecords (sourceRoot / "records.jsonl")
+  let corrupted := records.map fun r =>
+    if r.name == "Fixture.first" then { r with body := some "by\n  admit" } else r
+  let recordsPath : System.FilePath := s!"/tmp/lean-reassemble-badrecords-{pid}.jsonl"
+  Corpus.Artifact.writeJsonl recordsPath corrupted
+  let skipOut : System.FilePath := s!"/tmp/lean-reassemble-skip-{pid}"
+  let backoffOut : System.FilePath := s!"/tmp/lean-reassemble-backoff-{pid}"
+  let failOut : System.FilePath := s!"/tmp/lean-reassemble-failpolicy-{pid}"
+  removeDirIfExists skipOut
+  removeDirIfExists backoffOut
+  removeDirIfExists failOut
+  try
+    -- `fail` (default) aborts on the corrupted record.
+    expectFailure "on-failure fail aborts" do
+      LeanReassemble.materializeRepo { sourceRoot, records := recordsPath, output := failOut }
+    -- `skip`: `first` keeps its real proof; `second` is sorried; project builds.
+    LeanReassemble.materializeRepo {
+      sourceRoot, records := recordsPath, output := skipOut, onFailure := .skip }
+    let skipFile ← IO.FS.readFile (skipOut / "repos" / "TestProject" / "Fixture" / "Basic.lean")
+    assertIO (skipFile.contains "trivial") "skip keeps the failed theorem's real proof"
+    assertIO (skipFile.contains "sorry") "skip still sorries the good theorem"
+    assertIO (← (skipOut / "repos" / "TestProject" / ".lake" / "build" / "lib" / "lean" /
+      "Fixture" / "Basic.olean").pathExists) "skip artifact builds"
+    -- `backoff`: `first` is deleted; project still builds.
+    LeanReassemble.materializeRepo {
+      sourceRoot, records := recordsPath, output := backoffOut, onFailure := .backoff }
+    let backoffFile ← IO.FS.readFile
+      (backoffOut / "repos" / "TestProject" / "Fixture" / "Basic.lean")
+    assertIO (!backoffFile.contains "theorem first") "backoff deletes the failed theorem"
+    assertIO (backoffFile.contains "sorry") "backoff still sorries the good theorem"
+    assertIO (← (backoffOut / "repos" / "TestProject" / ".lake" / "build" / "lib" / "lean" /
+      "Fixture" / "Basic.olean").pathExists) "backoff artifact builds"
+    assertIO ((← IO.FS.readFile sourcePath) == original) "source tree unchanged by policies"
+  finally
+    removeDirIfExists skipOut
+    removeDirIfExists backoffOut
+    removeDirIfExists failOut
+    if ← recordsPath.pathExists then IO.FS.removeFile recordsPath
+
 unsafe def run : IO Unit := do
   let result ← fixtureResult
   let records ← LeanReassemble.readRecords "TestFixtures/records.jsonl"
   testRewritePlan result records
   testKeepProofs result records
+  testDeleteProofs result records
+  testManifestOverride result records
+  testCollectingFailures result records
   testManifestParity result records
   testFailures result records
   let output := "/tmp/lean-reassemble-rewrite-test.lean"
@@ -368,6 +504,7 @@ unsafe def run : IO Unit := do
   let original ← IO.FS.readFile "TestFixtures/RewriteFixture.lean"
   assertIO (keptFile == original) "end-to-end keep output matches the source file"
   testMaterializers
+  testFailurePolicies
   IO.println "reassemble tests passed"
 
 end ReassembleTests

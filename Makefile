@@ -133,6 +133,20 @@ endif
 	    --source-root ./$(EXAMPLE_PKG) \
 	    --records $(ARTIFACTS_DIR)/decl/Trees.Tree.total_mirror/data/target.jsonl \
 	    --output $(ARTIFACTS_DIR)/reasm/decl-unit
+	@echo "=== reassemble: per-theorem manifest (delete + keep + default sorry)"
+	printf '{"format":"lean-reassemble-manifest.v1","theorems":{"Trees.Tree.total_mirror":"delete","Trees.Tree.mirror_mirror":"keep"}}' \
+	    > $(ARTIFACTS_DIR)/manifest.json
+	./$(BINDIR)/lean_reassemble materialize-repo \
+	    --source-root ./$(EXAMPLE_PKG) \
+	    --records $(ARTIFACTS_DIR)/plain/data/theorems/train.jsonl \
+	    --manifest $(ARTIFACTS_DIR)/manifest.json \
+	    --output $(ARTIFACTS_DIR)/reasm/manifest-repo
+	@echo "=== reassemble: repo with --on-failure backoff (clean records: no-op)"
+	./$(BINDIR)/lean_reassemble materialize-repo \
+	    --source-root ./$(EXAMPLE_PKG) \
+	    --records $(ARTIFACTS_DIR)/plain/data/theorems/train.jsonl \
+	    --on-failure backoff \
+	    --output $(ARTIFACTS_DIR)/reasm/backoff-repo
 	@echo "=== artifacts in $(ARTIFACTS_DIR)"
 
 # `lake clean` leaves the toolchain and any fetched packages in place.

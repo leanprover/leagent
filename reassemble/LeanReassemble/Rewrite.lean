@@ -10,25 +10,54 @@ namespace LeanReassemble
 
 open Lean
 
-/-- What to do with each selected theorem's proof.
+/-- What to do with each selected theorem.
 
 `keep` is not a way of skipping the rewriter — it runs the SAME pipeline
 (match records to declarations, agree on the proof range, check the recorded
 `body` against the source) and only substitutes the original text for the
 `sorry`. So a `keep` artifact is a *verified reference state*: proof of the
-correspondence between records and source, in compilable form. -/
+correspondence between records and source, in compilable form.
+
+`delete` is the only mode that touches more than a proof: it erases the whole
+declaration (doc comment, attributes, signature, and value). It carries no
+`body` obligation — there is nothing to preserve — and removing a name that other
+declarations reference will break the build. That is the caller's responsibility;
+the reassembler does no dependency analysis. -/
 inductive ProofMode where
   /-- Replace each selected proof with `by sorry` (the default). -/
   | replace
   /-- Preserve each selected proof verbatim; output is byte-identical to source. -/
   | keep
+  /-- Erase the whole declaration from the source. -/
+  | delete
   deriving Inhabited, BEq
 
 def ProofMode.toString : ProofMode → String
   | .replace => "sorry"
   | .keep    => "keep"
+  | .delete  => "delete"
 
 instance : ToString ProofMode := ⟨ProofMode.toString⟩
+
+/-- What to do when a theorem cannot be reassembled (it fails to match, its body
+disagrees with the source, or the artifact it produces does not verify). -/
+inductive FailurePolicy where
+  /-- Abort the whole run on the first failure (the default, historical behavior). -/
+  | fail
+  /-- Omit the failing theorem from the artifact and record it in `skipped`. In
+  repo mode this leaves the theorem's original proof in place; in units mode it
+  emits no task. -/
+  | skip
+  /-- Degrade the failing theorem to `delete`, record it in `failed`, and retry. -/
+  | backoff
+  deriving Inhabited, BEq
+
+def FailurePolicy.toString : FailurePolicy → String
+  | .fail    => "fail"
+  | .skip    => "skip"
+  | .backoff => "backoff"
+
+instance : ToString FailurePolicy := ⟨FailurePolicy.toString⟩
 
 structure RewriteConfig where
   sourceRoot : System.FilePath
@@ -36,6 +65,10 @@ structure RewriteConfig where
   file : String
   output : System.FilePath
   proofMode : ProofMode := .replace
+  /-- Optional per-theorem action overrides; absent theorems use `proofMode`. -/
+  manifestPath : Option System.FilePath := none
+  /-- What to do when a theorem fails to reassemble. -/
+  onFailure : FailurePolicy := .fail
 
 structure Edit where
   declaration : String
@@ -137,6 +170,7 @@ private def replacementFor (mode : ProofMode)
     (kind : Corpus.SourceSyntax.DeclValueKind) (indent original : String) : String :=
   match mode with
   | .keep => original
+  | .delete => ""  -- unused: delete replaces the whole command range, see `planEdits`.
   | .replace =>
     let proof := s!"by\n{indent}  sorry"
     match kind with
@@ -160,14 +194,50 @@ def validateEdits (source : String) (edits : Array Edit) : IO Unit := do
     if current.range.start.byteIdx < previous.range.stop.byteIdx then
       fail s!"overlapping proof ranges for {previous.declaration} and {current.declaration}"
 
-/-- Match records to declarations and compute non-overlapping source edits. -/
-def planEdits (frontendResult : Corpus.Frontend.ElabResult)
-    (records : Array Corpus.ConstRecord) (mode : ProofMode := .replace)
-    : IO (Array Edit) := do
-  let candidates ← declarationCandidates frontendResult
-  let mut edits := #[]
-  let mut matchedKeys : Std.HashSet (Nat × Nat) := {}
-  for record in records do
+/-- Compute the single edit for one record's matched declaration `command`.
+
+`.delete` erases the whole command (`commandRange?`) and carries no `body`
+obligation. `.keep`/`.replace` operate on the proof range and verify the recorded
+`body` against the source slice, so a wrong range is caught here rather than by the
+build. -/
+private def planEdit (source : String) (command : Syntax) (record : Corpus.ConstRecord)
+    (mode : ProofMode) : IO Edit := do
+  match mode with
+  | .delete =>
+    let some range := Corpus.SourceSyntax.commandRange? command
+      | fail s!"declaration syntax range not found for {record.name}"
+    let expected := String.Pos.Raw.extract source range.start range.stop
+    return { declaration := record.name, range, expected, replacement := "" }
+  | .keep | .replace =>
+    let some (kind, range) := Corpus.SourceSyntax.proofRange? command
+      | fail s!"proof syntax not found for {record.name}"
+    let expected := String.Pos.Raw.extract source range.start range.stop
+    if let some body := record.body then
+      if expected.trimAsciiEnd.toString != body then
+        fail s!"record body does not match source proof for {record.name}"
+    return {
+      declaration := record.name
+      range
+      expected
+      replacement := replacementFor mode kind (commandIndent source command) expected
+    }
+
+/-- The result of planning a set of records against one file. `edits` are the
+records that matched and planned; `failures` pairs each record that could not be
+planned with the reason. The strict `planEdits` throws on the first failure; the
+resilient policies (`skip`/`backoff`) inspect `failures` instead. -/
+structure PlanOutcome where
+  edits : Array Edit
+  failures : Array (String × String)
+
+/-- Plan the edit for one record against `candidates`, returning either the edit
+and the declaration key it matched, or an attributable failure reason. Never
+throws for a per-record problem — that is what makes it usable under `skip`. -/
+private def planOneRecord (frontendResult : Corpus.Frontend.ElabResult)
+    (candidates : Array Candidate) (matchedKeys : Std.HashSet (Nat × Nat))
+    (record : Corpus.ConstRecord) (mode : ProofMode)
+    : IO (Except String (Edit × (Nat × Nat))) := do
+  try
     if record.module != frontendResult.file.module.toString then
       fail s!"record module does not match source file for {record.name}"
     let matchingCandidates := candidates.filter fun candidate =>
@@ -181,25 +251,55 @@ def planEdits (frontendResult : Corpus.Frontend.ElabResult)
     let candidate := matchingCandidates[0]!
     if matchedKeys.contains candidate.key then
       fail s!"multiple records matched declaration {record.name}"
-    matchedKeys := matchedKeys.insert candidate.key
     let some command :=
         commandForKey? frontendResult.source frontendResult.commands candidate.key
       | fail s!"declaration syntax not found for {record.name}"
-    let some (kind, range) := Corpus.SourceSyntax.proofRange? command
-      | fail s!"proof syntax not found for {record.name}"
-    let expected := String.Pos.Raw.extract frontendResult.source range.start range.stop
-    if let some body := record.body then
-      if expected.trimAsciiEnd.toString != body then
-        fail s!"record body does not match source proof for {record.name}"
-    edits := edits.push {
-      declaration := record.name
-      range
-      expected
-      replacement := replacementFor mode kind
-        (commandIndent frontendResult.source command) expected
-    }
+    let edit ← planEdit frontendResult.source command record mode
+    return .ok (edit, candidate.key)
+  catch error =>
+    -- Strip the shared prefix so a collected reason reads cleanly in a report.
+    let message := error.toString
+    return .error ((message.dropPrefix "lean-reassemble: ").copy)
+
+/-- Match records to declarations and compute non-overlapping source edits,
+collecting per-record failures rather than aborting on the first.
+
+`mode` is the run's default action; `modeFor` overrides it per record name (the
+manifest hook). Cross-record invariants — one record per declaration, no
+overlapping ranges — are still enforced over the records that DID plan. -/
+def planEditsCollecting (frontendResult : Corpus.Frontend.ElabResult)
+    (records : Array Corpus.ConstRecord) (mode : ProofMode := .replace)
+    (modeFor : String → ProofMode := fun _ => mode)
+    : IO PlanOutcome := do
+  let candidates ← declarationCandidates frontendResult
+  let mut edits := #[]
+  let mut failures := #[]
+  let mut matchedKeys : Std.HashSet (Nat × Nat) := {}
+  for record in records do
+    match ← planOneRecord frontendResult candidates matchedKeys record (modeFor record.name) with
+    | .ok (edit, key) =>
+      matchedKeys := matchedKeys.insert key
+      edits := edits.push edit
+    | .error reason => failures := failures.push (record.name, reason)
   validateEdits frontendResult.source edits
-  return edits
+  return { edits, failures }
+
+/-- Match records to declarations and compute non-overlapping source edits.
+
+`mode` is the run's default action. `modeFor`, when given, overrides it per record
+name — this is the manifest hook: the resolver returns the manifest's action for a
+named theorem or the default for everything else.
+
+Strict: the first record that fails to plan aborts the whole call. Callers that
+tolerate failures use `planEditsCollecting` instead. -/
+def planEdits (frontendResult : Corpus.Frontend.ElabResult)
+    (records : Array Corpus.ConstRecord) (mode : ProofMode := .replace)
+    (modeFor : String → ProofMode := fun _ => mode)
+    : IO (Array Edit) := do
+  let outcome ← planEditsCollecting frontendResult records mode modeFor
+  if let some (_, reason) := outcome.failures[0]? then
+    fail reason
+  return outcome.edits
 
 /-- Apply validated byte-range edits in one left-to-right pass. -/
 def applyEdits (source : String) (edits : Array Edit) : IO String := do
@@ -275,11 +375,13 @@ unsafe def prepareSourceFile (sourceRoot : System.FilePath) (file : String)
     fail s!"frontend elaboration failed for {sourcePath}"
   return { sourceAbs, relFile, moduleName, frontendResult }
 
-/-- Rewrite an already-prepared file for a given set of records. -/
+/-- Rewrite an already-prepared file for a given set of records. `modeFor` is the
+per-record action resolver (see `planEdits`); it defaults to the flat `mode`. -/
 def rewritePreparedFile (prepared : PreparedFile)
     (selected : Array Corpus.ConstRecord) (mode : ProofMode := .replace)
-    (validate : Bool := true) : IO RewriteResult := do
-  let edits ← planEdits prepared.frontendResult selected mode
+    (validate : Bool := true) (modeFor : String → ProofMode := fun _ => mode)
+    : IO RewriteResult := do
+  let edits ← planEdits prepared.frontendResult selected mode modeFor
   let rewritten ← applyEdits prepared.frontendResult.source edits
   if validate then
     validateWithWorker prepared.sourceAbs rewritten
@@ -289,26 +391,10 @@ def rewritePreparedFile (prepared : PreparedFile)
 /-- Rewrite one source file for every record that belongs to it. -/
 unsafe def rewriteSourceFile (sourceRoot : System.FilePath)
     (records : Array Corpus.ConstRecord) (file : String)
-    (mode : ProofMode := .replace) : IO RewriteResult := do
+    (mode : ProofMode := .replace) (modeFor : String → ProofMode := fun _ => mode)
+    : IO RewriteResult := do
   let prepared ← prepareSourceFile sourceRoot file
   rewritePreparedFile prepared (← selectTheorems records prepared.relFile) mode
-
-/-- Rewrite one source file and validate the edited document before writing it. -/
-unsafe def rewriteFile (config : RewriteConfig) : IO Unit := do
-  let cwd ← IO.currentDir
-  let output :=
-    if config.output.isAbsolute then config.output else cwd / config.output
-  let outputAbs := output.normalize
-  let result ← rewriteSourceFile config.sourceRoot (← readRecords config.records)
-    config.file config.proofMode
-  if outputAbs.toString == result.sourcePath.toString then
-    fail "output path must differ from the source file"
-  if ← outputAbs.pathExists then
-    let resolvedOutput ← IO.FS.realPath outputAbs
-    if resolvedOutput.toString == result.sourcePath.toString then
-      fail "output path must not resolve to the source file"
-  if let some parent := outputAbs.parent then
-    IO.FS.createDirAll parent
-  IO.FS.writeFile outputAbs result.text
+    (modeFor := modeFor)
 
 end LeanReassemble

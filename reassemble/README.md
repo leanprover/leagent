@@ -9,19 +9,22 @@ lake exe lean_reassemble rewrite-file \
   --records <records.jsonl> \
   --file <project-relative.lean> \
   --output <rewritten.lean> \
-  [--proofs sorry|keep]
+  [--proofs sorry|keep|delete] [--manifest <manifest.json>] \
+  [--on-failure fail|skip|backoff]
 
 lake exe lean_reassemble materialize-repo \
   --source-root <lake-project> \
   --records <records.jsonl> \
   --output <artifact-dir> \
-  [--build-target <target>] [--proofs sorry|keep]
+  [--build-target <target>] [--proofs sorry|keep|delete] \
+  [--manifest <manifest.json>] [--on-failure fail|skip|backoff]
 
 lake exe lean_reassemble materialize-units \
   --source-root <lake-project> \
   --records <records.jsonl> \
   --output <artifact-dir> \
-  [--build-target <target>] [--proofs sorry|keep]
+  [--build-target <target>] [--proofs sorry|keep|delete] \
+  [--manifest <manifest.json>] [--on-failure fail|skip|backoff]
 ```
 
 Run these from `leagent/reassemble`. The source root must be a Lake project with
@@ -41,12 +44,17 @@ pass it only the theorems you want sorried.
 
 ## Proof Modes
 
-`--proofs` controls what happens to each selected theorem's proof:
+`--proofs` sets the default action for every selected theorem:
 
 | Mode | Effect |
 |---|---|
 | `sorry` (default) | Replace the proof with `by sorry` — the training/eval artifact. |
 | `keep` | Preserve the proof verbatim — the compilable **reference state**. |
+| `delete` | Erase the whole declaration (doc comment, attributes, signature, value). |
+
+`delete` does **no dependency analysis**: removing a theorem that other
+declarations reference will break the build. Keeping the manifest consistent is the
+caller's responsibility.
 
 `keep` is not a bypass. It runs the identical pipeline — match each record to
 exactly one declaration, obtain the proof range from parsed `Syntax`, check the
@@ -75,13 +83,57 @@ Under `keep`, unit verification is *stricter*: `sorry` warnings are permitted in
 `sorry` mode (the target is expected to warn) but rejected in `keep` mode, since a
 preserved artifact should compile with no diagnostics at all.
 
-`rewrite-report.json` and `manifest.json` record the mode, and count edits as
-`preserved` rather than `replaced`:
+`rewrite-report.json` and `manifest.json` record the mode, and the buckets report
+the resolved action of each theorem — so a run that mixes actions (via a manifest)
+is reflected faithfully:
 
 ```json
 { "proof_mode": "keep", "eligible": 104, "replaced": 0,
-  "preserved": 104, "skipped": 0, "failed": 0 }
+  "preserved": 104, "deleted": 0, "skipped": 0, "failed": 0 }
 ```
+
+## Per-Theorem Manifest
+
+`--manifest <path>` is a **sparse override** on top of `--proofs`. It names only the
+theorems whose action differs from the default; every theorem it does not mention
+follows `--proofs`. An empty manifest is a no-op.
+
+```json
+{
+  "format": "lean-reassemble-manifest.v1",
+  "theorems": {
+    "Project.Foo.helper":   "keep",
+    "Project.Foo.scratch":  "sorry",
+    "Project.Foo.deadLemma": "delete"
+  }
+}
+```
+
+Keys are full theorem names (the same names the records carry); values are
+`keep | sorry | delete`. A key that matches no theorem in the records is a hard
+error, to catch typos.
+
+## Failure Policy
+
+`--on-failure` controls what happens when a theorem cannot be reassembled — it does
+not match a declaration, its recorded body disagrees with the source, or (in units
+mode) the artifact it produces does not verify:
+
+| Policy | Effect |
+|---|---|
+| `fail` (default) | Abort the whole run on the first failure. |
+| `skip` | Omit the failing theorem and record it in `skipped`. |
+| `backoff` | Delete the failing theorem, record it in `failed`, and continue. |
+
+Under `skip`, repo mode leaves the failing theorem's **original proof in place**
+(its edit is simply not applied), so under `--proofs sorry` that proof stays real;
+units mode emits no task for it. Under `backoff`, the theorem is deleted — a record
+that matches no declaration has nothing to delete, so it falls through to a skip.
+
+`skip`/`backoff` recover from **planning** failures. A post-rewrite `lake build`
+break in `materialize-repo` still aborts regardless of policy: such a break is
+almost always at a *dependent* of a holed or deleted theorem, not at that theorem,
+so there is no safe declaration to auto-attribute and remove.
 
 ## Repository Artifacts
 

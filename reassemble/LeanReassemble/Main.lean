@@ -7,22 +7,33 @@ private def usage : String := "\
 Usage:
   lean_reassemble rewrite-file --source-root <lake-project>
     --records <declarations.jsonl> --file <relative.lean>
-    --output <rewritten.lean> [--proofs sorry|keep]
+    --output <rewritten.lean> [--proofs sorry|keep|delete]
 
   lean_reassemble materialize-repo --source-root <lake-project>
     --records <declarations.jsonl> --output <artifact-dir>
-    [--build-target <target>] [--proofs sorry|keep]
+    [--build-target <target>] [--proofs sorry|keep|delete]
 
   lean_reassemble materialize-units --source-root <lake-project>
     --records <declarations.jsonl> --output <artifact-dir>
-    [--build-target <target>] [--proofs sorry|keep]
+    [--build-target <target>] [--proofs sorry|keep|delete]
 
 --proofs sorry (default) replaces each selected theorem's proof with `by sorry`.
 --proofs keep preserves the proofs verbatim, producing the compilable REFERENCE
 state of the same records: every record is still matched to its declaration and
 its proof range validated, so the artifact is evidence that the extraction agrees
 with the source. Use it to get an intermediate, fully-compiling checkout from an
-extractor run, or as the oracle to diff a sorried artifact against."
+extractor run, or as the oracle to diff a sorried artifact against.
+--proofs delete erases each selected declaration outright. It does no dependency
+analysis: deleting a theorem others reference will break the build.
+
+--manifest <path> is a sparse per-theorem override: a JSON object mapping theorem
+names to keep|sorry|delete. Theorems it does not name follow --proofs.
+
+--on-failure fail (default) aborts on the first theorem that fails to reassemble.
+skip omits it (recorded as skipped); backoff deletes it (recorded as failed) and
+continues. Both recover from PLANNING failures; a post-rewrite build break in
+materialize-repo still aborts, since it usually points at a dependent rather than
+the holed theorem."
 
 private def requireArg (name : String) : Option String → Except String String
   | some value => .ok value
@@ -42,15 +53,24 @@ private def Command.requiresManifest : Command → Bool
   | .rewriteFile _ => false
   | .materializeRepo _ | .materializeUnits _ => true
 
-/-- Parse `--proofs sorry|keep`. -/
+/-- Parse `--proofs sorry|keep|delete`. -/
 private def parseProofMode : String → Except String ProofMode
-  | "sorry" => .ok .replace
-  | "keep"  => .ok .keep
-  | value   => .error s!"--proofs expects sorry|keep, got: {value}"
+  | "sorry"  => .ok .replace
+  | "keep"   => .ok .keep
+  | "delete" => .ok .delete
+  | value    => .error s!"--proofs expects sorry|keep|delete, got: {value}"
+
+/-- Parse `--on-failure fail|skip|backoff`. -/
+private def parseFailurePolicy : String → Except String FailurePolicy
+  | "fail"    => .ok .fail
+  | "skip"    => .ok .skip
+  | "backoff" => .ok .backoff
+  | value     => .error s!"--on-failure expects fail|skip|backoff, got: {value}"
 
 private def parseRewriteArgs (args : List String) : Except String RewriteConfig := do
   let rec go (remaining : List String) (sourceRoot records output : Option String)
-      (file : Option String) (mode : ProofMode) : Except String RewriteConfig :=
+      (file manifest : Option String) (mode : ProofMode) (onFailure : FailurePolicy)
+      : Except String RewriteConfig :=
     match remaining with
     | [] => return {
         sourceRoot := ← requireArg "--source-root" sourceRoot
@@ -58,19 +78,25 @@ private def parseRewriteArgs (args : List String) : Except String RewriteConfig 
         file := ← requireArg "--file" file
         output := ← requireArg "--output" output
         proofMode := mode
+        manifestPath := manifest.map System.FilePath.mk
+        onFailure
       }
-    | "--source-root" :: value :: tail => go tail (some value) records output file mode
-    | "--records" :: value :: tail => go tail sourceRoot (some value) output file mode
-    | "--file" :: value :: tail => go tail sourceRoot records output (some value) mode
-    | "--output" :: value :: tail => go tail sourceRoot records (some value) file mode
+    | "--source-root" :: value :: tail => go tail (some value) records output file manifest mode onFailure
+    | "--records" :: value :: tail => go tail sourceRoot (some value) output file manifest mode onFailure
+    | "--file" :: value :: tail => go tail sourceRoot records output (some value) manifest mode onFailure
+    | "--output" :: value :: tail => go tail sourceRoot records (some value) file manifest mode onFailure
+    | "--manifest" :: value :: tail => go tail sourceRoot records output file (some value) mode onFailure
     | "--proofs" :: value :: tail => do
-        go tail sourceRoot records output file (← parseProofMode value)
+        go tail sourceRoot records output file manifest (← parseProofMode value) onFailure
+    | "--on-failure" :: value :: tail => do
+        go tail sourceRoot records output file manifest mode (← parseFailurePolicy value)
     | flag :: _ => throw s!"unknown or incomplete argument: {flag}"
-  go args none none none none .replace
+  go args none none none none none .replace .fail
 
 private def parseMaterializeArgs (args : List String) : Except String MaterializeConfig := do
   let rec go (remaining : List String) (sourceRoot records output buildTarget : Option String)
-      (mode : ProofMode) : Except String MaterializeConfig :=
+      (manifest : Option String) (mode : ProofMode) (onFailure : FailurePolicy)
+      : Except String MaterializeConfig :=
     match remaining with
     | [] => return {
         sourceRoot := ← requireArg "--source-root" sourceRoot
@@ -78,19 +104,25 @@ private def parseMaterializeArgs (args : List String) : Except String Materializ
         output := ← requireArg "--output" output
         buildTarget
         proofMode := mode
+        manifestPath := manifest.map System.FilePath.mk
+        onFailure
       }
     | "--source-root" :: value :: tail =>
-        go tail (some value) records output buildTarget mode
+        go tail (some value) records output buildTarget manifest mode onFailure
     | "--records" :: value :: tail =>
-        go tail sourceRoot (some value) output buildTarget mode
+        go tail sourceRoot (some value) output buildTarget manifest mode onFailure
     | "--output" :: value :: tail =>
-        go tail sourceRoot records (some value) buildTarget mode
+        go tail sourceRoot records (some value) buildTarget manifest mode onFailure
     | "--build-target" :: value :: tail =>
-        go tail sourceRoot records output (some value) mode
+        go tail sourceRoot records output (some value) manifest mode onFailure
+    | "--manifest" :: value :: tail =>
+        go tail sourceRoot records output buildTarget (some value) mode onFailure
     | "--proofs" :: value :: tail => do
-        go tail sourceRoot records output buildTarget (← parseProofMode value)
+        go tail sourceRoot records output buildTarget manifest (← parseProofMode value) onFailure
+    | "--on-failure" :: value :: tail => do
+        go tail sourceRoot records output buildTarget manifest mode (← parseFailurePolicy value)
     | flag :: _ => throw s!"unknown or incomplete argument: {flag}"
-  go args none none none none .replace
+  go args none none none none none .replace .fail
 
 private def parseArgs : List String → Except String Command
   | "rewrite-file" :: rest => .rewriteFile <$> parseRewriteArgs rest
@@ -101,7 +133,7 @@ private def parseArgs : List String → Except String Command
 
 private def reexecMarker := "LEAN_REASSEMBLE_REEXEC"
 
-private def reexecPathFlags := ["--source-root", "--records", "--output"]
+private def reexecPathFlags := ["--source-root", "--records", "--output", "--manifest"]
 
 private unsafe def execute : Command → IO Unit
   | .rewriteFile config => rewriteFile config
