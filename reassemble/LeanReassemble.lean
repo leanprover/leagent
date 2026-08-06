@@ -1,2 +1,3 @@
 import LeanReassemble.Rewrite
+import LeanReassemble.Manifest
 import LeanReassemble.Materialize

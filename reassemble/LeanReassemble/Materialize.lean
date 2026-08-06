@@ -1,4 +1,5 @@
 import LeanReassemble.Rewrite
+import LeanReassemble.Manifest
 import Corpus.Artifact
 
 namespace LeanReassemble
@@ -15,8 +16,13 @@ structure MaterializeConfig where
   output : System.FilePath
   buildTarget : Option String := none
   /-- `.replace` (default) holes out each selected proof; `.keep` preserves them,
-  producing the compilable reference state of the same records. See `ProofMode`. -/
+  producing the compilable reference state of the same records; `.delete` erases
+  the declaration. See `ProofMode`. -/
   proofMode : ProofMode := .replace
+  /-- Optional per-theorem action overrides; absent theorems use `proofMode`. -/
+  manifestPath : Option System.FilePath := none
+  /-- What to do when a theorem fails to reassemble. -/
+  onFailure : FailurePolicy := .fail
 
 private def artifactPath (path : System.FilePath) : String :=
   path.toString.replace "\\" "/"
@@ -136,51 +142,125 @@ private def projectName (root : System.FilePath) : IO String :=
   | some name => pure name
   | none => fail s!"cannot derive project name from {root}"
 
-/-- The rewrite summary. `replaced` counts proofs turned into `sorry`; under
-`.keep` nothing is replaced, and `preserved` reports the same edits instead — the
-proofs were located and validated, just written back unchanged. -/
-private def rewriteSummary (mode : ProofMode) (eligible edits : Nat) : Json :=
+/-- Per-action tallies for a run. With a manifest, a single run can mix actions,
+so the buckets are counted from each theorem's resolved mode rather than derived
+from one global mode. `skipped`/`failed` come from the failure policy (Phase 3). -/
+structure RewriteCounts where
+  replaced : Nat := 0
+  preserved : Nat := 0
+  deleted : Nat := 0
+  skipped : Nat := 0
+  failed : Nat := 0
+
+/-- Add one resolved action to the tally. -/
+def RewriteCounts.bump (counts : RewriteCounts) : ProofMode → RewriteCounts
+  | .replace => { counts with replaced := counts.replaced + 1 }
+  | .keep    => { counts with preserved := counts.preserved + 1 }
+  | .delete  => { counts with deleted := counts.deleted + 1 }
+
+/-- The rewrite summary. `proof_mode` reports the run default; the buckets report
+the resolved action per theorem, so a manifest that mixes actions is reflected
+faithfully. -/
+private def rewriteSummary (mode : ProofMode) (eligible : Nat)
+    (counts : RewriteCounts) : Json :=
   Json.mkObj [
     ("proof_mode", toString mode),
     ("eligible", eligible),
-    ("replaced", if mode == .keep then 0 else edits),
-    ("preserved", if mode == .keep then edits else 0),
-    ("skipped", 0),
-    ("failed", 0)
+    ("replaced", counts.replaced),
+    ("preserved", counts.preserved),
+    ("deleted", counts.deleted),
+    ("skipped", counts.skipped),
+    ("failed", counts.failed)
   ]
+
+/-- Load the optional manifest and validate its keys against `eligible`. -/
+private def loadManifest (path : Option System.FilePath)
+    (eligible : Array Corpus.ConstRecord) : IO Manifest := do
+  match path with
+  | none => return Manifest.empty
+  | some path =>
+    let manifest ← Manifest.read path
+    manifest.validateKeys (Std.HashSet.ofArray (eligible.map (·.name)))
+    return manifest
 
 unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
   let (sourceRoot, artifact) ← prepareOutput config.sourceRoot config.output
   let records ← readRecords config.records
   let theorems ← eligibleTheorems records
+  let manifest ← loadManifest config.manifestPath theorems
+  let modeFor := fun name => manifest.actionFor name config.proofMode
   let name ← projectName sourceRoot
   let repoRel : System.FilePath := ("repos" : System.FilePath) / name
   let repoRoot := artifact / repoRel
   copyTree sourceRoot repoRoot
   removeIfExists (repoRoot / ".git")
   removeIfExists (repoRoot / ".lake")
-  let mut replaced := 0
+  let mut counts : RewriteCounts := {}
   let mut rewrittenFiles : Array Json := #[]
   for file in theoremFiles theorems do
-    let result ← rewriteSourceFile sourceRoot records file config.proofMode
+    -- Under `fail` this is the historical strict path: any per-record planning
+    -- problem aborts. Under `skip`/`backoff` we plan resiliently and act on each
+    -- failure — `skip` leaves that theorem's proof untouched (its edit is simply
+    -- not applied), `backoff` re-plans it as a delete.
+    --
+    -- `prepareSourceFile` (frontend elaboration) is intentionally OUTSIDE that
+    -- resilience: a module that no longer elaborates is a file-level failure, not
+    -- attributable to any one theorem, so — like the whole-tree build below — it
+    -- aborts under every policy. skip/backoff recover per-theorem planning failures.
+    let prepared ← prepareSourceFile sourceRoot file
+    let selected ← selectTheorems records prepared.relFile
+    let mut edits : Array Edit := #[]
+    if config.onFailure == .fail then
+      edits ← planEdits prepared.frontendResult selected config.proofMode modeFor
+      for edit in edits do
+        counts := counts.bump (modeFor edit.declaration)
+    else
+      let outcome ← planEditsCollecting prepared.frontendResult selected
+        config.proofMode modeFor
+      for edit in outcome.edits do
+        counts := counts.bump (modeFor edit.declaration)
+      for (name, reason) in outcome.failures do
+        IO.eprintln s!"lean-reassemble: {config.onFailure} {name}: {reason}"
+      edits := outcome.edits
+      -- `backoff` retries the failed records as deletes; any that still cannot be
+      -- planned (e.g. their declaration syntax is unrecoverable) fall through to a
+      -- skip. `skip` records nothing further — the theorem keeps its source proof.
+      if config.onFailure == .backoff then
+        let failedNames := Std.HashSet.ofArray (outcome.failures.map (·.1))
+        let failedRecords := selected.filter (failedNames.contains ·.name)
+        let retry ← planEditsCollecting prepared.frontendResult failedRecords .delete
+        edits := edits ++ retry.edits
+        counts := { counts with failed := counts.failed + retry.edits.size }
+        counts := { counts with
+          skipped := counts.skipped + (outcome.failures.size - retry.edits.size) }
+      else
+        counts := { counts with skipped := counts.skipped + outcome.failures.size }
+    let text ← applyEdits prepared.frontendResult.source edits
     let outputPath := repoRoot / file
     if let some parent := outputPath.parent then
       IO.FS.createDirAll parent
-    IO.FS.writeFile outputPath result.text
-    replaced := replaced + result.edits.size
+    IO.FS.writeFile outputPath text
     rewrittenFiles := rewrittenFiles.push <| Json.mkObj [
       ("file", file),
-      ("module", result.moduleName.toString),
-      ("edits", result.edits.size)
+      ("module", prepared.moduleName.toString),
+      ("edits", edits.size)
     ]
-  if replaced != theorems.size then
-    fail s!"edit count mismatch: expected {theorems.size} theorem(s), \
-      edited {replaced} (proof mode: {config.proofMode})"
+  -- Every eligible theorem is accounted for exactly once: as a resolved action
+  -- (replaced/preserved/deleted), a backoff deletion (`failed`), or a `skipped`.
+  let accounted := counts.replaced + counts.preserved + counts.deleted
+    + counts.skipped + counts.failed
+  if accounted != theorems.size then
+    fail s!"theorem accounting mismatch: expected {theorems.size}, accounted {accounted} \
+      (proof mode: {config.proofMode}, on-failure: {config.onFailure})"
+  -- Best-effort build. A post-rewrite build break is usually at a DEPENDENT of a
+  -- holed/deleted theorem, not at that theorem, so there is no safe theorem to
+  -- auto-attribute it to — skip/backoff recover planning failures, not build
+  -- breaks. We therefore let a build failure abort even under skip/backoff.
   let _ ← runChecked repoRoot "lake" (buildArgs config.buildTarget) cleanLakeEnv
   let report := Json.mkObj [
     ("format", "lean-corpus-rewrite-report.v1"),
     ("files", Json.arr rewrittenFiles),
-    ("rewrite_summary", rewriteSummary config.proofMode theorems.size replaced),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts),
     ("verification", Json.mkObj [("status", "passed"), ("command",
       String.intercalate " " (["lake", "build"] ++ config.buildTarget.toList))])
   ]
@@ -191,7 +271,7 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
     ("project", name),
     ("repository", artifactPath repoRel),
     ("build_target", toJson config.buildTarget),
-    ("rewrite_summary", rewriteSummary config.proofMode theorems.size replaced),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts),
     ("verification", Json.mkObj [("status", "passed")])
   ]
 
@@ -290,6 +370,7 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
   let (sourceRoot, artifact) ← prepareOutput config.sourceRoot config.output
   let records ← readRecords config.records
   let theorems ← eligibleTheorems records
+  let manifest ← loadManifest config.manifestPath theorems
   let workRoot := artifact / ".work" / "pristine"
   copyTree sourceRoot workRoot
   removeIfExists (workRoot / ".git")
@@ -329,70 +410,105 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
   for file in theoremFiles theorems do
     preparedByFile := preparedByFile.insert file (← prepareSourceFile sourceRoot file)
   let mut tasks : Array Json := #[]
+  let mut counts : RewriteCounts := {}
   for index in [:theorems.size] do
     let record := theorems[index]!
-    let file := normalizeRelativePath record.file.get!
-    let some prepared := preparedByFile[file]?
-      | fail s!"prepared source missing for {record.name}"
-    -- A unit is a task for ONE theorem: hole out only this record's proof and
-    -- leave every other declaration in the module intact. Rewriting the whole
-    -- file's records here would sorry the target's neighbours too — including
-    -- lemmas its own proof depends on — and would make every task from a given
-    -- file byte-identical.
-    let rewritten ← rewritePreparedFile prepared #[record] config.proofMode
-    if rewritten.moduleName.toString != record.module then
-      fail s!"module mismatch for {record.name}"
-    let some span := replacementSpan? rewritten.edits record.name
-      | fail s!"replacement span missing for {record.name}"
-    let id := s!"{index}-{safeName record.name}"
-    let taskRel : System.FilePath := ("units" : System.FilePath) / id
-    let srcRoot := artifact / taskRel / "src"
-    let sourcePath := srcRoot / file
-    if let some parent := sourcePath.parent then
-      IO.FS.createDirAll parent
-    IO.FS.writeFile sourcePath rewritten.text
-    let verification ← runOutput artifact leanExe.toString
-      #["-R", srcRoot.toString, sourcePath.toString] leanEnv
-    if verification.exitCode != 0 then
-      fail s!"unit verification failed for {record.name}:\n\
-        {verification.stdout}{verification.stderr}"
-    let sourceRel := artifactPath (taskRel / "src" / file)
-    let diagnostics := (verification.stdout ++ verification.stderr).replace
-      artifact.toString "."
-    -- `sorry` warnings are expected under `.replace` (we just created one) and,
-    -- under EITHER mode, for declarations whose proof was already incomplete in the
-    -- source. Real projects carry work-in-progress `sorry`s, and the module retains
-    -- every declaration, so those warnings are not ours to reject: the extractor
-    -- records them as `sorryAx` in the record's `axioms`, and rejecting them would
-    -- make `--proofs keep` unusable on any project with an open goal.
-    --
-    -- What we DO reject under `.keep` is a `sorry` count higher than the source
-    -- explains — that would mean we holed out a proof we were told to preserve.
-    let sorryWarnings := (diagnostics.splitOn "\n").filter
-      (fun line => line.contains "warning:" && line.contains "declaration uses `sorry`")
-    let sourceSorryCount := sourceSorryCountFor records file
-    let expectedSorries :=
-      if config.proofMode == .keep then sourceSorryCount
-      -- The target itself is holed out; if it was already incomplete it is counted
-      -- in the baseline, so it must not be counted twice.
-      else if record.axioms.contains "sorryAx" then sourceSorryCount
-      else sourceSorryCount + 1
-    if sorryWarnings.length > expectedSorries then
-      fail s!"{record.name}: {sorryWarnings.length} `sorry` warning(s) but at most \
-        {expectedSorries} expected for proof mode {config.proofMode} \
-        ({sourceSorryCount} declaration(s) in this module are already incomplete \
-        in the source): {"; ".intercalate sorryWarnings}"
-    for line in diagnostics.splitOn "\n" do
-      if line.contains "warning:" && !line.contains "declaration uses `sorry`" then
-        fail s!"unexpected warning while verifying {record.name}: {line}"
-    writeJson (artifact / taskRel / "task.json")
-      (unitTaskJson id sourceRel toolchain (toString config.proofMode) record span
-        leanRoots nativeRoots diagnostics)
-    tasks := tasks.push <| Json.mkObj [
-      ("id", id),
-      ("target", record.name),
-      ("task", artifactPath (taskRel / "task.json"))
-    ]
+    let targetMode := manifest.actionFor record.name config.proofMode
+    -- A unit is the problem "reconstruct THIS theorem", so a `delete` target has no
+    -- task to emit: deleting the very theorem a unit would ask a solver to prove is
+    -- meaningless. Record it in the summary and move on. (`keep`/`sorry` neighbours
+    -- are irrelevant here — a unit only ever touches its own target.)
+    if targetMode == .delete then
+      counts := counts.bump .delete
+      continue
+    -- Build and verify the task, tolerating a per-task failure per `--on-failure`.
+    -- The whole body is attributable to this one record, so `skip` (omit + record)
+    -- and `backoff` (drop + record) are both clean here; only `fail` re-throws.
+    let outcome : Except String Json ← try
+      let file := normalizeRelativePath record.file.get!
+      let some prepared := preparedByFile[file]?
+        | fail s!"prepared source missing for {record.name}"
+      -- A unit is a task for ONE theorem: hole out only this record's proof and
+      -- leave every other declaration in the module intact. Rewriting the whole
+      -- file's records here would sorry the target's neighbours too — including
+      -- lemmas its own proof depends on — and would make every task from a given
+      -- file byte-identical.
+      let rewritten ← rewritePreparedFile prepared #[record] targetMode
+      if rewritten.moduleName.toString != record.module then
+        fail s!"module mismatch for {record.name}"
+      let some span := replacementSpan? rewritten.edits record.name
+        | fail s!"replacement span missing for {record.name}"
+      let id := s!"{index}-{safeName record.name}"
+      let taskRel : System.FilePath := ("units" : System.FilePath) / id
+      let srcRoot := artifact / taskRel / "src"
+      let sourcePath := srcRoot / file
+      if let some parent := sourcePath.parent then
+        IO.FS.createDirAll parent
+      IO.FS.writeFile sourcePath rewritten.text
+      let verification ← runOutput artifact leanExe.toString
+        #["-R", srcRoot.toString, sourcePath.toString] leanEnv
+      if verification.exitCode != 0 then
+        fail s!"unit verification failed for {record.name}:\n\
+          {verification.stdout}{verification.stderr}"
+      let sourceRel := artifactPath (taskRel / "src" / file)
+      let diagnostics := (verification.stdout ++ verification.stderr).replace
+        artifact.toString "."
+      -- `sorry` warnings are expected under `.replace` (we just created one) and,
+      -- under EITHER mode, for declarations whose proof was already incomplete in the
+      -- source. Real projects carry work-in-progress `sorry`s, and the module retains
+      -- every declaration, so those warnings are not ours to reject: the extractor
+      -- records them as `sorryAx` in the record's `axioms`, and rejecting them would
+      -- make `--proofs keep` unusable on any project with an open goal.
+      --
+      -- What we DO reject under `.keep` is a `sorry` count higher than the source
+      -- explains — that would mean we holed out a proof we were told to preserve.
+      let sorryWarnings := (diagnostics.splitOn "\n").filter
+        (fun line => line.contains "warning:" && line.contains "declaration uses `sorry`")
+      let sourceSorryCount := sourceSorryCountFor records file
+      let expectedSorries :=
+        -- `.keep` adds nothing (delete emits no task, so it never reaches here). Only
+        -- `.replace` introduces a fresh sorry.
+        if targetMode == .keep then sourceSorryCount
+        -- The target itself is holed out; if it was already incomplete it is counted
+        -- in the baseline, so it must not be counted twice.
+        else if record.axioms.contains "sorryAx" then sourceSorryCount
+        else sourceSorryCount + 1
+      if sorryWarnings.length > expectedSorries then
+        fail s!"{record.name}: {sorryWarnings.length} `sorry` warning(s) but at most \
+          {expectedSorries} expected for proof mode {targetMode} \
+          ({sourceSorryCount} declaration(s) in this module are already incomplete \
+          in the source): {"; ".intercalate sorryWarnings}"
+      for line in diagnostics.splitOn "\n" do
+        if line.contains "warning:" && !line.contains "declaration uses `sorry`" then
+          fail s!"unexpected warning while verifying {record.name}: {line}"
+      writeJson (artifact / taskRel / "task.json")
+        (unitTaskJson id sourceRel toolchain (toString targetMode) record span
+          leanRoots nativeRoots diagnostics)
+      pure <| Except.ok <| Json.mkObj [
+        ("id", id),
+        ("target", record.name),
+        ("task", artifactPath (taskRel / "task.json"))
+      ]
+    catch error =>
+      if config.onFailure == .fail then throw error
+      pure <| Except.error (error.toString.dropPrefix "lean-reassemble: ").copy
+    match outcome with
+    | .ok task =>
+      counts := counts.bump targetMode
+      tasks := tasks.push task
+    | .error reason =>
+      -- The task's src tree may have been partly written before the failure (the
+      -- `id`/dir are a deterministic function of index+name, so recompute them here
+      -- rather than threading them out of the try). Remove it so a skipped/backed-off
+      -- theorem leaves no orphan directory in the artifact.
+      removeIfExists (artifact / "units" / s!"{index}-{safeName record.name}")
+      -- Under both surviving policies the theorem contributes no task; they differ
+      -- only in which bucket records it. `backoff` deletes the offender, which in
+      -- units mode is the same as skipping — there is no dependent to protect.
+      match config.onFailure with
+      | FailurePolicy.skip => counts := { counts with skipped := counts.skipped + 1 }
+      | _                  => counts := { counts with failed := counts.failed + 1 }
+      IO.eprintln s!"lean-reassemble: {config.onFailure} {record.name}: {reason}"
   removeIfExists (artifact / ".work")
   let name ← projectName sourceRoot
   writeJson (artifact / "manifest.json") <| Json.mkObj [
@@ -402,8 +518,53 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     ("build_target", toJson config.buildTarget),
     ("environment", "cache/environment.json"),
     ("tasks", Json.arr tasks),
-    ("rewrite_summary", rewriteSummary config.proofMode theorems.size theorems.size),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts),
     ("verification", Json.mkObj [("status", "passed")])
   ]
+
+/-- Rewrite one source file and validate the edited document before writing it. -/
+unsafe def rewriteFile (config : RewriteConfig) : IO Unit := do
+  let cwd ← IO.currentDir
+  let output :=
+    if config.output.isAbsolute then config.output else cwd / config.output
+  let outputAbs := output.normalize
+  let records ← readRecords config.records
+  -- Validate manifest keys against EVERY theorem in the records, not just this
+  -- file's. A records file (and a manifest) commonly spans a whole project, and
+  -- rewrite-file just happens to touch one file of it; a manifest key naming a real
+  -- theorem in another file is not a typo. selectTheorems below still restricts the
+  -- rewrite to this file's records.
+  let manifest ← loadManifest config.manifestPath (← eligibleTheorems records)
+  let modeFor := fun name => manifest.actionFor name config.proofMode
+  let prepared ← prepareSourceFile config.sourceRoot config.file
+  let selected ← selectTheorems records prepared.relFile
+  -- Honor --on-failure: `fail` is the strict path; `skip`/`backoff` plan resiliently
+  -- and act on each per-record failure. (rewrite-file does not build, so there is no
+  -- whole-tree build surface here — only planning failures arise.)
+  let edits ←
+    if config.onFailure == .fail then
+      planEdits prepared.frontendResult selected config.proofMode modeFor
+    else do
+      let outcome ← planEditsCollecting prepared.frontendResult selected
+        config.proofMode modeFor
+      for (name, reason) in outcome.failures do
+        IO.eprintln s!"lean-reassemble: {config.onFailure} {name}: {reason}"
+      if config.onFailure == .backoff then
+        let failedNames := Std.HashSet.ofArray (outcome.failures.map (·.1))
+        let failedRecords := selected.filter (failedNames.contains ·.name)
+        let retry ← planEditsCollecting prepared.frontendResult failedRecords .delete
+        pure (outcome.edits ++ retry.edits)
+      else pure outcome.edits
+  let text ← applyEdits prepared.frontendResult.source edits
+  validateWithWorker prepared.sourceAbs text
+  if outputAbs.toString == prepared.sourceAbs.toString then
+    fail "output path must differ from the source file"
+  if ← outputAbs.pathExists then
+    let resolvedOutput ← IO.FS.realPath outputAbs
+    if resolvedOutput.toString == prepared.sourceAbs.toString then
+      fail "output path must not resolve to the source file"
+  if let some parent := outputAbs.parent then
+    IO.FS.createDirAll parent
+  IO.FS.writeFile outputAbs text
 
 end LeanReassemble
