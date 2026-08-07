@@ -105,6 +105,9 @@ artifacts: all example
 	@echo "=== extract: proof-metrics"
 	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
 	    --output $(ARTIFACTS_DIR)/metrics --proof-metrics
+	@echo "=== extract: proof-metrics + reverse-elab (tactic family from rev-elab body)"
+	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
+	    --output $(ARTIFACTS_DIR)/metrics-rev --proof-metrics --reverse-elab
 	@echo "=== extract: decl closure"
 	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
 	    --output $(ARTIFACTS_DIR)/decl --decl Trees.Tree.total_mirror

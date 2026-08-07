@@ -43,13 +43,13 @@ built to prevent.
 
 ### Tactic family
 
-Computed from the author's `by`-block **syntax** — never from the elaborated term.
-It measures the human-written tactic script:
+Computed from a proof's tactic-script **syntax** — never from the elaborated term.
+It measures the script's shape:
 
 | Column | Meaning |
 |---|---|
-| `tactic_step_count` | top-level author tactics |
-| `tactic_total_count` | all author tactics, nested children included |
+| `tactic_step_count` | top-level tactics |
+| `tactic_total_count` | all tactics, nested children included |
 | `max_tactic_depth` | deepest tactic nesting (0 for a flat proof) |
 | `tactic_kinds` | sorted distinct tactic-kind strings |
 | `tactic_histogram` | kind → occurrence count |
@@ -58,11 +58,22 @@ It measures the human-written tactic script:
 | `have_count` | `have` / `suffices` / `let` |
 | `calc_steps` | steps inside `calc` blocks |
 | `automation_tactics` | sorted short names of automation used (`simp`, `omega`, `grind`, `aesop`, …) |
+| `tactic_metrics_source` | which body was measured: `"author"` / `"reverse_elab"` / `null` |
 
-For a **term-mode proof** (`:= rfl`, `:= fun …` — no `by`) every one of these is
-`null`/`[]`. There is no author tactic script to measure. The `is_term_proof` flag
-is what makes those nulls interpretable: `true` means "not a tactic proof", not "a
-zero-step tactic proof".
+**Which script is measured depends on the run** (see
+[Reverse-elaboration](#reverse-elaboration), below). On a plain run it is the
+author's source `by` block; on a `--reverse-elab` run it is the reverse-elaborated
+body. `tactic_metrics_source` records which, so every row is self-describing — a
+consumer that merges plain and rev-elab extractions can filter on it.
+
+The family is `null`/`[]` when there is no tactic script to measure: a **term-mode
+proof** (`:= rfl`, `:= fun …` — no `by`) on a plain run, or a proof that failed to
+reverse-elaborate on a `--reverse-elab` run. In both cases `tactic_metrics_source`
+is `null`. The `is_term_proof` flag always reports the **original** proof — `true`
+means "the author wrote a term proof" — so it disambiguates the nulls even on a
+rev-elab run, where a term-proved theorem's synthesized `by exact …` script *does*
+get measured (the row is then `is_term_proof = true` with a non-null tactic family
+sourced from `reverse_elab`).
 
 ### Semantic family
 
@@ -74,7 +85,10 @@ Computed from the elaborated proof `Expr`, so it is populated for **every** theo
 | `proof_term_size` | distinct sub-expressions of the proof term (`ReverseElab.distinctNodes`) |
 | `proof_term_depth` | approximate depth of the proof term (`Expr.approxDepth`) |
 
-Both are `null` for non-theorems (a `def`'s value is not a proof).
+Both are `null` for non-theorems (a `def`'s value is not a proof). Unlike the
+tactic family, the semantic family is **unaffected by `--reverse-elab`**: the
+reverse-elaborated term is defeq to the original, so its size and depth are the same
+body either way.
 
 ### Attributes
 
@@ -92,32 +106,48 @@ for exactly the large, intricate proofs a complexity estimate cares most about.
 
 The two paths must nonetheless agree on *what counts as a tactic*. They share one
 definition — `CollectCommon.tacticKindSet`, the `tactic` + `conv` parser categories
-read from the file's own environment — so `--proof-metrics`' `tactic_total_count`
-equals `--proof-states`' `step_count` and `max_tactic_depth` equals its `max_depth`,
-theorem for theorem. Reading the set from the environment (rather than a hard-coded
-list) is also what makes the classifiers pick up project-defined and Mathlib tactics
-for free; the automation / case-split / rewrite recognizers match on the kind
-*string*, so they recognize `aesop` / `linarith` / `norm_num` without the extractor
-depending on Mathlib.
+read from the file's own environment — so on a plain (`author`-sourced) run
+`--proof-metrics`' `tactic_total_count` equals `--proof-states`' `step_count` and
+`max_tactic_depth` equals its `max_depth`, theorem for theorem. (On a
+`--reverse-elab` run the tactic family measures a different body — the synthesized
+script — so it no longer tracks proof-states, which always walks the author's
+proof.) Reading the set from the environment (rather than a hard-coded list) is also
+what makes the classifiers pick up project-defined and Mathlib tactics for free; the
+automation / case-split / rewrite recognizers match on the kind *string*, so they
+recognize `aesop` / `linarith` / `norm_num` without the extractor depending on
+Mathlib.
 
-## Orthogonality with reverse-elaboration
+## Interaction with reverse-elaboration
 
-`--reverse-elab` fills `proof_script` / `proof_method` by re-elaborating the proof
-term into a synthesized tactic script. The proof-metric columns are computed from
-the author's syntax and the elaborated term directly, so they are **byte-identical**
-whether or not `--reverse-elab` is passed. A `--proof-metrics --reverse-elab` run is
-just the metric columns plus the two reverse-elab columns; the metrics never reflect
-the machine reconstruction. This keeps provenance clean: the tactic family is always
-what the author wrote in tactic mode, the semantic family is always the elaborated
-term, and neither blurs into the other.
+`--reverse-elab` re-elaborates each proof term into a synthesized tactic script,
+recorded in `proof_script` / `proof_method`. On such a run, the tactic family
+measures **that script** rather than the author's source proof — the run's purpose
+is the reconstruction, so its metrics are what the run reports. Concretely:
+
+- **Plain run** — tactic family from the author's `by` block; `tactic_metrics_source
+  = "author"`. Term-mode proofs get a null tactic family.
+- **`--reverse-elab` run** — tactic family re-parsed from the synthesized script;
+  `tactic_metrics_source = "reverse_elab"`. A proof that produced no script
+  (`fail` / `skipped_large` / `timeout` / `deadline_skipped`) gets a null tactic
+  family with a `null` source.
+
+Two things are held invariant across the two runs, so provenance stays legible:
+`is_term_proof` and `attributes` always describe the **original** declaration, and
+the **semantic family** always measures the elaborated term (defeq under
+reverse-elaboration). Only the tactic family switches which body it reflects, and
+`tactic_metrics_source` records the switch per row — a single wide-table row cannot
+see the run's flags, so it carries its own provenance.
 
 ## Implementation
 
 - `lean-extract/Corpus/ProofMetrics.lean` — the pure, syntax-only analysis
-  (`analyzeTacticProof`, `attributesOf`, `buildMetricsMap`). `Info`-free, so it is
+  (`analyzeTacticProof`, `attributesOf`, `buildMetricsMap`), plus `metricsFromScript`
+  (re-parse a rendered `by …` script and measure it) and `withNullTactics` (null the
+  tactic family while keeping `isTermProof`/`attributes`). `Info`-free, so it is
   unit-testable without an `Environment`.
 - `CollectCommon.tacticKindSet` — the shared tactic-kind selection set (also used by
   `Corpus.ProofStates`, so the two cannot drift).
-- `CorpusManifest.buildEntry` — looks up the tactic family by the declaration's
-  selection position and sizes the semantic family from the proof term.
+- `CorpusManifest.buildEntry` — resolves the tactic family (author metrics, or the
+  reverse-elab body under `--reverse-elab`), sets `metricsSource`, and sizes the
+  semantic family from the proof term.
 - `Corpus.Records.ConstRecord` — the wire columns and their `null`-tolerant decoder.

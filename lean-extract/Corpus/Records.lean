@@ -75,20 +75,29 @@ structure ConstRecord where
   --
   -- The metrics split into two families that measure DIFFERENT things and are
   -- populated on different rows — do not conflate them:
-  --   * Tactic family (`tacticStepCount` … `automationTactics`): from the AUTHOR'S
-  --     proof syntax. `none`/`[]` for a TERM-mode proof (`:= rfl`, no `by`) — there
-  --     is no author tactic script to measure. `isTermProof` distinguishes "not a
-  --     tactic proof" (its fields are null by design) from a real zero-value.
+  --   * Tactic family (`tacticStepCount` … `automationTactics`): a tactic script's
+  --     shape. WHICH script depends on the run — the author's source `by` block on
+  --     a plain run, the reverse-elaborated body on a `--reverse-elab` run.
+  --     `tacticMetricsSource` names which per row. `none`/`[]` when there is no
+  --     script to measure (a term-mode author proof on a plain run; a proof with no
+  --     reverse-elab script on a `--reverse-elab` run). `isTermProof` always
+  --     reports the ORIGINAL proof, so it disambiguates the nulls.
   --   * Semantic family (`proofTermSize`/`proofTermDepth`): from the elaborated
   --     proof term, so populated for EVERY theorem including term-mode ones — the
-  --     complexity signal for the rows the tactic family leaves null.
-  -- Reverse-elaboration (`--reverse-elab`) is orthogonal: these columns are
-  -- identical with or without it.
-  /-- `true` iff the proof is a bare term (`:= …`, no `by`). When `true`, every
-  tactic-family field below is `none`/`[]` by design — use the semantic family
-  (`proofTermSize`/`proofTermDepth`) for such rows. `false` for a tactic proof and
-  for non-theorems. -/
+  --     complexity signal for the rows the tactic family leaves null. NOT affected
+  --     by `--reverse-elab` (the reconstructed term is defeq to the original).
+  /-- `true` iff the ORIGINAL proof is a bare term (`:= …`, no `by`), independent of
+  `--reverse-elab`. On a plain run `true` forces the tactic family to `none`/`[]`
+  (no author tactic script). On a `--reverse-elab` run a `true` row may still carry
+  tactic metrics — measured from the SYNTHESIZED script — so pair this with
+  `tacticMetricsSource` to read a row correctly. `false` for non-theorems. -/
   isTermProof : Bool := false
+  /-- Which proof body the tactic family was measured from: `"author"` (source `by`
+  block), `"reverse_elab"` (the reverse-elaborated `proof_script`), or `none` (no
+  tactic family — either `--proof-metrics` was off, or nothing was measurable).
+  A single wide-table row cannot see the run's flags, so this makes each row
+  self-describing. See `Corpus.ProofMetrics.sourceAuthor` / `sourceReverseElab`. -/
+  tacticMetricsSource : Option String := none
   /-- Top-level author tactic steps. Tactic family: `none` for a term proof, a
   non-theorem, or when `--proof-metrics` is off. -/
   tacticStepCount : Option Nat := none
@@ -182,6 +191,7 @@ def toJson (r : ConstRecord) : Json :=
     ("is_private",   Json.bool r.isPrivate),
     ("tags",         tagsJson),
     ("is_term_proof",      Json.bool r.isTermProof),
+    ("tactic_metrics_source", Lean.toJson r.tacticMetricsSource),
     ("tactic_step_count",  Lean.toJson r.tacticStepCount),
     ("tactic_total_count", Lean.toJson r.tacticTotalCount),
     ("max_tactic_depth",   Lean.toJson r.maxTacticDepth),
@@ -290,6 +300,7 @@ def fromJson? (j : Json) : Except String ConstRecord := do
     isPrivate   := ← getBool "is_private"
     tags        := tags
     isTermProof       := ← getBoolD "is_term_proof"
+    tacticMetricsSource := ← getOptStr "tactic_metrics_source"
     tacticStepCount   := ← getOptNat' "tactic_step_count"
     tacticTotalCount  := ← getOptNat' "tactic_total_count"
     maxTacticDepth    := ← getOptNat' "max_tactic_depth"

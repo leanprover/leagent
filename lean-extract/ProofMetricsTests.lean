@@ -89,6 +89,31 @@ private def testAttributes (env : Environment) : IO Unit := do
   assert m2.attributes.isEmpty s!"spurious attributes: {m2.attributes}"
   assert m2.isTermProof "a plain def value is a term, not a tactic proof"
 
+/-- `--reverse-elab` recomputes the tactic family from the synthesized `proof_script`
+(a rendered `by …` string), while `is_term_proof` and `attributes` stay from the
+author metrics. A script that does not parse yields `none` so the caller nulls the
+tactic family. -/
+private def testMetricsFromScript (env : Environment) : IO Unit := do
+  let kinds := CollectCommon.tacticKindSet env
+  -- Base = the ORIGINAL author metrics (here: a term proof, with an attribute).
+  let base := (TacticMetrics.termProof #["simp"])
+  let m := metricsFromScript env kinds base "by intro h; simp <;> omega"
+  match m with
+  | none => assert false "metricsFromScript failed to parse a valid by-script"
+  | some m =>
+    assert (m.tacticStepCount == some 2) s!"script step count wrong: {m.tacticStepCount}"
+    assert (m.automationTactics == #["omega", "simp"]) s!"script automation wrong: {m.automationTactics}"
+    -- Carried from the base: original was a term proof, keep the attribute.
+    assert m.isTermProof "is_term_proof not carried from base (original was a term proof)"
+    assert (m.attributes == #["simp"]) s!"attributes not carried from base: {m.attributes}"
+  -- A non-`by` string (no tactic block) → none, so the caller nulls the family.
+  assert (metricsFromScript env kinds base "fun x => x" |>.isNone)
+    "a term-only script should yield no tactic metrics"
+  -- withNullTactics keeps is_term_proof/attributes, nulls the rest.
+  let n := base.withNullTactics
+  assert (n.isTermProof && n.attributes == #["simp"] && n.tacticStepCount == none)
+    "withNullTactics dropped is_term_proof/attributes or kept a tactic field"
+
 unsafe def run : IO UInt32 := do
   Lean.enableInitializersExecution
   Lean.initSearchPath (← Lean.findSysroot)
@@ -100,6 +125,7 @@ unsafe def run : IO UInt32 := do
   testCalcSteps env
   testHistogram env
   testAttributes env
+  testMetricsFromScript env
   IO.println "proof metrics tests passed"
   return (0 : UInt32)
 

@@ -75,6 +75,7 @@ def entryToRecord (e : CorpusManifestEntry) (relFile : String) (tagConfig : TagC
     -- tactic-family field keeps its record default; a term proof yields a metrics
     -- record with `isTermProof := true` and null tactic fields by construction.
     isTermProof       := (e.metrics.map (·.isTermProof)).getD false
+    tacticMetricsSource := e.metricsSource
     tacticStepCount   := e.metrics.bind (·.tacticStepCount)
     tacticTotalCount  := e.metrics.bind (·.tacticTotalCount)
     maxTacticDepth    := e.metrics.bind (·.maxTacticDepth)
