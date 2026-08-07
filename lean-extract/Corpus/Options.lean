@@ -76,6 +76,12 @@ structure CollectOptions where
   /-- Theorem names to skip reverse-elaboration for, matched against either the
   corpus display name or the raw Lean internal name. CLI: `--skip-reverse`. -/
   reverseSkip     : Array String := #[]
+  /-- Emit proof-complexity metric columns on each record (tactic-family syntactic
+  metrics, semantic proof-term size/depth, and declaration attributes). Off by
+  default: it walks each proof's syntax and sizes each proof term. Independent of
+  `reverseElab` — the metric columns are identical with or without it. CLI:
+  `--proof-metrics`. See `Corpus.ProofMetrics`. -/
+  proofMetrics    : Bool := false
   deriving Inhabited, ToJson, FromJson
 
 end Corpus

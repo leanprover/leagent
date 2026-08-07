@@ -11,6 +11,7 @@ import Corpus.CollectCommon
 import Corpus.ReverseElab
 import Corpus.Frontend
 import Corpus.SourceSyntax
+import Corpus.ProofMetrics
 import Corpus.Verify
 import Corpus.ChildProcess
 import Corpus.Options
@@ -137,6 +138,18 @@ structure CorpusManifestEntry where
   endLine     : Option Nat
   /-- 0-based end column. -/
   endCol      : Option Nat
+  /-- Proof-complexity metrics for the record schema, populated only under
+  `--proof-metrics` (`opts.proofMetrics`). `none` otherwise, which maps to the
+  record's empty column forms. The tactic half is `ProofMetrics.TacticMetrics`
+  (from proof syntax); the two `proofTerm*` fields are the semantic half (from the
+  elaborated proof `Expr`, theorems only). See `Corpus.ProofMetrics`. -/
+  metrics       : Option ProofMetrics.TacticMetrics := none
+  /-- Semantic family: distinct sub-expressions of the elaborated proof term
+  (`ReverseElab.distinctNodes`). `none` for non-theorems or flag off. -/
+  proofTermSize : Option Nat := none
+  /-- Semantic family: approximate depth of the elaborated proof term. `none` as
+  `proofTermSize`. -/
+  proofTermDepth : Option Nat := none
 
 open Lean.PrettyPrinter
 
@@ -550,6 +563,9 @@ structure SourceMaps where
   /-- Position → `simp [..]` argument lists harvested from that proof, for
   `--closers`. Empty unless closers are enabled (building it walks every proof). -/
   simpArgs   : Std.HashMap (Nat × Nat) (Array String) := {}
+  /-- Position → tactic-family proof metrics. Empty unless `--proof-metrics` is on
+  (building it walks every proof's syntax). -/
+  metrics    : Std.HashMap (Nat × Nat) ProofMetrics.TacticMetrics := {}
 
 private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
     (info : ConstantInfo)
@@ -642,6 +658,26 @@ private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
           | none => pure (none, none)
         else pure (none, none)
     | _ => pure (none, none)
+  -- Proof-complexity metrics (`--proof-metrics`). The tactic family is looked up
+  -- from the syntax-derived map by the decl's selection position (same key as
+  -- sig/body); the semantic family is sized from the elaborated proof term, so it
+  -- is populated for term-mode theorems too (the rows the tactic family leaves
+  -- null). Both are `none` when the flag is off or for non-theorems.
+  let metrics? :=
+    if opts.proofMetrics then
+      match ranges? with
+      | some r => maps.metrics[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
+      | none   => none
+    else none
+  let (proofTermSize, proofTermDepth) :=
+    if opts.proofMetrics then
+      match info with
+      | .thmInfo _ =>
+          match info.value? (allowOpaque := true) with
+          | some v => (some (ReverseElab.distinctNodes v), some v.approxDepth.toNat)
+          | none   => (none, none)
+      | _ => (none, none)
+    else (none, none)
   return {
     -- Resolvable display name: private decls are unmangled from `_private.…` to
     -- their user name, so the record is citeable and joins with deps/premises.
@@ -670,6 +706,9 @@ private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
     startCol
     endLine
     endCol
+    metrics := metrics?
+    proofTermSize
+    proofTermDepth
   }
 
 /-- Reverse-elab cost proxy for scheduling: a theorem's proof-term node count
@@ -760,12 +799,17 @@ private def foldCorpusEntries (maps : SourceMaps) (opts : CollectOptions)
 
 The simp-arg map is built ONLY when closers are enabled: constructing it walks every
 proof's syntax, and nothing reads it otherwise. -/
-def SourceMaps.of (r : Frontend.ElabResult) (closers : Bool) : CoreM SourceMaps := do
+def SourceMaps.of (r : Frontend.ElabResult) (opts : CollectOptions) : CoreM SourceMaps := do
+  let env ← getEnv
   return {
     sig        := buildSourceMap r.source r.commands
     declSource := buildDeclSourceMap r.source r.commands
     scope      := buildScopeMap r.source r.commands
-    simpArgs   := ← if closers then buildSimpArgMap r.source r.commands else pure {} }
+    simpArgs   := ← if opts.reverseClosers then buildSimpArgMap r.source r.commands else pure {}
+    metrics    := if opts.proofMetrics then
+                    ProofMetrics.buildMetricsMap (CollectCommon.tacticKindSet env)
+                      r.source r.commands
+                  else {} }
 
 /-- The corpus-collector entry point: build the corpus manifest entries for one
 frontend-elaborated file. The `CoreM` fold runs via `Frontend.runCollectorOn` against
@@ -779,7 +823,7 @@ def corpusManifestCore (r : Frontend.ElabResult) (opts : CollectOptions)
     (reverseDeadlineMs : Nat := 0)
     : IO (Array CorpusManifestEntry) :=
   Frontend.runCollectorOn r do
-    let maps ← SourceMaps.of r opts.reverseClosers
+    let maps ← SourceMaps.of r opts
     foldCorpusEntries maps opts reverseDeadlineMs r.file.relPath (some r)
 
 end Corpus

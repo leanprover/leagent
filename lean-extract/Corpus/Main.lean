@@ -49,7 +49,7 @@ open Lean
 open Corpus.Artifact (writeJsonl partitionByConfig)
 
 /-- Tool version, bumped manually as the schema evolves. -/
-def toolVersion : String := "0.2.0"
+def toolVersion : String := "0.3.0"
 
 /-- Per-kind counters for the corpus `metadata.json`. -/
 structure RunStats where
@@ -68,6 +68,7 @@ structure CliArgs where
   reverseElab        : Bool := false
   reverseClosers     : Bool := false
   reverseSkip        : Array String := #[]
+  proofMetrics       : Bool := false
   reverseTimeoutMs   : Nat := 300000
   jobs               : Option Nat := none
   isolateFiles       : Bool := true
@@ -109,7 +110,8 @@ def CliArgs.opts (cli : CliArgs) : CollectOptions :=
     includePrivate  := cli.includePrivate
     reverseElab     := cli.reverseElab
     reverseClosers  := cli.reverseClosers
-    reverseSkip     := cli.reverseSkip }
+    reverseSkip     := cli.reverseSkip
+    proofMetrics    := cli.proofMetrics }
 
 private def usage : String := "\
 Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
@@ -117,7 +119,7 @@ Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
                      [--reverse-elab] [--closers] [--skip-reverse <decl>]
-                     [--reverse-timeout <seconds>]
+                     [--reverse-timeout <seconds>] [--proof-metrics]
                      [--jobs <n>] [--no-isolate-files] [--resume]
                      [--grind-manifest] [--grind-in-proof] [--proof-states]
                      [--decl <Name> ...] [--strict-closure]
@@ -159,6 +161,17 @@ internal name and emits proof_method=skipped_requested for that theorem.
 --reverse-timeout sets the isolated reverse-elaboration timeout in seconds
 (default 300). On timeout the file is re-run without reverse elaboration. A value
 of 0 disables this timeout.
+
+--proof-metrics adds proof-complexity columns to each record: a tactic family
+computed from the author's `by`-block syntax (step/depth counts, tactic
+histogram, case-split/rewrite/have/calc counts, automation tactics used) and a
+semantic family from the elaborated proof term (proof_term_size,
+proof_term_depth), plus the declaration's attributes. TERM-mode proofs (`:= rfl`,
+no `by`) have null tactic-family columns BY DESIGN — there is no author tactic
+script to measure — and carry their complexity signal in the semantic family
+instead; is_term_proof distinguishes the two. This augments the regular run (it is
+NOT one of the mutually-exclusive modes) and is independent of --reverse-elab: the
+metric columns are identical with or without it.
 
 --decl extracts ONE named declaration plus its transitive project-owned
 dependency closure, into its own directory under --output (mirroring the corpus
@@ -275,6 +288,8 @@ where
     | "--skip-reverse" :: v :: xs, acc =>
         if v.startsWith "--" then .error "--skip-reverse expects a declaration name"
         else go xs { acc with reverseSkip := acc.reverseSkip.push v }
+    | "--proof-metrics" :: xs, acc =>
+        go xs { acc with proofMetrics := true }
     | "--reverse-timeout" :: v :: xs, acc =>
         match parseNat? v with
         | some n => go xs { acc with reverseTimeoutMs := n * 1000 }

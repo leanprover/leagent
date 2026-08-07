@@ -197,6 +197,21 @@ def collectStatementPremises (env : Environment) (owned : Name → Bool)
   | none        => #[]
   | some rootCi => collectPremisesFrom env owned root rootCi.type.getUsedConstantsAsSet.toArray
 
+/-- The tactic-node kinds a user can write: the `tactic` and `conv` parser
+categories, read from the file's own environment. Reading it from the environment
+(rather than a hard-coded denylist) is what makes it correct across Lean versions
+and inclusive of project-defined tactics — see the extended discussion at
+`Corpus.ProofStates`, whose InfoTree walk uses this to keep only author tactics.
+`Corpus.ProofMetrics`'s syntactic walk uses the SAME set so the two paths agree on
+what a tactic is. Lives here (dependency-free, imported by both) so it cannot
+drift between them. -/
+def tacticKindSet (env : Environment) : Std.HashSet Name := Id.run do
+  let mut out : Std.HashSet Name := {}
+  for cat in [`tactic, `conv] do
+    if let some c := Lean.Parser.getParserCategory? env cat then
+      out := c.kinds.foldl (fun s k _ => s.insert k) out
+  return out
+
 /-- Build a `MetaM` runner over an environment and execute `act`. Only the
 environment matters; all other contexts are default.
 
