@@ -102,6 +102,9 @@ artifacts: all example
 	@echo "=== extract: reverse-elab"
 	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
 	    --output $(ARTIFACTS_DIR)/rev-elab --reverse-elab
+	@echo "=== extract: proof-metrics"
+	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
+	    --output $(ARTIFACTS_DIR)/metrics --proof-metrics
 	@echo "=== extract: decl closure"
 	./$(BINDIR)/lean_extract --source-root ./$(EXAMPLE_PKG) --modules Trees \
 	    --output $(ARTIFACTS_DIR)/decl --decl Trees.Tree.total_mirror
@@ -176,6 +179,7 @@ test:
 	cd $(EXTRACT_PKG) && lake exe resume_tests
 	cd $(EXTRACT_PKG) && lake exe decl_closure_tests
 	cd $(EXTRACT_PKG) && lake exe proof_states_tests
+	cd $(EXTRACT_PKG) && lake exe proof_metrics_tests
 	cd $(REASSEMBLE_PKG) && lake exe reassemble_tests
 
 # Fetch the pinned toolchain up front rather than mid-build.

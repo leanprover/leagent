@@ -68,6 +68,60 @@ structure ConstRecord where
   isProtected : Bool
   isPrivate   : Bool
   tags        : List (String × String)
+  -- Proof-complexity metrics (`--proof-metrics`). Populated only under that flag;
+  -- every field below is its empty form (`none`/`[]`/`false`) otherwise, so the
+  -- column set is stable whether or not the flag was passed. See
+  -- `Corpus.ProofMetrics`.
+  --
+  -- The metrics split into two families that measure DIFFERENT things and are
+  -- populated on different rows — do not conflate them:
+  --   * Tactic family (`tacticStepCount` … `automationTactics`): from the AUTHOR'S
+  --     proof syntax. `none`/`[]` for a TERM-mode proof (`:= rfl`, no `by`) — there
+  --     is no author tactic script to measure. `isTermProof` distinguishes "not a
+  --     tactic proof" (its fields are null by design) from a real zero-value.
+  --   * Semantic family (`proofTermSize`/`proofTermDepth`): from the elaborated
+  --     proof term, so populated for EVERY theorem including term-mode ones — the
+  --     complexity signal for the rows the tactic family leaves null.
+  -- Reverse-elaboration (`--reverse-elab`) is orthogonal: these columns are
+  -- identical with or without it.
+  /-- `true` iff the proof is a bare term (`:= …`, no `by`). When `true`, every
+  tactic-family field below is `none`/`[]` by design — use the semantic family
+  (`proofTermSize`/`proofTermDepth`) for such rows. `false` for a tactic proof and
+  for non-theorems. -/
+  isTermProof : Bool := false
+  /-- Top-level author tactic steps. Tactic family: `none` for a term proof, a
+  non-theorem, or when `--proof-metrics` is off. -/
+  tacticStepCount : Option Nat := none
+  /-- Every author tactic, nested children included. `none` as `tacticStepCount`. -/
+  tacticTotalCount : Option Nat := none
+  /-- Deepest author-tactic nesting (0 for a flat proof). `none` as above. -/
+  maxTacticDepth : Option Nat := none
+  /-- Sorted distinct tactic-kind strings in the proof. `[]` when not applicable. -/
+  tacticKinds : List String := []
+  /-- Tactic-kind string → occurrence count. `{}` when not applicable. -/
+  tacticHistogram : List (String × Nat) := []
+  /-- Case-analysis tactics (`induction`/`cases`/`rcases`/…). `none` as above. -/
+  caseSplitCount : Option Nat := none
+  /-- Directed rewrites (`rw`/`rewrite`; `simp` counts as automation). `none`. -/
+  rewriteCount : Option Nat := none
+  /-- Intermediate assertions (`have`/`suffices`/`let`). `none` as above. -/
+  haveCount : Option Nat := none
+  /-- Steps inside `calc` blocks. `none` as above. -/
+  calcSteps : Option Nat := none
+  /-- Sorted short names of automation tactics used (`simp`/`omega`/`grind`/…).
+  `[]` for a term proof, a manual proof with no automation, or flag off. -/
+  automationTactics : List String := []
+  /-- Semantic family: distinct sub-expressions of the elaborated proof term.
+  Populated for theorems (incl. term-mode) under `--proof-metrics`; `none` for
+  non-theorems or when the flag is off. -/
+  proofTermSize : Option Nat := none
+  /-- Semantic family: approximate depth of the elaborated proof term. `none` as
+  `proofTermSize`. -/
+  proofTermDepth : Option Nat := none
+  /-- Declaration attributes (`@[simp]` → `"simp"`), sorted. Present for term and
+  tactic proofs alike under `--proof-metrics`; `[]` when the flag is off or the
+  declaration has no attributes. -/
+  attributes : List String := []
   /-- Single-declaration mode (`--decl`) only: this record's role in ONE target's
   dependency closure — `"target"`, `"statement"` (reachable from the target's
   type, so needed to state it), or `"proof"` (reachable only through the target's
@@ -96,6 +150,11 @@ keys we emit and what they map to. -/
 def toJson (r : ConstRecord) : Json :=
   let tagsJson : Json :=
     Json.mkObj (r.tags.map (fun (k, v) => (k, Json.str v)))
+  -- Histogram renders as a flat kind→count object (like `tags`), not a
+  -- list-of-pairs, so a consumer reads `{"…rwSeq": 2}` directly.
+  let histJson : Json :=
+    Json.mkObj (r.tacticHistogram.map (fun (k, n) =>
+      (k, Json.num (Lean.JsonNumber.fromNat n))))
   Json.mkObj [
     ("name",         Json.str r.name),
     ("kind",         Json.str r.kind),
@@ -122,6 +181,20 @@ def toJson (r : ConstRecord) : Json :=
     ("is_protected", Json.bool r.isProtected),
     ("is_private",   Json.bool r.isPrivate),
     ("tags",         tagsJson),
+    ("is_term_proof",      Json.bool r.isTermProof),
+    ("tactic_step_count",  Lean.toJson r.tacticStepCount),
+    ("tactic_total_count", Lean.toJson r.tacticTotalCount),
+    ("max_tactic_depth",   Lean.toJson r.maxTacticDepth),
+    ("tactic_kinds",       Lean.toJson r.tacticKinds),
+    ("tactic_histogram",   histJson),
+    ("case_split_count",   Lean.toJson r.caseSplitCount),
+    ("rewrite_count",      Lean.toJson r.rewriteCount),
+    ("have_count",         Lean.toJson r.haveCount),
+    ("calc_steps",         Lean.toJson r.calcSteps),
+    ("automation_tactics", Lean.toJson r.automationTactics),
+    ("proof_term_size",    Lean.toJson r.proofTermSize),
+    ("proof_term_depth",   Lean.toJson r.proofTermDepth),
+    ("attributes",         Lean.toJson r.attributes),
     ("closure_role", Lean.toJson r.closureRole)
   ]
 
@@ -170,6 +243,26 @@ def fromJson? (j : Json) : Except String ConstRecord := do
           | _          => acc
         .ok acc
     | _ => .ok ([] : List (String × String)))
+  -- Proof-metric fields. All tolerate absence (records written before
+  -- `--proof-metrics`, or with the flag off) by defaulting to the empty form.
+  let getBoolD (k : String) : Except String Bool :=
+    match j.getObjVal? k with
+    | .ok v    => v.getBool?
+    | .error _ => .ok false
+  let getOptNat' (k : String) : Except String (Option Nat) :=
+    match j.getObjVal? k with
+    | .ok .null => .ok none
+    | .ok v     => (Lean.fromJson? v : Except String Nat).map some
+    | .error _  => .ok none
+  let tacticHistogram ← (do
+    match j.getObjVal? "tactic_histogram" with
+    | .ok (Json.obj kvs) =>
+        let acc := kvs.foldl (init := ([] : List (String × Nat))) fun acc k v =>
+          match (Lean.fromJson? v : Except String Nat) with
+          | .ok n => acc ++ [(k, n)]
+          | _     => acc
+        .ok acc
+    | _ => .ok ([] : List (String × Nat)))
   return {
     name        := ← getStr "name"
     kind        := ← getStr "kind"
@@ -196,6 +289,20 @@ def fromJson? (j : Json) : Except String ConstRecord := do
     isProtected := ← getBool "is_protected"
     isPrivate   := ← getBool "is_private"
     tags        := tags
+    isTermProof       := ← getBoolD "is_term_proof"
+    tacticStepCount   := ← getOptNat' "tactic_step_count"
+    tacticTotalCount  := ← getOptNat' "tactic_total_count"
+    maxTacticDepth    := ← getOptNat' "max_tactic_depth"
+    tacticKinds       := ← getOptStrList "tactic_kinds"
+    tacticHistogram   := tacticHistogram
+    caseSplitCount    := ← getOptNat' "case_split_count"
+    rewriteCount      := ← getOptNat' "rewrite_count"
+    haveCount         := ← getOptNat' "have_count"
+    calcSteps         := ← getOptNat' "calc_steps"
+    automationTactics := ← getOptStrList "automation_tactics"
+    proofTermSize     := ← getOptNat' "proof_term_size"
+    proofTermDepth    := ← getOptNat' "proof_term_depth"
+    attributes        := ← getOptStrList "attributes"
     closureRole := ← getOptStr "closure_role"
   }
 

@@ -70,7 +70,24 @@ def entryToRecord (e : CorpusManifestEntry) (relFile : String) (tagConfig : TagC
     axioms      := e.axioms.toList
     isProtected := e.isProtected
     isPrivate   := e.isPrivate
-    tags        := tagConfig.matchTags e.module }
+    tags        := tagConfig.matchTags e.module
+    -- Proof-complexity metrics. When `e.metrics` is `none` (flag off) every
+    -- tactic-family field keeps its record default; a term proof yields a metrics
+    -- record with `isTermProof := true` and null tactic fields by construction.
+    isTermProof       := (e.metrics.map (·.isTermProof)).getD false
+    tacticStepCount   := e.metrics.bind (·.tacticStepCount)
+    tacticTotalCount  := e.metrics.bind (·.tacticTotalCount)
+    maxTacticDepth    := e.metrics.bind (·.maxTacticDepth)
+    tacticKinds       := (e.metrics.map (·.tacticKinds.toList)).getD []
+    tacticHistogram   := (e.metrics.map (·.tacticHistogram.toList)).getD []
+    caseSplitCount    := e.metrics.bind (·.caseSplitCount)
+    rewriteCount      := e.metrics.bind (·.rewriteCount)
+    haveCount         := e.metrics.bind (·.haveCount)
+    calcSteps         := e.metrics.bind (·.calcSteps)
+    automationTactics := (e.metrics.map (·.automationTactics.toList)).getD []
+    proofTermSize     := e.proofTermSize
+    proofTermDepth    := e.proofTermDepth
+    attributes        := (e.metrics.map (·.attributes.toList)).getD [] }
 
 /-- Extract the corpus entries for ONE already-elaborated file.
 
@@ -179,6 +196,7 @@ def runFingerprint (projectRoot : System.FilePath)
     ("reverseElab", Json.bool opts.reverseElab),
     ("reverseClosers", Json.bool opts.reverseClosers),
     ("reverseSkip", Json.arr ((opts.reverseSkip.qsort (· < ·)).map Json.str)),
+    ("proofMetrics", Json.bool opts.proofMetrics),
     ("reverseTimeoutMs", Json.num (JsonNumber.fromNat reverseTimeoutMs))
   ]
 

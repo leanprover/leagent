@@ -194,12 +194,30 @@ jobs:
               ("plain/data/theorems/train.jsonl", 9),
               ("plain/data/definitions.jsonl", 13),
               ("rev-elab/data/theorems/train.jsonl", 9),
+              ("metrics/data/theorems/train.jsonl", 9),
               ("proof-states/data/proof-states/train.jsonl", 9),
               ("decl/Trees.Tree.total_mirror/data/target.jsonl", 1),
           ]:
               got = lines(rel)
               if got != want:
                   failed.append(f"{rel}: expected {want} record(s), got {got}")
+
+          # --proof-metrics must actually populate its columns, not just emit
+          # nulls. Every example theorem is a tactic proof, so the tactic family
+          # must be non-null and total_count must match the proof-states step_count
+          # (both walk the same tactic-kind set — a mismatch means they drifted).
+          mrecs = [json.loads(l) for l in (root / "metrics/data/theorems/train.jsonl").open()]
+          ps = {json.loads(l)["name"]: json.loads(l)
+                for l in (root / "proof-states/data/proof-states/train.jsonl").open()}
+          for r in mrecs:
+              if r["is_term_proof"] or r["tactic_step_count"] is None:
+                  failed.append(f"metrics: {r['name']} has null tactic family, want populated")
+              if r["proof_term_size"] is None:
+                  failed.append(f"metrics: {r['name']} has null proof_term_size")
+              want_total = ps.get(r["name"], {}).get("step_count")
+              if r["tactic_total_count"] != want_total:
+                  failed.append(f"metrics: {r['name']} total_count {r['tactic_total_count']} "
+                                f"!= proof-states step_count {want_total}")
 
           # Every materialized artifact must report verification passed and no
           # failed rewrites. This is the real assertion: it means the generated

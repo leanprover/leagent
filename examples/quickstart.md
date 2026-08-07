@@ -68,6 +68,29 @@ typechecked, not guessed.
 Record counts are identical to the plain run — the only difference is that
 `proof_script` and `proof_method` are populated rather than `null`.
 
+### Proof metrics
+
+Adds proof-complexity columns to the *same* records the plain and rev-elab modes
+emit — it augments the corpus run rather than replacing it, so it composes with
+either. Pass `--proof-metrics` (optionally alongside `--reverse-elab`):
+
+```sh
+./bin/lean_extract \
+    --source-root ./examples/tree-project --modules Trees \
+    --output /tmp/demo-trees/metrics \
+    --proof-metrics
+```
+
+The columns split into two families. The **tactic family** —
+`tactic_step_count`, `tactic_total_count`, `max_tactic_depth`, `tactic_kinds`,
+`tactic_histogram`, `case_split_count`, `rewrite_count`, `have_count`,
+`calc_steps`, `automation_tactics` — is read from the author's `by`-block syntax,
+so it is `null`/`[]` for a term-mode proof (`:= rfl`); `is_term_proof` marks those
+rows. The **semantic family** — `proof_term_size`, `proof_term_depth` — is sized
+from the elaborated proof term, so it is populated for every theorem including
+term-mode ones. `attributes` lists the declaration's `@[…]` names. The metric
+columns are identical with or without `--reverse-elab`.
+
 ### Decl
 
 Inverts the walk: instead of the whole project, take *one* declaration plus its
@@ -381,13 +404,18 @@ def show(df):
         print("  ".join(str(row[c]).ljust(w[c]) for c in cols).rstrip())
 ```
 
-A record has 26 columns, so select before printing:
+A record has 40 columns, so select before printing:
 
 ```python
 thms = load("plain", "data", "theorems", "train.jsonl")
 defs = load("plain", "data", "definitions.jsonl")
-thms.shape          # (9, 26)
+thms.shape          # (9, 40)
 ```
+
+The last 14 columns are the proof-metric columns. They are always present, but
+carry real values only under `--proof-metrics` (see [Proof
+metrics](#proof-metrics)); a plain run leaves them `null`/`[]`, so the schema is
+the same either way.
 
 **What a record holds.** `signature` and `body` are verbatim source slices; `type`
 is the elaborated, pretty-printed statement.

@@ -364,13 +364,10 @@ def GoalTable.intern (t : GoalTable) (mvar : String) (hyps : Array ProofHyp)
 
 /-- The tactic-node kinds a user can write: the `tactic` and `conv` parser
 categories, read from the file's own environment. See the module docstring for why
-this is the selection test. -/
-def tacticKindSet (env : Environment) : Std.HashSet Name := Id.run do
-  let mut out : Std.HashSet Name := {}
-  for cat in [`tactic, `conv] do
-    if let some c := Lean.Parser.getParserCategory? env cat then
-      out := c.kinds.foldl (fun s k _ => s.insert k) out
-  return out
+this is the selection test. Defined once in `CollectCommon` (shared with
+`Corpus.ProofMetrics`); re-exported here under the name the walk and its tests use. -/
+def tacticKindSet (env : Environment) : Std.HashSet Name :=
+  CollectCommon.tacticKindSet env
 
 /-- Render a goal list under an ALREADY-RESTORED metavariable context, interning
 each into the table. The caller is responsible for entering `runMetaM` with the

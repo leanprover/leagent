@@ -26,3 +26,7 @@ lean_exe decl_closure_tests where
 lean_exe proof_states_tests where
   root := `ProofStatesTests
   supportInterpreter := true
+
+lean_exe proof_metrics_tests where
+  root := `ProofMetricsTests
+  supportInterpreter := true
