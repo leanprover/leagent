@@ -212,6 +212,19 @@ jobs:
                    for l in (root / "metrics/data/theorems/train.jsonl").open()}
           ps = {json.loads(l)["name"]: json.loads(l)
                 for l in (root / "proof-states/data/proof-states/train.jsonl").open()}
+          # Contract invariant, independent of which proofs the example happens to
+          # have: the source marker is non-null IFF a tactic family was measured.
+          # (A term proof or an unmeasured rev-elab body has a null family AND a
+          # null source; anything measured has both.) Holds on every run.
+          for label in ("metrics", "metrics-rev", "plain", "rev-elab"):
+              for r in (json.loads(l) for l in
+                        (root / label / "data/theorems/train.jsonl").open()):
+                  has_family = r["tactic_step_count"] is not None
+                  has_source = r["tactic_metrics_source"] is not None
+                  if has_family != has_source:
+                      failed.append(f"{label}: {r['name']} family/source mismatch "
+                                    f"(step_count={r['tactic_step_count']}, "
+                                    f"source={r['tactic_metrics_source']!r})")
           for name, r in mrecs.items():
               if r["is_term_proof"] or r["tactic_step_count"] is None:
                   failed.append(f"metrics: {name} has null tactic family, want populated")
