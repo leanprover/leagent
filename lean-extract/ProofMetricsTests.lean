@@ -88,6 +88,25 @@ private def testAttributes (env : Environment) : IO Unit := do
   let m2 ← IO.ofExcept <| metricsOf env "def d : Nat := 0"
   assert m2.attributes.isEmpty s!"spurious attributes: {m2.attributes}"
   assert m2.isTermProof "a plain def value is a term, not a tactic proof"
+  -- Regression: an `attrKind` modifier (`local`/`scoped`) must NOT shadow the
+  -- attribute name. `@[local simp]` is `simp`, not `local`.
+  let m3 ← IO.ofExcept <| metricsOf env "@[local simp] theorem loc : True := by trivial"
+  assert (m3.attributes == #["simp"]) s!"attrKind shadowed the name: {m3.attributes}"
+  let m4 ← IO.ofExcept <| metricsOf env "@[scoped simp] theorem scp : True := by trivial"
+  assert (m4.attributes == #["simp"]) s!"scoped attrKind shadowed the name: {m4.attributes}"
+
+/-- Regression: a multi-clause equation proof has one `by` block per clause. The
+whole declaration value is walked, so EVERY clause's tactics are counted — not just
+the first `by`'s. -/
+private def testMultiClause (env : Environment) : IO Unit := do
+  let src := "theorem foo : Nat → True\n  | 0 => by trivial\n  | _ + 1 => by simp"
+  let m ← IO.ofExcept <| metricsOf env src
+  assert (!m.isTermProof) "multi-clause tactic proof flagged as term"
+  -- Both clauses contribute: `trivial` + `simp` = 2 tactics, and `simp` is seen.
+  assert (m.tacticTotalCount == some 2)
+    s!"multi-clause undercount (want 2, only first by measured?): {m.tacticTotalCount}"
+  assert (m.automationTactics == #["simp"])
+    s!"second clause's simp not counted: {m.automationTactics}"
 
 /-- `--reverse-elab` recomputes the tactic family from the synthesized `proof_script`
 (a rendered `by …` string), while `is_term_proof` and `attributes` stay from the
@@ -125,6 +144,7 @@ unsafe def run : IO UInt32 := do
   testCalcSteps env
   testHistogram env
   testAttributes env
+  testMultiClause env
   testMetricsFromScript env
   IO.println "proof metrics tests passed"
   return (0 : UInt32)

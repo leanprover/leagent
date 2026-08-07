@@ -676,11 +676,18 @@ private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
       | some r => maps.metrics[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
       | none   => none
     else none
+  -- Reverse-elaboration only ever runs on THEOREMS (a `def`'s value is a term, not a
+  -- proof — `proofScript` is always `none` for it). So the rev-elab replacement path
+  -- applies only to theorems; a tactic-bodied `def` keeps its AUTHOR metrics whether
+  -- or not `--reverse-elab` is set, rather than being nulled just because the flag is
+  -- on and it produced no script.
+  let isTheorem := match info with | .thmInfo _ => true | _ => false
+  let replaceWithRevElab := opts.reverseElab && isTheorem
   let (metrics?, metricsSource) ←
     match authorMetrics? with
     | none      => pure (none, none)
     | some base =>
-      if opts.reverseElab then
+      if replaceWithRevElab then
         -- Measure the reverse-elaborated body instead. `proofScript` is the rendered
         -- `by …` string (or `none` when reverse-elab produced nothing). When there is
         -- no measurable body, keep `isTermProof`/`attributes` (they describe the
@@ -694,9 +701,10 @@ private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
             | some m => pure (some m, some ProofMetrics.sourceReverseElab)
             | none   => pure unmeasured   -- script did not parse → null, honestly
       else
-        -- Author source. A term proof carries no tactic family, so its source is
-        -- `none` (null marker ⇔ null family), not `"author"` — `isTermProof`
-        -- already records that it is a term proof.
+        -- Author source (plain run, or a non-theorem on a rev-elab run). A term proof
+        -- carries no tactic family, so its source is `none` (null marker ⇔ null
+        -- family), not `"author"` — `isTermProof` already records that it is a term
+        -- proof.
         if base.isTermProof then pure (some base, none)
         else pure (some base, some ProofMetrics.sourceAuthor)
   let (proofTermSize, proofTermDepth) :=
