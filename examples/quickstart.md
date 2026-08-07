@@ -84,12 +84,20 @@ either. Pass `--proof-metrics` (optionally alongside `--reverse-elab`):
 The columns split into two families. The **tactic family** —
 `tactic_step_count`, `tactic_total_count`, `max_tactic_depth`, `tactic_kinds`,
 `tactic_histogram`, `case_split_count`, `rewrite_count`, `have_count`,
-`calc_steps`, `automation_tactics` — is read from the author's `by`-block syntax,
-so it is `null`/`[]` for a term-mode proof (`:= rfl`); `is_term_proof` marks those
-rows. The **semantic family** — `proof_term_size`, `proof_term_depth` — is sized
-from the elaborated proof term, so it is populated for every theorem including
-term-mode ones. `attributes` lists the declaration's `@[…]` names. The metric
-columns are identical with or without `--reverse-elab`.
+`calc_steps`, `automation_tactics` — measures a tactic script's shape. On a plain
+run it reads the author's `by`-block syntax; add `--reverse-elab` and it instead
+measures the *reverse-elaborated* proof body (the script `proof_script` records),
+since that reconstruction is what such a run is about. `tactic_metrics_source`
+names which body each row measured (`"author"` / `"reverse_elab"` / `null`), so a
+row is self-describing regardless of the run. The family is `null`/`[]` when there
+is no script to measure — a term-mode proof on a plain run, or a proof that failed
+to reverse-elaborate on a `--reverse-elab` run; `is_term_proof` always reports the
+*original* proof, so it disambiguates the nulls.
+
+The **semantic family** — `proof_term_size`, `proof_term_depth` — is sized from
+the elaborated proof term, so it is populated for every theorem (including
+term-mode ones) and is *unchanged* by `--reverse-elab` (the reconstruction is defeq
+to the original). `attributes` lists the declaration's `@[…]` names.
 
 ### Decl
 
@@ -404,15 +412,15 @@ def show(df):
         print("  ".join(str(row[c]).ljust(w[c]) for c in cols).rstrip())
 ```
 
-A record has 40 columns, so select before printing:
+A record has 41 columns, so select before printing:
 
 ```python
 thms = load("plain", "data", "theorems", "train.jsonl")
 defs = load("plain", "data", "definitions.jsonl")
-thms.shape          # (9, 40)
+thms.shape          # (9, 41)
 ```
 
-The last 14 columns are the proof-metric columns. They are always present, but
+The last 15 columns are the proof-metric columns. They are always present, but
 carry real values only under `--proof-metrics` (see [Proof
 metrics](#proof-metrics)); a plain run leaves them `null`/`[]`, so the schema is
 the same either way.

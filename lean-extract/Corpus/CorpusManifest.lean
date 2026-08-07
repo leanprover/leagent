@@ -144,6 +144,9 @@ structure CorpusManifestEntry where
   (from proof syntax); the two `proofTerm*` fields are the semantic half (from the
   elaborated proof `Expr`, theorems only). See `Corpus.ProofMetrics`. -/
   metrics       : Option ProofMetrics.TacticMetrics := none
+  /-- Which body `metrics` was measured from: `sourceAuthor` / `sourceReverseElab`,
+  or `none` when `metrics` is `none`. See `ConstRecord.tacticMetricsSource`. -/
+  metricsSource : Option String := none
   /-- Semantic family: distinct sub-expressions of the elaborated proof term
   (`ReverseElab.distinctNodes`). `none` for non-theorems or flag off. -/
   proofTermSize : Option Nat := none
@@ -658,17 +661,40 @@ private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
           | none => pure (none, none)
         else pure (none, none)
     | _ => pure (none, none)
-  -- Proof-complexity metrics (`--proof-metrics`). The tactic family is looked up
-  -- from the syntax-derived map by the decl's selection position (same key as
-  -- sig/body); the semantic family is sized from the elaborated proof term, so it
-  -- is populated for term-mode theorems too (the rows the tactic family leaves
-  -- null). Both are `none` when the flag is off or for non-theorems.
-  let metrics? :=
+  -- Proof-complexity metrics (`--proof-metrics`). The tactic family starts from the
+  -- author's source `by` block (looked up from the syntax-derived map by the decl's
+  -- selection position, the same key as sig/body). On a `--reverse-elab` run it is
+  -- REPLACED by the metrics of the reverse-elaborated body — `--reverse-elab` is the
+  -- request for that reconstruction, so its metrics are what the run reports — and
+  -- nulled when no script was produced. `metricsSource` records which body was
+  -- measured. `isTermProof`/`attributes` are always carried from the author metrics,
+  -- so they describe the ORIGINAL declaration regardless. The semantic family
+  -- (below) is sized from the elaborated term and is unaffected by `--reverse-elab`.
+  let authorMetrics? :=
     if opts.proofMetrics then
       match ranges? with
       | some r => maps.metrics[(r.selectionRange.pos.line, r.selectionRange.pos.column)]?
       | none   => none
     else none
+  let (metrics?, metricsSource) ←
+    match authorMetrics? with
+    | none      => pure (none, none)
+    | some base =>
+      if opts.reverseElab then
+        -- Measure the reverse-elaborated body instead. `proofScript` is the rendered
+        -- `by …` string (or `none` when reverse-elab produced nothing). When there is
+        -- no measurable body, keep `isTermProof`/`attributes` (they describe the
+        -- original decl) but null the tactic family and the source marker.
+        let unmeasured := (some base.withNullTactics, none)
+        match proofScript with
+        | none        => pure unmeasured  -- nothing reconstructed → nothing to measure
+        | some script =>
+            let kinds := CollectCommon.tacticKindSet env
+            match ProofMetrics.metricsFromScript env kinds base script with
+            | some m => pure (some m, some ProofMetrics.sourceReverseElab)
+            | none   => pure unmeasured   -- script did not parse → null, honestly
+      else
+        pure (some base, some ProofMetrics.sourceAuthor)
   let (proofTermSize, proofTermDepth) :=
     if opts.proofMetrics then
       match info with
@@ -707,6 +733,7 @@ private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
     endLine
     endCol
     metrics := metrics?
+    metricsSource
     proofTermSize
     proofTermDepth
   }

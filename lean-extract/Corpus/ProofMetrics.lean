@@ -25,22 +25,31 @@ The metrics split into two families that MUST NOT be conflated, because they
 measure different things and are populated on different rows:
 
 1. **Tactic family** — computed from the AUTHOR'S proof SYNTAX (the `by` block),
-   never from the elaborated term. It measures the human-written tactic script:
-   step counts, nesting depth, which tactics were used, how many rewrites /
-   case-splits / intermediate `have`s. This is `none`/`#[]` for a TERM-mode proof
-   (`:= rfl`, `:= fun …`) — there is no author tactic script to measure. The
-   `isTermProof` flag is what makes those nulls interpretable: `true` means "not a
-   tactic proof", not "a zero-step tactic proof".
+   never from the elaborated term. It measures a tactic script's shape: step
+   counts, nesting depth, which tactics were used, how many rewrites / case-splits
+   / intermediate `have`s. `none`/`#[]` when there is no tactic script to measure
+   (see the two cases below). The `isTermProof` flag makes those nulls
+   interpretable: `true` means "the ORIGINAL proof was a term", not "a zero-step
+   tactic proof".
+
+   WHICH tactic script is measured depends on the run:
+   - Plain (`--proof-metrics` alone): the AUTHOR'S source `by` block. `null` for a
+     term-mode proof (`:= rfl`, `:= fun …`) — there is no author tactic script.
+   - With `--reverse-elab`: the REVERSE-ELABORATED proof body, i.e. the tactic
+     script `proof_script` records. `--reverse-elab` is the request for that
+     machine reconstruction, so its metrics are what the run is about. `null` when
+     reverse-elaboration produced no script (`fail`/`skipped_large`/`timeout`/
+     `deadline_skipped`) — nothing to measure.
+   The `tacticMetricsSource` column names which body every row measured
+   (`sourceAuthor` / `sourceReverseElab` / `null`), because a single wide-table row
+   cannot see the run's flags.
 
 2. **Semantic family** — computed from the elaborated proof `Expr` (in
    `CorpusManifest.buildEntry`, not here): `proofTermSize` / `proofTermDepth`.
    Populated for EVERY theorem including term-mode ones, so it is the complexity
-   signal for the rows the tactic family leaves null.
-
-Provenance never blurs: tactic family = what the author wrote in tactic mode;
-semantic family = the elaborated term, always present. Reverse-elaboration
-(`--reverse-elab`) is orthogonal — it only fills `proof_script`/`proof_method`,
-and the metrics here are byte-identical with or without it.
+   signal for the rows the tactic family leaves null. It is NOT affected by
+   `--reverse-elab`: the reverse-elaborated term is defeq to the original, so the
+   term size/depth are the same body either way.
 
 # Why syntax, not the InfoTree
 
@@ -152,6 +161,16 @@ structure TacticMetrics where
   the declaration modifiers, so present for term and tactic proofs alike. -/
   attributes      : Array String
   deriving Inhabited, Repr
+
+/-- Null every tactic-family field, keeping `isTermProof` and `attributes` — those
+describe the ORIGINAL declaration and stay valid even when there is no tactic body
+to measure (e.g. reverse-elaboration produced no script). Paired with a `none`
+`tacticMetricsSource` at the record level. -/
+def TacticMetrics.withNullTactics (m : TacticMetrics) : TacticMetrics :=
+  { isTermProof := m.isTermProof, tacticStepCount := none, tacticTotalCount := none
+    maxTacticDepth := none, tacticKinds := #[], tacticHistogram := #[]
+    caseSplitCount := none, rewriteCount := none, haveCount := none
+    calcSteps := none, automationTactics := #[], attributes := m.attributes }
 
 /-- The metrics of a proof that is a bare term: everything null but the flag, plus
 whatever `attributes` the caller found on the declaration. -/
@@ -321,5 +340,39 @@ def buildMetricsMap (kinds : Std.HashSet Name) (source : String)
       for key in declarationKeys fileMap cmdStx do
         m := m.insert key metrics
   return m
+
+/-! ## Provenance of the tactic family
+
+On a `--reverse-elab` run the tactic family describes the reverse-elaborated proof
+BODY, not the author's source proof (`--reverse-elab` is the request for the
+machine reconstruction, so its metrics are what the run is about). But a single row
+in the wide table cannot see the run's flags, and "replace" makes the tactic
+columns mean two different things depending on the run — so every row carries a
+`tacticMetricsSource` marker naming which body was measured. `null` marker ⇔ null
+tactic family (nothing measured). -/
+
+/-- The tactic family was computed from the author's source `by` block. -/
+def sourceAuthor : String := "author"
+/-- The tactic family was computed from the reverse-elaborated proof script. -/
+def sourceReverseElab : String := "reverse_elab"
+
+/-- Recompute the tactic family from a reverse-elaborated `by …` script STRING,
+carrying over `isTermProof` and `attributes` from the author-syntax metrics (those
+describe the ORIGINAL declaration, not the reconstruction — a term-proved theorem
+whose script is a synthesized `by exact …` is still `isTermProof := true`).
+
+`none` when the script does not parse or holds no `byTactic` node — the caller then
+nulls the tactic family, since there is no body to measure. Parsing uses the file's
+own `env` so project/Mathlib tactic kinds resolve. -/
+def metricsFromScript (env : Environment) (kinds : Std.HashSet Name)
+    (base : TacticMetrics) (script : String) : Option TacticMetrics :=
+  match Lean.Parser.runParserCategory env `term script with
+  | .error _ => none
+  | .ok stx  =>
+    match findByKind stx [``Lean.Parser.Term.byTactic] with
+    | none        => none
+    | some byNode =>
+      let m := analyzeTacticProof kinds byNode base.attributes
+      some { m with isTermProof := base.isTermProof }
 
 end Corpus.ProofMetrics
