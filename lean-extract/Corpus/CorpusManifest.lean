@@ -694,7 +694,11 @@ private def buildEntry (maps : SourceMaps) (opts : CollectOptions)
             | some m => pure (some m, some ProofMetrics.sourceReverseElab)
             | none   => pure unmeasured   -- script did not parse → null, honestly
       else
-        pure (some base, some ProofMetrics.sourceAuthor)
+        -- Author source. A term proof carries no tactic family, so its source is
+        -- `none` (null marker ⇔ null family), not `"author"` — `isTermProof`
+        -- already records that it is a term proof.
+        if base.isTermProof then pure (some base, none)
+        else pure (some base, some ProofMetrics.sourceAuthor)
   let (proofTermSize, proofTermDepth) :=
     if opts.proofMetrics then
       match info with
