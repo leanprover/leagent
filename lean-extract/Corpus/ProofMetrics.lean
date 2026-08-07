@@ -264,10 +264,11 @@ def analyzeTacticProof (kinds : Std.HashSet Name) (proof : Syntax)
 /-! ## Attributes
 
 `@[simp, reducible]` on a declaration is a `Command.declModifiers` node holding a
-`Term.attributes` block of `Term.attrInstance`s. The attribute NAME is the leading
-identifier of each instance (`Attr.simp "simp" …`, `Attr.simple `reducible …`), so
-harvesting the first identifier/atom token of each `attrInstance` recovers the
-names the way a reader sees them. -/
+`Term.attributes` block of `Term.attrInstance`s. Each `attrInstance` is
+`[attrKind, attr]`: `attrKind` is the optional `scoped`/`local` modifier and `attr`
+carries the name (`Attr.simp "simp" …`, `Attr.simple `reducible …`). The attribute
+NAME is the first name token of the `attr` child — skipping `attrKind`, whose
+`local`/`scoped` keyword would otherwise be mistaken for the name. -/
 
 /-- Attribute names attached to the declaration command `cmdStx`, sorted and
 deduped. `#[]` when the declaration has no `@[…]` block. -/
@@ -275,9 +276,13 @@ partial def attributesOf (cmdStx : Syntax) : Array String := Id.run do
   let some attrs := findByKind cmdStx [``Lean.Parser.Term.attributes] | return #[]
   let mut names : Array String := #[]
   for inst in collectByKind attrs [``Lean.Parser.Term.attrInstance] do
-    -- The attribute name is the first identifier/atom leaf under the instance,
-    -- past the (usually empty) `attrKind`. `firstName?` finds it.
-    if let some n := firstName? inst then
+    -- An `attrInstance` is `[attrKind, attr]`, where `attrKind` holds the OPTIONAL
+    -- `scoped`/`local` modifier. The attribute name is the first name token of the
+    -- `attr` node (child 1) — NOT of the whole instance, because a non-empty
+    -- `attrKind` would otherwise shadow it (`@[local simp]` → `"local"`). We skip
+    -- straight to child 1; `firstName?` then finds the real name (`simp`,
+    -- `deprecated`, …).
+    if let some n := firstName? (inst.getArg 1) then
       unless names.contains n do names := names.push n
   return names.qsort (· < ·)
 where
@@ -289,12 +294,10 @@ where
     match stx with
     | .node _ _ args => args.foldl (fun acc a => collectByKind a kinds acc) acc
     | _              => acc
-  /-- The first identifier or keyword atom under `stx` — the attribute's name. An
-  `attrKind` (the optional `scoped`/`local`) is skipped because it holds no name
-  leaf when empty; when non-empty its keyword would sort before the real name, so
-  we take the LAST such token per instance instead. Simpler and correct here: the
-  attribute name is always the first NON-`attrKind` name token, and `attrKind`
-  contributes none when empty (the common case), so first-token works. -/
+  /-- The first identifier or keyword atom under `stx` — the attribute's name.
+  Applied by the caller to the `attr` node (child 1 of the `attrInstance`), so the
+  `attrKind` modifier is already excluded and the first name token IS the name
+  (`simp`, `deprecated`, `reducible`). -/
   firstName? (stx : Syntax) : Option String :=
     match stx with
     | .ident _ _ n _ =>
@@ -322,9 +325,15 @@ def metricsForCommand (kinds : Std.HashSet Name) (cmdStx : Syntax) : TacticMetri
   match declarationValue? cmdStx with
   | none => TacticMetrics.termProof attrs
   | some (_, value) =>
-    match findByKind value [``Lean.Parser.Term.byTactic] with
-    | some byNode => analyzeTacticProof kinds byNode attrs
-    | none        => TacticMetrics.termProof attrs
+    -- A `by` block ANYWHERE in the value makes this a tactic proof. Presence is
+    -- decided by `findByKind` (first hit), but the WHOLE `value` is then walked —
+    -- not just that first `by` node — so a multi-clause equation proof, a `where`
+    -- auxiliary, or an `if h then by … else by …` counts every clause's tactics.
+    -- `foldTactics` descends through the structural nodes between clauses and only
+    -- tallies tactic-category nodes, so the non-tactic parts contribute nothing.
+    if (findByKind value [``Lean.Parser.Term.byTactic]).isSome then
+      analyzeTacticProof kinds value attrs
+    else TacticMetrics.termProof attrs
 
 /-- Map each declaration's key position to its tactic-family metrics, keyed the way
 `CorpusManifest.buildSourceMap` keys (by `findDeclarationRanges?` selection
