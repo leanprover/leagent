@@ -81,6 +81,33 @@ def signatureBodyOf (cmdStx : Syntax) (source : String) :
 def commandRange? (cmdStx : Syntax) : Option Lean.Syntax.Range :=
   cmdStx.getRange?
 
+/-- The top-level commands whose elaboration EVALUATES a term and therefore aborts
+when that term transitively depends on `sorryAx`. Holing a proof turns these into
+hard build errors ("Aborting evaluation since the expression depends on the 'sorry'
+axiom"), even for a `#eval` in a module that carries no holed proof itself — the
+dependency reaches through imports. These kinds are exactly the ones observed to
+break a `--proofs sorry` corpus reassembly:
+
+* `Lean.Parser.Command.eval` / `.evalBang` — `#eval` / `#eval!`
+* `Lean.reduceCmd` — `#reduce`
+* `Lean.Parser.Command.guardCmd` — `#guard`
+* `Lean.guardMsgsCmd` — `#guard_msgs … in …` (its range spans the leading
+  `/-- info: … -/` docstring and the wrapped command, so erasing it leaves no
+  dangling docstring)
+
+Verified against the installed toolchain by parsing each form; the names are the
+`SyntaxNodeKind`s the parser assigns, not guesses. Non-evaluating diagnostic
+commands (`#check`, `#print`) are deliberately absent: they never run code, so a
+`sorry` cannot make them fail. -/
+def evaluationCommandKinds : List SyntaxNodeKind :=
+  [``Lean.Parser.Command.eval, ``Lean.Parser.Command.evalBang, `Lean.reduceCmd,
+   ``Lean.Parser.Command.guardCmd, `Lean.guardMsgsCmd]
+
+/-- True iff `cmdStx` is one of the evaluation commands that aborts under `sorry`
+(see `evaluationCommandKinds`). -/
+def isEvaluationCommand (cmdStx : Syntax) : Bool :=
+  evaluationCommandKinds.contains cmdStx.getKind
+
 /-- Return the range replaced when erasing a declaration value.
 
 For `:= term`, only `term` is selected. Equation and `where` forms include their

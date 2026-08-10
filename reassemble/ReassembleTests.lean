@@ -1,5 +1,6 @@
 import LeanReassemble
 import Corpus.CorpusManifest
+import Corpus.WorkerExtract
 
 open Lean
 
@@ -269,6 +270,74 @@ private def testCollectingFailures (result : Corpus.Frontend.ElabResult)
   assertIO (retry.edits.size == 1 && retry.edits[0]!.replacement == "")
     "backoff re-plans the failed record as a delete"
 
+/-- A `where`/`let rec` helper is lifted to its own theorem constant, but has no
+standalone command syntax — it lives inside its parent's proof. Its record must be
+classified `auxiliary` (excluded), NOT a failure: the parent's edit already governs
+the text it lives in. Distinct from drift (a record that matches no constant at all),
+which stays a failure. -/
+private unsafe def testAuxiliaryRecords : IO Unit := do
+  let root ← IO.FS.realPath "."
+  let path ← IO.FS.realPath (root / "TestFixtures/AuxiliaryFixture.lean")
+  Corpus.Frontend.initFrontend
+  let importLock : Corpus.Frontend.ImportLock ← Std.Mutex.new ()
+  let result ← Corpus.Frontend.elaborateFile importLock {
+    absPath := path, module := `TestFixtures.AuxiliaryFixture
+    relPath := "TestFixtures/AuxiliaryFixture.lean" }
+  assertIO (!result.hasErrors) "auxiliary fixture frontend elaboration"
+  let entries ← Corpus.corpusManifestCore result
+    { includeInternal := false, includePrivate := false, reverseElab := false,
+      reverseClosers := false, reverseSkip := #[] }
+  let records := entries.map fun e =>
+    Corpus.entryToRecord e result.file.relPath Corpus.TagConfig.empty
+  let theorems := records.filter Corpus.Artifact.isTheoremRecord
+  -- Both the parent and its lifted helper are theorem records for this file.
+  let hasParent := theorems.any (·.name == "AuxiliaryFixture.parent")
+  let hasHelper := theorems.any (·.name == "AuxiliaryFixture.parent.helper")
+  assertIO (hasParent && hasHelper)
+    "fixture should yield both the parent and its lifted where-helper as records"
+  let outcome ← LeanReassemble.planEditsCollecting result theorems .replace
+  -- The helper is auxiliary; the parent (and any other real theorem) plans; nothing
+  -- is a failure.
+  assertIO (outcome.auxiliaries.contains "AuxiliaryFixture.parent.helper")
+    "the where-helper is classified auxiliary"
+  assertIO (outcome.failures.isEmpty)
+    "an auxiliary is not reported as a failure"
+  assertIO (outcome.edits.any (·.declaration == "AuxiliaryFixture.parent"))
+    "the parent theorem still plans an edit"
+  -- Drift (a record naming no real constant) stays a failure, not an auxiliary.
+  let bogus := { theorems[0]! with name := "AuxiliaryFixture.doesNotExist" }
+  let driftOutcome ← LeanReassemble.planEditsCollecting result #[bogus] .replace
+  assertIO (driftOutcome.auxiliaries.isEmpty && driftOutcome.failures.size == 1)
+    "a record matching no declaration is a failure, not an auxiliary"
+
+/-- `evalStripEdits` erases exactly the evaluation commands (`#eval`, `#eval!`,
+`#reduce`, `#guard`, `#guard_msgs`) — including a `#guard_msgs` block's leading
+docstring — and leaves every declaration (`def`, `theorem`) and `#check` untouched.
+These are the commands that abort a `--proofs sorry` build. -/
+private unsafe def testEvalStrip : IO Unit := do
+  let root ← IO.FS.realPath "."
+  let path ← IO.FS.realPath (root / "TestFixtures/EvalFixture.lean")
+  Corpus.Frontend.initFrontend
+  let importLock : Corpus.Frontend.ImportLock ← Std.Mutex.new ()
+  let result ← Corpus.Frontend.elaborateFile importLock {
+    absPath := path, module := `TestFixtures.EvalFixture
+    relPath := "TestFixtures/EvalFixture.lean" }
+  assertIO (!result.hasErrors) "eval fixture frontend elaboration"
+  let edits := LeanReassemble.evalStripEdits result
+  -- Five evaluation commands in the fixture: #eval, #eval!, #reduce, #guard, #guard_msgs.
+  assertIO (edits.size == 5) s!"expected 5 eval-strip edits, got {edits.size}"
+  for edit in edits do
+    assertIO (edit.replacement == "") "eval-strip replacement is empty"
+  let stripped ← LeanReassemble.applyEdits result.source edits
+  -- Every evaluation command is gone (including the docstring that fed #guard_msgs).
+  for token in ["#eval", "#eval!", "#reduce", "#guard", "#guard_msgs", "info: 42"] do
+    assertIO (!stripped.contains token) s!"eval-strip left `{token}` behind"
+  -- Declarations and #check survive: they never evaluate, so a sorry can't break them.
+  assertIO (stripped.contains "def answer : Nat := 42") "eval-strip removed a definition"
+  assertIO (stripped.contains "theorem answer_eq : answer = 42 := rfl")
+    "eval-strip removed a theorem"
+  assertIO (stripped.contains "#check answer") "eval-strip removed #check"
+
 private def testManifestParity (result : Corpus.Frontend.ElabResult)
     (records : Array Corpus.ConstRecord) : IO Unit := do
   let shared := Corpus.SourceSyntax.buildSourceMap result.source result.commands
@@ -359,6 +428,17 @@ private unsafe def testMaterializers : IO Unit := do
       "Fixture" / "Basic.olean").pathExists) "repository clean build"
     assertIO (← (repoRoot / "rewrite-report.json").pathExists)
       "repository rewrite report"
+    -- The eval-strip pass (default under sorry) reaches the record-free `Examples`
+    -- module via its second pass: its evaluation commands are gone and the report
+    -- records the strip, while its imports/namespace survive.
+    let examples ← IO.FS.readFile (repoRoot / "Fixture" / "Examples.lean")
+    assertIO (!examples.contains "#eval" && !examples.contains "#guard")
+      "eval-strip removed evaluation commands from the Examples module"
+    assertIO (examples.contains "namespace Fixture.Examples")
+      "eval-strip preserved the Examples module's declarations"
+    let repoReport ← IO.FS.readFile (repoRoot / "rewrite-report.json")
+    assertIO (repoReport.contains "\"eval_stripped\"" && repoReport.contains "Examples.lean")
+      "rewrite report records the eval strip"
     expectFailure "existing materialization output" do
       LeanReassemble.materializeRepo {
         sourceRoot
@@ -455,6 +535,10 @@ private unsafe def testFailurePolicies : IO Unit := do
     assertIO (skipFile.contains "sorry") "skip still sorries the good theorem"
     assertIO (← (skipOut / "repos" / "TestProject" / ".lake" / "build" / "lib" / "lean" /
       "Fixture" / "Basic.olean").pathExists) "skip artifact builds"
+    -- The report must NAME the skipped theorem and its reason, not just count it.
+    let skipReport ← IO.FS.readFile (skipOut / "repos" / "TestProject" / "rewrite-report.json")
+    assertIO (skipReport.contains "\"Fixture.first\"" && skipReport.contains "\"skipped\"")
+      "skip report names the skipped theorem"
     -- `backoff`: `first` is deleted; project still builds.
     LeanReassemble.materializeRepo {
       sourceRoot, records := recordsPath, output := backoffOut, onFailure := .backoff }
@@ -464,6 +548,10 @@ private unsafe def testFailurePolicies : IO Unit := do
     assertIO (backoffFile.contains "sorry") "backoff still sorries the good theorem"
     assertIO (← (backoffOut / "repos" / "TestProject" / ".lake" / "build" / "lib" / "lean" /
       "Fixture" / "Basic.olean").pathExists) "backoff artifact builds"
+    let backoffReport ← IO.FS.readFile
+      (backoffOut / "repos" / "TestProject" / "rewrite-report.json")
+    assertIO (backoffReport.contains "\"Fixture.first\"" && backoffReport.contains "\"failed\"")
+      "backoff report names the failed theorem"
     assertIO ((← IO.FS.readFile sourcePath) == original) "source tree unchanged by policies"
   finally
     removeDirIfExists skipOut
@@ -479,6 +567,8 @@ unsafe def run : IO Unit := do
   testDeleteProofs result records
   testManifestOverride result records
   testCollectingFailures result records
+  testAuxiliaryRecords
+  testEvalStrip
   testManifestParity result records
   testFailures result records
   let output := "/tmp/lean-reassemble-rewrite-test.lean"
