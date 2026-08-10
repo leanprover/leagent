@@ -224,19 +224,53 @@ private def planEdit (source : String) (command : Syntax) (record : Corpus.Const
 
 /-- The result of planning a set of records against one file. `edits` are the
 records that matched and planned; `failures` pairs each record that could not be
-planned with the reason. The strict `planEdits` throws on the first failure; the
-resilient policies (`skip`/`backoff`) inspect `failures` instead. -/
+planned with the reason; `auxiliaries` names records that are not reassembly targets
+at all (see `RecordPlan.auxiliary`). The strict `planEdits` throws on the first
+failure; the resilient policies (`skip`/`backoff`) inspect `failures` instead. -/
 structure PlanOutcome where
   edits : Array Edit
   failures : Array (String × String)
+  auxiliaries : Array String
 
-/-- Plan the edit for one record against `candidates`, returning either the edit
-and the declaration key it matched, or an attributable failure reason. Never
+/-- The outcome of planning one record against its file.
+
+`auxiliary` is the case the corpus surfaced: a record that matches a real elaborated
+constant, but whose declaration has NO standalone command syntax to edit — a
+`where`/`let rec` helper (lifted to its own constant but written inside its parent's
+`where` clause) or a member of a `mutual … end` block. The reassembler neither can
+nor needs to hole such a declaration on its own: under `keep` it rides along inside
+its parent's preserved proof, and under `sorry`/`delete` the parent's edit already
+erases the whole body it lives in. It is therefore **informational** — excluded from
+the target set, not reported as a failure. This is distinct from "did not match a
+declaration" (`failed`), which means the record disagrees with the source (drift). -/
+inductive RecordPlan where
+  | planned (edit : Edit) (key : Nat × Nat)
+  | auxiliary
+  | failed (reason : String)
+
+/-- One theorem the run could not reassemble, with the action taken. `action` is
+`"skipped"` (its proof left as-is / no task emitted) or `"failed"` (backed off to a
+delete). Collected so the artifact's report NAMES what did not reassemble, rather
+than only tallying counts — a `skip`/`backoff` run is then auditable after the
+fact. -/
+structure FailureReport where
+  name : String
+  action : String
+  reason : String
+  deriving Inhabited
+
+/-- Render collected failures as a JSON array of `{theorem, action, reason}`. -/
+def failuresJson (failures : Array FailureReport) : Lean.Json :=
+  Lean.Json.arr <| failures.map fun f => Lean.Json.mkObj [
+    ("theorem", f.name), ("action", f.action), ("reason", f.reason)]
+
+/-- Plan the edit for one record against `candidates`, classifying the record as
+`planned`, `auxiliary` (no standalone syntax — see `RecordPlan`), or `failed`. Never
 throws for a per-record problem — that is what makes it usable under `skip`. -/
 private def planOneRecord (frontendResult : Corpus.Frontend.ElabResult)
     (candidates : Array Candidate) (matchedKeys : Std.HashSet (Nat × Nat))
     (record : Corpus.ConstRecord) (mode : ProofMode)
-    : IO (Except String (Edit × (Nat × Nat))) := do
+    : IO RecordPlan := do
   try
     if record.module != frontendResult.file.module.toString then
       fail s!"record module does not match source file for {record.name}"
@@ -251,15 +285,20 @@ private def planOneRecord (frontendResult : Corpus.Frontend.ElabResult)
     let candidate := matchingCandidates[0]!
     if matchedKeys.contains candidate.key then
       fail s!"multiple records matched declaration {record.name}"
+    -- The record matched a real elaborated constant, but no top-level command covers
+    -- its position: it is a `where`/`let rec` auxiliary or a `mutual` member, written
+    -- inside another declaration's syntax. Such a constant has no proof to hole on its
+    -- own — its parent's edit already governs the text it lives in — so it is an
+    -- auxiliary, not a failure. (Contrast the zero-candidate case above: that is drift.)
     let some command :=
         commandForKey? frontendResult.source frontendResult.commands candidate.key
-      | fail s!"declaration syntax not found for {record.name}"
+      | return .auxiliary
     let edit ← planEdit frontendResult.source command record mode
-    return .ok (edit, candidate.key)
+    return .planned edit candidate.key
   catch error =>
     -- Strip the shared prefix so a collected reason reads cleanly in a report.
     let message := error.toString
-    return .error ((message.dropPrefix "lean-reassemble: ").copy)
+    return .failed ((message.dropPrefix "lean-reassemble: ").copy)
 
 /-- Match records to declarations and compute non-overlapping source edits,
 collecting per-record failures rather than aborting on the first.
@@ -274,15 +313,17 @@ def planEditsCollecting (frontendResult : Corpus.Frontend.ElabResult)
   let candidates ← declarationCandidates frontendResult
   let mut edits := #[]
   let mut failures := #[]
+  let mut auxiliaries := #[]
   let mut matchedKeys : Std.HashSet (Nat × Nat) := {}
   for record in records do
     match ← planOneRecord frontendResult candidates matchedKeys record (modeFor record.name) with
-    | .ok (edit, key) =>
+    | .planned edit key =>
       matchedKeys := matchedKeys.insert key
       edits := edits.push edit
-    | .error reason => failures := failures.push (record.name, reason)
+    | .auxiliary => auxiliaries := auxiliaries.push record.name
+    | .failed reason => failures := failures.push (record.name, reason)
   validateEdits frontendResult.source edits
-  return { edits, failures }
+  return { edits, failures, auxiliaries }
 
 /-- Match records to declarations and compute non-overlapping source edits.
 
@@ -300,6 +341,30 @@ def planEdits (frontendResult : Corpus.Frontend.ElabResult)
   if let some (_, reason) := outcome.failures[0]? then
     fail reason
   return outcome.edits
+
+/-- Delete-edits that erase every evaluation command (`#eval`, `#eval!`, `#reduce`,
+`#guard`, `#guard_msgs`) in an elaborated file.
+
+These commands abort the build once a proof they transitively depend on is holed
+("Aborting evaluation since the expression depends on the 'sorry' axiom"), so a
+`--proofs sorry` reassembly must remove them to build. Each edit covers the whole
+command range — including a `#guard_msgs` block's leading `/-- info: … -/`
+docstring — with an empty replacement, so no dangling docstring is left behind.
+
+The ranges come from the SAME `frontendResult` a file's proof edits do, so both
+sets share one coordinate space and compose in a single `applyEdits` pass. Every
+`theorem`/`def` is left intact — only the evaluation commands are removed. -/
+def evalStripEdits (frontendResult : Corpus.Frontend.ElabResult) : Array Edit := Id.run do
+  let source := frontendResult.source
+  let mut edits := #[]
+  for cmd in frontendResult.commands do
+    if Corpus.SourceSyntax.isEvaluationCommand cmd then
+      if let some range := Corpus.SourceSyntax.commandRange? cmd then
+        let expected := String.Pos.Raw.extract source range.start range.stop
+        edits := edits.push {
+          declaration := s!"«eval command @ {range.start.byteIdx}»"
+          range, expected, replacement := "" }
+  return edits
 
 /-- Apply validated byte-range edits in one left-to-right pass. -/
 def applyEdits (source : String) (edits : Array Edit) : IO String := do

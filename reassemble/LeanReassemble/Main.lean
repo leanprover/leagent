@@ -11,7 +11,7 @@ Usage:
 
   lean_reassemble materialize-repo --source-root <lake-project>
     --records <declarations.jsonl> --output <artifact-dir>
-    [--build-target <target>] [--proofs sorry|keep|delete]
+    [--build-target <target>] [--proofs sorry|keep|delete] [--keep-eval]
 
   lean_reassemble materialize-units --source-root <lake-project>
     --records <declarations.jsonl> --output <artifact-dir>
@@ -33,7 +33,16 @@ names to keep|sorry|delete. Theorems it does not name follow --proofs.
 skip omits it (recorded as skipped); backoff deletes it (recorded as failed) and
 continues. Both recover from PLANNING failures; a post-rewrite build break in
 materialize-repo still aborts, since it usually points at a dependent rather than
-the holed theorem."
+the holed theorem. Under skip/backoff the run's report NAMES each skipped/failed
+theorem and its reason, not just a count.
+
+--keep-eval (materialize-repo only) preserves #eval/#eval!/#reduce/#guard/#guard_msgs
+commands verbatim. By default, once the run holes or deletes any proof, those
+commands are stripped from the reassembled tree: Lean refuses to evaluate an
+expression that transitively depends on `sorry`, so a #eval reaching a holed proof
+would otherwise fail the build. Stripping erases only the evaluation commands (a
+#guard_msgs block with its docstring included); every theorem and definition is
+kept and still holed. A pure --proofs keep run holes nothing, so it never strips."
 
 private def requireArg (name : String) : Option String → Except String String
   | some value => .ok value
@@ -96,6 +105,7 @@ private def parseRewriteArgs (args : List String) : Except String RewriteConfig 
 private def parseMaterializeArgs (args : List String) : Except String MaterializeConfig := do
   let rec go (remaining : List String) (sourceRoot records output buildTarget : Option String)
       (manifest : Option String) (mode : ProofMode) (onFailure : FailurePolicy)
+      (keepEval : Bool)
       : Except String MaterializeConfig :=
     match remaining with
     | [] => return {
@@ -106,23 +116,26 @@ private def parseMaterializeArgs (args : List String) : Except String Materializ
         proofMode := mode
         manifestPath := manifest.map System.FilePath.mk
         onFailure
+        keepEval
       }
     | "--source-root" :: value :: tail =>
-        go tail (some value) records output buildTarget manifest mode onFailure
+        go tail (some value) records output buildTarget manifest mode onFailure keepEval
     | "--records" :: value :: tail =>
-        go tail sourceRoot (some value) output buildTarget manifest mode onFailure
+        go tail sourceRoot (some value) output buildTarget manifest mode onFailure keepEval
     | "--output" :: value :: tail =>
-        go tail sourceRoot records (some value) buildTarget manifest mode onFailure
+        go tail sourceRoot records (some value) buildTarget manifest mode onFailure keepEval
     | "--build-target" :: value :: tail =>
-        go tail sourceRoot records output (some value) manifest mode onFailure
+        go tail sourceRoot records output (some value) manifest mode onFailure keepEval
     | "--manifest" :: value :: tail =>
-        go tail sourceRoot records output buildTarget (some value) mode onFailure
+        go tail sourceRoot records output buildTarget (some value) mode onFailure keepEval
     | "--proofs" :: value :: tail => do
-        go tail sourceRoot records output buildTarget manifest (← parseProofMode value) onFailure
+        go tail sourceRoot records output buildTarget manifest (← parseProofMode value) onFailure keepEval
     | "--on-failure" :: value :: tail => do
-        go tail sourceRoot records output buildTarget manifest mode (← parseFailurePolicy value)
+        go tail sourceRoot records output buildTarget manifest mode (← parseFailurePolicy value) keepEval
+    | "--keep-eval" :: tail =>
+        go tail sourceRoot records output buildTarget manifest mode onFailure true
     | flag :: _ => throw s!"unknown or incomplete argument: {flag}"
-  go args none none none none none .replace .fail
+  go args none none none none none .replace .fail false
 
 private def parseArgs : List String → Except String Command
   | "rewrite-file" :: rest => .rewriteFile <$> parseRewriteArgs rest

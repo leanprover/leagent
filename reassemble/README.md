@@ -17,7 +17,7 @@ lake exe lean_reassemble materialize-repo \
   --records <records.jsonl> \
   --output <artifact-dir> \
   [--build-target <target>] [--proofs sorry|keep|delete] \
-  [--manifest <manifest.json>] [--on-failure fail|skip|backoff]
+  [--manifest <manifest.json>] [--on-failure fail|skip|backoff] [--keep-eval]
 
 lake exe lean_reassemble materialize-units \
   --source-root <lake-project> \
@@ -89,7 +89,17 @@ is reflected faithfully:
 
 ```json
 { "proof_mode": "keep", "eligible": 104, "replaced": 0,
-  "preserved": 104, "deleted": 0, "skipped": 0, "failed": 0 }
+  "preserved": 104, "deleted": 0, "skipped": 0, "failed": 0, "failures": [] }
+```
+
+`failures` names each theorem behind the `skipped`/`failed` counts, so a best-effort
+run is auditable rather than only tallied (it is empty under `--on-failure fail`):
+
+```json
+"failures": [
+  { "theorem": "Project.Term.preservation", "action": "skipped",
+    "reason": "theorem record did not match a declaration: Project.Term.preservation" }
+]
 ```
 
 ## Per-Theorem Manifest
@@ -130,10 +140,44 @@ Under `skip`, repo mode leaves the failing theorem's **original proof in place**
 units mode emits no task for it. Under `backoff`, the theorem is deleted — a record
 that matches no declaration has nothing to delete, so it falls through to a skip.
 
+### Auxiliary declarations (excluded, not failed)
+
+A `where`/`let rec` proof helper, or a member of a `mutual … end` block, is lifted by
+Lean into its own kernel constant — so the extractor emits a record for it — but it
+has **no standalone command syntax**: it is written inside its parent declaration.
+The reassembler cannot (and need not) hole such a constant on its own — under `keep`
+it rides along inside its parent's preserved proof, and under `sorry`/`delete` the
+parent's edit already erases the whole body it lives in. These records are therefore
+classified **auxiliary**: excluded from the target set and counted in `auxiliary`,
+*not* reported as failures. So a project using `where`-helpers reassembles cleanly
+under the default `--on-failure fail`. This is distinct from a record that matches no
+declaration at all (source/extraction drift), which stays a genuine failure.
+
 `skip`/`backoff` recover from **planning** failures. A post-rewrite `lake build`
 break in `materialize-repo` still aborts regardless of policy: such a break is
 almost always at a *dependent* of a holed or deleted theorem, not at that theorem,
 so there is no safe declaration to auto-attribute and remove.
+
+## Evaluation Commands and `--keep-eval`
+
+Lean refuses to evaluate an expression that transitively depends on `sorry`
+("Aborting evaluation since the expression depends on the 'sorry' axiom"). So a
+`#eval` / `#eval!` / `#reduce` / `#guard` / `#guard_msgs` that reaches a holed proof
+— even indirectly, through an import — turns into a hard build error the moment a
+proof is holed. This most often bites an `Examples.lean` full of `#eval`/`#guard_msgs`
+anti-vacuity checks.
+
+`materialize-repo` therefore **strips these evaluation commands by default** whenever
+the run holes or deletes at least one proof. Stripping erases only the evaluation
+commands (a `#guard_msgs` block is removed together with its `/-- info: … -/`
+docstring); every `theorem` and `def` — including those living beside the evals in
+an `Examples` module — is kept and holed as usual, so no theorem is lost from the
+artifact. A pure `--proofs keep` run holes nothing and so never strips. Each strip is
+reported per file in `rewrite-report.json` as `eval_stripped`.
+
+Pass `--keep-eval` to preserve the evaluation commands verbatim (the historical
+behavior); under `--proofs sorry` this reproduces the build break above, so it is
+mainly useful with `--proofs keep`.
 
 ## Repository Artifacts
 

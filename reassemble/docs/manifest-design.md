@@ -141,6 +141,51 @@ which violates the "don't paper over failures" principle. So:
   failure is the user's, per decision 2); manifest override precedence;
   back-off degrading a failing theorem to delete.
 
+## Follow-on: eval-strip + named failure reports (as built)
+
+A corpus run of `materialize-repo --proofs sorry` across ~110 projects surfaced two
+gaps this design did not cover, both now closed:
+
+1. **Evaluation commands abort under `sorry`.** `#eval`/`#eval!`/`#reduce`/`#guard`/
+   `#guard_msgs` refuse to run once their expression transitively depends on `sorry`
+   ("Aborting evaluation since the expression depends on the 'sorry' axiom"), so a
+   module full of anti-vacuity `#eval`s (typically `Examples.lean`) fails the
+   whole-tree build the moment any proof it reaches is holed — including reaching
+   through imports, so a *record-free* module still breaks. This was the single
+   largest failure bucket in the run (24 projects).
+   - Fix: `materializeRepo` strips exactly those commands (`SourceSyntax.evaluationCommandKinds`,
+     verified against the toolchain's parser kinds) whenever the run holes/deletes a
+     proof. Stripping erases only the eval command — a `#guard_msgs` block including
+     its `/-- info -/` docstring — and keeps every `theorem`/`def`, so an `Examples`
+     module's own named theorems are still holed and verified (no theorem lost). The
+     eval edits share the file's `frontendResult`, so they compose with proof edits in
+     one `applyEdits` pass; record-free modules are handled by a second pass over
+     `Discover.discoverFiles` (textually prefiltered). `--keep-eval` opts out; a pure
+     `--proofs keep` run holes nothing and so never strips.
+2. **Failures were counted but not named.** `skip`/`backoff` only bumped `skipped`/
+   `failed` and `eprintln`'d each reason. The report now carries a `failures` array
+   (`{theorem, action, reason}`) in `rewrite_summary`, in both repo and units mode, so
+   a best-effort run is auditable from the artifact alone. This directly serves "do
+   best effort and report things that failed to reassemble" — the 17+2 projects whose
+   nested/auxiliary or drifted records could not plan are now recoverable under `skip`
+   with a named report rather than aborting the project.
+3. **Auxiliaries were miscategorized as failures.** A `where`/`let rec` helper or a
+   `mutual` member is lifted to its own constant (so a record exists) but has no
+   standalone command syntax to edit. Planning previously reported "declaration syntax
+   not found" and treated it as a failure — which aborted the project under the default
+   `--on-failure fail`. This was the largest failure bucket in the run (17 projects).
+   - Fix: `planOneRecord` now returns a three-way `RecordPlan` — `planned` / `auxiliary`
+     / `failed`. The discriminator is precise and non-heuristic: a record that matched a
+     real elaborated constant but whose declaration key is covered by no top-level
+     command is `auxiliary`; a record that matched no constant at all is `failed`
+     (drift, e.g. References/Sub). Auxiliaries are excluded from the target set and
+     counted in a new `auxiliary` bucket (which keeps the `accounted == theorems.size`
+     invariant whole); they never abort, in any policy. Holing the *parent* already
+     governs the helper — verified that holing a `by` block while leaving its `where`
+     clause intact compiles with only a `sorry` warning. Units mode excludes an
+     auxiliary target the same way it excludes a `delete` target: there is no
+     "reconstruct this helper in isolation" task to emit.
+
 ## Open risks
 
 - Repo-mode attribution is the one fragile piece; explicitly best-effort with a

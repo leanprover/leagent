@@ -23,6 +23,12 @@ structure MaterializeConfig where
   manifestPath : Option System.FilePath := none
   /-- What to do when a theorem fails to reassemble. -/
   onFailure : FailurePolicy := .fail
+  /-- Whether to KEEP evaluation commands (`#eval`, `#guard`, `#guard_msgs`, …) in
+  the reassembled tree. They abort the build once a proof they transitively depend
+  on is holed, so `materialize-repo` strips them by default whenever the run holes
+  or deletes at least one proof. Set to skip that strip and preserve them verbatim
+  (the historical behavior, and correct when nothing is holed). -/
+  keepEval : Bool := false
 
 private def artifactPath (path : System.FilePath) : String :=
   path.toString.replace "\\" "/"
@@ -144,13 +150,18 @@ private def projectName (root : System.FilePath) : IO String :=
 
 /-- Per-action tallies for a run. With a manifest, a single run can mix actions,
 so the buckets are counted from each theorem's resolved mode rather than derived
-from one global mode. `skipped`/`failed` come from the failure policy (Phase 3). -/
+from one global mode. `skipped`/`failed` come from the failure policy (Phase 3).
+`auxiliary` counts theorem records that are not reassembly targets at all — `where`/
+`let rec` helpers and `mutual` members with no standalone syntax (see
+`RecordPlan.auxiliary`); they are excluded rather than holed, and this bucket keeps
+the accounting total whole. -/
 structure RewriteCounts where
   replaced : Nat := 0
   preserved : Nat := 0
   deleted : Nat := 0
   skipped : Nat := 0
   failed : Nat := 0
+  auxiliary : Nat := 0
 
 /-- Add one resolved action to the tally. -/
 def RewriteCounts.bump (counts : RewriteCounts) : ProofMode → RewriteCounts
@@ -160,9 +171,11 @@ def RewriteCounts.bump (counts : RewriteCounts) : ProofMode → RewriteCounts
 
 /-- The rewrite summary. `proof_mode` reports the run default; the buckets report
 the resolved action per theorem, so a manifest that mixes actions is reflected
-faithfully. -/
+faithfully. `failures` NAMES the theorems behind the `skipped`/`failed` counts (with
+the reason each could not be reassembled), so a best-effort run is auditable rather
+than only tallied; it is empty under `--on-failure fail`. -/
 private def rewriteSummary (mode : ProofMode) (eligible : Nat)
-    (counts : RewriteCounts) : Json :=
+    (counts : RewriteCounts) (failures : Array FailureReport := #[]) : Json :=
   Json.mkObj [
     ("proof_mode", toString mode),
     ("eligible", eligible),
@@ -170,7 +183,9 @@ private def rewriteSummary (mode : ProofMode) (eligible : Nat)
     ("preserved", counts.preserved),
     ("deleted", counts.deleted),
     ("skipped", counts.skipped),
-    ("failed", counts.failed)
+    ("failed", counts.failed),
+    ("auxiliary", counts.auxiliary),
+    ("failures", failuresJson failures)
   ]
 
 /-- Load the optional manifest and validate its keys against `eligible`. -/
@@ -195,8 +210,24 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
   copyTree sourceRoot repoRoot
   removeIfExists (repoRoot / ".git")
   removeIfExists (repoRoot / ".lake")
+  -- Evaluation commands (`#eval`, `#guard_msgs`, …) abort once a proof they reach
+  -- through is holed, so we strip them WHEN the run actually holes or deletes a
+  -- proof. `.keep` on its own holes nothing (the artifact is byte-faithful and would
+  -- build untouched), so we only arm stripping when the resolved actions include a
+  -- `.replace`/`.delete` — either from the default mode or a manifest override. The
+  -- gate is run-level, not per-file: a `#eval` in a record-free module still breaks
+  -- if it imports a holed proof, so those files must be stripped too. `--keep-eval`
+  -- forces it off.
+  let holingModes : Bool :=
+    theorems.any fun t => modeFor t.name != ProofMode.keep
+  let stripEval := !config.keepEval && holingModes
   let mut counts : RewriteCounts := {}
+  let mut failures : Array FailureReport := #[]
   let mut rewrittenFiles : Array Json := #[]
+  -- Files that carry theorem records are rewritten below; track them so the later
+  -- eval-strip pass skips them (their eval edits are merged in here, in the SAME
+  -- coordinate space as their proof edits) and only visits record-free modules.
+  let mut rewrittenPaths : Std.HashSet String := {}
   for file in theoremFiles theorems do
     -- Under `fail` this is the historical strict path: any per-record planning
     -- problem aborts. Under `skip`/`backoff` we plan resiliently and act on each
@@ -209,19 +240,19 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
     -- aborts under every policy. skip/backoff recover per-theorem planning failures.
     let prepared ← prepareSourceFile sourceRoot file
     let selected ← selectTheorems records prepared.relFile
-    let mut edits : Array Edit := #[]
+    -- Plan resiliently in every policy: `planEditsCollecting` classifies each record
+    -- as planned / auxiliary / failed. Auxiliaries (no standalone syntax) are counted
+    -- and excluded under all policies; only `fail` re-throws on a genuine failure.
+    let outcome ← planEditsCollecting prepared.frontendResult selected
+      config.proofMode modeFor
+    for edit in outcome.edits do
+      counts := counts.bump (modeFor edit.declaration)
+    counts := { counts with auxiliary := counts.auxiliary + outcome.auxiliaries.size }
+    let mut edits : Array Edit := outcome.edits
     if config.onFailure == .fail then
-      edits ← planEdits prepared.frontendResult selected config.proofMode modeFor
-      for edit in edits do
-        counts := counts.bump (modeFor edit.declaration)
+      if let some (_, reason) := outcome.failures[0]? then
+        fail reason
     else
-      let outcome ← planEditsCollecting prepared.frontendResult selected
-        config.proofMode modeFor
-      for edit in outcome.edits do
-        counts := counts.bump (modeFor edit.declaration)
-      for (name, reason) in outcome.failures do
-        IO.eprintln s!"lean-reassemble: {config.onFailure} {name}: {reason}"
-      edits := outcome.edits
       -- `backoff` retries the failed records as deletes; any that still cannot be
       -- planned (e.g. their declaration syntax is unrecoverable) fall through to a
       -- skip. `skip` records nothing further — the theorem keeps its source proof.
@@ -230,25 +261,65 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
         let failedRecords := selected.filter (failedNames.contains ·.name)
         let retry ← planEditsCollecting prepared.frontendResult failedRecords .delete
         edits := edits ++ retry.edits
+        let retried := Std.HashSet.ofArray (retry.edits.map (·.declaration))
         counts := { counts with failed := counts.failed + retry.edits.size }
         counts := { counts with
           skipped := counts.skipped + (outcome.failures.size - retry.edits.size) }
+        for (name, reason) in outcome.failures do
+          let action := if retried.contains name then "failed" else "skipped"
+          IO.eprintln s!"lean-reassemble: {action} {name}: {reason}"
+          failures := failures.push { name, action, reason }
       else
         counts := { counts with skipped := counts.skipped + outcome.failures.size }
-    let text ← applyEdits prepared.frontendResult.source edits
+        for (name, reason) in outcome.failures do
+          IO.eprintln s!"lean-reassemble: skipped {name}: {reason}"
+          failures := failures.push { name, action := "skipped", reason }
+    -- Merge eval-strip edits (if armed) into the proof edits for this file. Both come
+    -- from `prepared.frontendResult`, so they share one coordinate space and one
+    -- `applyEdits` pass. `validateEdits` (inside `applyEdits`) still guards overlap.
+    let stripped := if stripEval then evalStripEdits prepared.frontendResult else #[]
+    let allEdits := edits ++ stripped
+    let text ← applyEdits prepared.frontendResult.source allEdits
     let outputPath := repoRoot / file
     if let some parent := outputPath.parent then
       IO.FS.createDirAll parent
     IO.FS.writeFile outputPath text
+    rewrittenPaths := rewrittenPaths.insert prepared.relFile
     rewrittenFiles := rewrittenFiles.push <| Json.mkObj [
       ("file", file),
       ("module", prepared.moduleName.toString),
-      ("edits", edits.size)
+      ("edits", edits.size),
+      ("eval_stripped", stripped.size)
     ]
+  -- Second pass: record-free modules the theorem loop never touched can still hold
+  -- `#eval`s that reach a holed proof through imports (e.g. an `Examples.lean` with
+  -- no theorems of its own). Strip those in place so the whole tree builds. A cheap
+  -- textual prefilter (an eval command always writes one of these tokens) avoids
+  -- elaborating the many files that carry none — in practice eval commands cluster
+  -- in one or two modules per project.
+  if stripEval then
+    for df in ← Corpus.Discover.discoverFiles sourceRoot #[] do
+      if rewrittenPaths.contains df.relPath then continue
+      let raw ← IO.FS.readFile df.absPath
+      let mentionsEval := ["#eval", "#reduce", "#guard"].any fun tok =>
+        (raw.splitOn tok).length > 1
+      unless mentionsEval do continue
+      let prepared ← prepareSourceFile sourceRoot df.relPath
+      let stripped := evalStripEdits prepared.frontendResult
+      if stripped.isEmpty then continue
+      let text ← applyEdits prepared.frontendResult.source stripped
+      IO.FS.writeFile (repoRoot / df.relPath) text
+      rewrittenFiles := rewrittenFiles.push <| Json.mkObj [
+        ("file", df.relPath),
+        ("module", prepared.moduleName.toString),
+        ("edits", 0),
+        ("eval_stripped", stripped.size)
+      ]
   -- Every eligible theorem is accounted for exactly once: as a resolved action
-  -- (replaced/preserved/deleted), a backoff deletion (`failed`), or a `skipped`.
+  -- (replaced/preserved/deleted), a backoff deletion (`failed`), a `skipped`, or an
+  -- `auxiliary` (no standalone syntax, so excluded rather than holed).
   let accounted := counts.replaced + counts.preserved + counts.deleted
-    + counts.skipped + counts.failed
+    + counts.skipped + counts.failed + counts.auxiliary
   if accounted != theorems.size then
     fail s!"theorem accounting mismatch: expected {theorems.size}, accounted {accounted} \
       (proof mode: {config.proofMode}, on-failure: {config.onFailure})"
@@ -260,7 +331,7 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
   let report := Json.mkObj [
     ("format", "lean-corpus-rewrite-report.v1"),
     ("files", Json.arr rewrittenFiles),
-    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts failures),
     ("verification", Json.mkObj [("status", "passed"), ("command",
       String.intercalate " " (["lake", "build"] ++ config.buildTarget.toList))])
   ]
@@ -271,7 +342,7 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
     ("project", name),
     ("repository", artifactPath repoRel),
     ("build_target", toJson config.buildTarget),
-    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts failures),
     ("verification", Json.mkObj [("status", "passed")])
   ]
 
@@ -411,6 +482,7 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     preparedByFile := preparedByFile.insert file (← prepareSourceFile sourceRoot file)
   let mut tasks : Array Json := #[]
   let mut counts : RewriteCounts := {}
+  let mut failures : Array FailureReport := #[]
   for index in [:theorems.size] do
     let record := theorems[index]!
     let targetMode := manifest.actionFor record.name config.proofMode
@@ -420,6 +492,14 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     -- are irrelevant here — a unit only ever touches its own target.)
     if targetMode == .delete then
       counts := counts.bump .delete
+      continue
+    -- A `where`/`let rec` helper or `mutual` member has no standalone declaration to
+    -- reconstruct, so it is not a valid unit target ("prove this helper in isolation"
+    -- is meaningless — it only exists inside its parent). Exclude it, like `delete`.
+    let some prepared := preparedByFile[normalizeRelativePath record.file.get!]?
+      | fail s!"prepared source missing for {record.name}"
+    if (← planEditsCollecting prepared.frontendResult #[record] targetMode).auxiliaries.size == 1 then
+      counts := { counts with auxiliary := counts.auxiliary + 1 }
       continue
     -- Build and verify the task, tolerating a per-task failure per `--on-failure`.
     -- The whole body is attributable to this one record, so `skip` (omit + record)
@@ -505,10 +585,14 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
       -- Under both surviving policies the theorem contributes no task; they differ
       -- only in which bucket records it. `backoff` deletes the offender, which in
       -- units mode is the same as skipping — there is no dependent to protect.
+      let action := match config.onFailure with
+        | FailurePolicy.skip => "skipped"
+        | _                  => "failed"
       match config.onFailure with
       | FailurePolicy.skip => counts := { counts with skipped := counts.skipped + 1 }
       | _                  => counts := { counts with failed := counts.failed + 1 }
-      IO.eprintln s!"lean-reassemble: {config.onFailure} {record.name}: {reason}"
+      IO.eprintln s!"lean-reassemble: {action} {record.name}: {reason}"
+      failures := failures.push { name := record.name, action, reason }
   removeIfExists (artifact / ".work")
   let name ← projectName sourceRoot
   writeJson (artifact / "manifest.json") <| Json.mkObj [
@@ -518,7 +602,7 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     ("build_target", toJson config.buildTarget),
     ("environment", "cache/environment.json"),
     ("tasks", Json.arr tasks),
-    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts),
+    ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts failures),
     ("verification", Json.mkObj [("status", "passed")])
   ]
 
