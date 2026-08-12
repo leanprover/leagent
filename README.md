@@ -49,6 +49,28 @@ curl -sSfLO https://github.com/leanprover/leagent/releases/download/latest/lean_
 Every release records the commit it was built from and a `SHA256SUMS` asset, so a
 download can be verified and traced back to source.
 
+### Runtime library
+
+Each binary links the toolchain's `libleanshared.so` dynamically rather than
+embedding a ~100 MB static copy, so it is a few MB. The loader must find that
+library before the tool starts. A binary built locally with `make` bakes its own
+toolchain's library directory into the binary's `RUNPATH`, so it just runs. A
+**downloaded** release binary carries only `$ORIGIN`-relative `RUNPATH` entries
+(no absolute build-machine path), so it finds the library one of two ways:
+
+- **Co-locate it with a toolchain.** Placed beside `lean` in a toolchain's `bin/`
+  (the `$ORIGIN/../lib/lean` entry), it just runs — the same layout upstream
+  `lean` uses.
+- **Point the loader at your matching toolchain** (which you already have
+  installed, since the tools drive its Lean):
+
+  ```bash
+  LD_LIBRARY_PATH=$(lean --print-libdir) ./lean_extract-v4.31.0 --help
+  ```
+
+The `RUNPATH` uses new dtags, so `LD_LIBRARY_PATH` always takes precedence over
+any baked entry — the override above works regardless of where the binary sits.
+
 To cut a versioned release, push a tag — or run the Release workflow manually and
 give it a tag name:
 

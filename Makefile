@@ -35,6 +35,12 @@ ALL_PKGS := $(EXTRACT_PKG) $(WORKERS_PKG) $(REASSEMBLE_PKG) $(FIXTURE_PKG) $(EXA
 
 TOOLCHAIN := $(shell cat $(EXTRACT_PKG)/lean-toolchain)
 
+# The pinned toolchain's Lean library directory (holds libleanshared.so). Baked
+# as the build-time DT_RUNPATH default so a locally-built binary loads its runtime
+# with no environment. Resolved from within the package so elan honours the
+# package's lean-toolchain rather than the ambient default.
+LIBDIR := $(shell cd $(EXTRACT_PKG) && lean --print-libdir)
+
 BINDIR := bin
 
 # Where `make artifacts` writes. Outside the repo by default: the docs are
@@ -57,22 +63,53 @@ GRIND_OK   := $(shell [ "$(LEAN_MAJOR)" -gt 4 ] 2>/dev/null && echo yes || \
 # race on shared build trees. Lake parallelises within a package already.
 .NOTPARALLEL:
 
-.PHONY: all extract reassemble example test artifacts clean distclean help toolchain set-toolchain
+.PHONY: all extract reassemble strip example test artifacts clean distclean help toolchain set-toolchain
 
 all: extract reassemble
 
 # lean_reassemble `require`s $(EXTRACT_PKG) and $(WORKERS_PKG) as path
 # dependencies; lake builds those itself, so there is no ordering to enforce here.
+#
+# The binaries link libleanshared.so from the toolchain dynamically (see the
+# lakefiles) rather than embedding a ~100 MB static copy. That library is not on
+# the default loader path, so the lakefiles bake a DT_RUNPATH into each binary:
+# `$ORIGIN` entries (for a binary placed beside a toolchain) plus, when built
+# through this Makefile, the build-time absolute library directory ($(LIBDIR)),
+# passed in as a Lake `-K` config option. A locally-built binary therefore finds
+# its runtime with zero environment. The RUNPATH uses new dtags, so a user whose
+# baked path does not exist (e.g. a downloaded release) overrides it with
+# `LD_LIBRARY_PATH=$$(lean --print-libdir)`.
+# `-R` (reconfigure) is required so a changed `-K libdir` is actually re-read:
+# Lake caches the elaborated config and does not treat `-K` options as a config
+# input, so without it a stale run's value would stick. Reconfiguring only
+# re-elaborates the lakefile (sub-second); module builds stay content-hashed, so
+# nothing recompiles when the value is unchanged.
 extract: | $(BINDIR)
-	cd $(EXTRACT_PKG) && lake build lean_extract
+	cd $(EXTRACT_PKG) && lake build -R -K libdir=$(LIBDIR) lean_extract
 	ln -sf ../$(EXTRACT_PKG)/.lake/build/bin/lean_extract $(BINDIR)/lean_extract
 
 reassemble: | $(BINDIR)
-	cd $(REASSEMBLE_PKG) && lake build lean_reassemble
+	cd $(REASSEMBLE_PKG) && lake build -R -K libdir=$(LIBDIR) lean_reassemble
 	ln -sf ../$(REASSEMBLE_PKG)/.lake/build/bin/lean_reassemble $(BINDIR)/lean_reassemble
 
 $(BINDIR):
 	mkdir -p $@
+
+# Strip the built binaries in place (following the symlinks into the build trees).
+# `--strip-all` drops .symtab/debug but keeps .dynsym, which the in-process
+# interpreter (supportInterpreter := true) resolves against — so this is safe and
+# roughly halves each binary. The release workflow strips its own dist/ copies;
+# this target is for producing a stripped local build to measure or ship by hand.
+strip:
+	@for l in lean_extract lean_reassemble; do \
+	  t=$(BINDIR)/$$l; \
+	  if [ -e "$$t" ]; then \
+	    r=$$(readlink -f "$$t"); \
+	    echo "strip $$r ($$(du -h "$$r" | cut -f1) ->"; \
+	    strip --strip-all "$$r"; \
+	    echo "  $$(du -h "$$r" | cut -f1))"; \
+	  fi; \
+	done
 
 # The extractor imports the target project's .oleans, so the example must be
 # built before examples/README.md will work — including after `make clean`, which
@@ -210,6 +247,7 @@ help:
 	@echo "  example      build $(EXAMPLE_PKG)"
 	@echo "  test         run all four test executables"
 	@echo "  artifacts    run the full extract -> reassemble pipeline"
+	@echo "  strip        strip .symtab/debug from the built binaries in place"
 	@echo "  toolchain    install $(TOOLCHAIN) via elan"
 	@echo "  set-toolchain  repoint all packages (make set-toolchain TOOLCHAIN=...)"
 	@echo "  clean        lake clean + drop $(BINDIR)/"
