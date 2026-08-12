@@ -125,13 +125,31 @@ jobs:
         run: make toolchain
 
       - name: Build
-        run: make all
+        # Empty LIBDIR: do NOT bake the CI builder's absolute toolchain path into
+        # the released binary's RUNPATH (it is meaningless on a user's machine).
+        # The binary keeps its `$ORIGIN` RUNPATH entries; consumers co-locate it
+        # with a toolchain or set `LD_LIBRARY_PATH=$(lean --print-libdir)`.
+        run: make all LIBDIR=
 
       - name: Package
         run: |
           mkdir -p dist
-          cp "$(readlink -f bin/lean_extract)" "dist/lean_extract-${{ matrix.slug }}"
-          cp "$(readlink -f bin/lean_reassemble)" "dist/lean_reassemble-${{ matrix.slug }}"
+          # One self-standing file per tool. The binary links libleanshared.so
+          # from the toolchain dynamically (see the lakefiles), so it is a few MB
+          # rather than ~215 MB. `--strip-all` then removes .symtab and debug info
+          # but keeps the dynamic symbol table (.dynsym), which the in-process
+          # interpreter (supportInterpreter := true) resolves against — so it is
+          # safe. The binary carries a DT_RUNPATH of `$ORIGIN` entries only (the
+          # Build step builds with an empty LIBDIR, so no build-machine path is
+          # baked in); consumers co-locate it with a toolchain or point at one with
+          # `LD_LIBRARY_PATH=$(lean --print-libdir)` (see README).
+          for tool in lean_extract lean_reassemble; do
+            asset="dist/$tool-${{ matrix.slug }}"
+            cp "$(readlink -f bin/$tool)" "$asset"
+            echo "stripping $asset: $(du -h "$asset" | cut -f1) ->"
+            strip --strip-all "$asset"
+            echo "  $(du -h "$asset" | cut -f1)"
+          done
 
       - name: Upload build
         uses: actions/upload-artifact@v4
@@ -214,6 +232,14 @@ jobs:
             echo "run the target project's Lean, so the versions must agree. The grind modes"
             echo "(\`--grind-manifest\`, \`--grind-in-proof\`) need v4.31.0 or newer — earlier"
             echo "builds refuse those two modes at startup and exit non-zero."
+            echo
+            echo "These binaries link the toolchain's \`libleanshared.so\` dynamically (they are"
+            echo "a few MB, not ~215 MB). If the loader cannot find it — \`error while loading"
+            echo "shared libraries: libleanshared.so\` — point it at your toolchain:"
+            echo
+            echo '```bash'
+            echo 'LD_LIBRARY_PATH=$(lean --print-libdir) ./lean_extract-<slug> --help'
+            echo '```'
             echo
             echo "## Checksums"
             echo
