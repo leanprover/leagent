@@ -39,7 +39,13 @@ TOOLCHAIN := $(shell cat $(EXTRACT_PKG)/lean-toolchain)
 # as the build-time DT_RUNPATH default so a locally-built binary loads its runtime
 # with no environment. Resolved from within the package so elan honours the
 # package's lean-toolchain rather than the ambient default.
-LIBDIR := $(shell cd $(EXTRACT_PKG) && lean --print-libdir)
+#
+# Deferred (`=`, not `:=`): this must run `lean` only when a build recipe expands
+# $(LIBDIR), never at parse time. An eager `:=` runs it for EVERY target — so
+# `make toolchain` would invoke the elan `lean` shim before the toolchain is
+# installed, auto-installing it and making the subsequent `elan toolchain install`
+# fail with "already installed".
+LIBDIR = $(shell cd $(EXTRACT_PKG) && lean --print-libdir)
 
 BINDIR := bin
 
