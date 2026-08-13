@@ -58,11 +58,26 @@ theorem let_case (n : Nat) : n = n := by let m := n; rfl
 theorem simp_case (xs : List Nat) : (xs ++ []).length = xs.length := by simp
 -- constructor (And)
 theorem and_case (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, hq⟩
+-- ordinary theorem application with non-local proof arguments
+theorem proof_app_pair {p q : Prop} (hp : p) (hq : q) : p ∧ q := ⟨hp, hq⟩
+theorem nested_proof_app (n : Nat) : n = n ∧ (2 : Nat) < 5 :=
+  proof_app_pair (Eq.refl n) (by decide)
+-- function extensionality should peel as `funext`, not as explicit `@funext`.
+theorem funext_case {α β γ : Type} (f g : α → β → γ)
+    (h : ∀ a b, f a b = g a b) : f = g := by
+  funext a b
+  exact h a b
+-- cases branch hidden beneath Eq.mpr and a nested theorem application
+theorem cases_eq_mpr (p q : Prop) (h : q = p) (x : p ∨ p) : q :=
+  Or.casesOn x
+    (fun hp => Eq.mpr (Eq.symm (Eq.symm h) : q = p) hp)
+    (fun hp => Eq.mpr (Eq.symm (Eq.symm h) : q = p) hp)
 
 def runHardTests : MetaM (Array String) := do
   let names : Array Name :=
     #[``rw_case, ``omega_case, ``decide_case, ``or_case,
-      ``ind_case, ``let_case, ``simp_case, ``and_case]
+      ``ind_case, ``let_case, ``simp_case, ``and_case,
+      ``nested_proof_app, ``funext_case, ``cases_eq_mpr]
   names.mapM testOne
 
 #eval show Lean.Elab.Command.CommandElabM Unit from do
@@ -109,7 +124,7 @@ def checkOne (n : Name) : MetaM (Name × String × Bool) := do
 def allNames : Array Name :=
   #[``imp_self, ``imp_chain, ``refl_eq, ``all_intro, ``and_proj, ``const_fn,
   ``rw_case, ``omega_case, ``decide_case, ``or_case, ``ind_case, ``let_case,
-  ``simp_case, ``and_case]
+  ``simp_case, ``and_case, ``nested_proof_app, ``funext_case, ``cases_eq_mpr]
 
 #eval show Lean.Elab.Command.CommandElabM Unit from do
   let res ← Lean.Elab.Command.liftTermElabM
@@ -120,3 +135,20 @@ def allNames : Array Name :=
     Lean.logInfo s!"{mark}  [{m}]  {n}"
     if ok then pass := pass + 1
   Lean.logInfo s!"-- round-trip: {pass}/{res.size} stored scripts re-elaborate to the original term"
+
+/-- The application-peeling regressions must use the structural rung, rather
+than merely surviving through an opaque exact fallback. -/
+def checkApplicationPeeling : MetaM Unit := do
+  for (n, marker) in
+      #[(``nested_proof_app, "@proof_app_pair"),
+        (``funext_case, "funext"),
+        (``cases_eq_mpr, "@Eq.mpr")] do
+    let env ← getEnv
+    let some ci := env.find? n | throwError "missing regression theorem {n}"
+    let some v := ci.value? (allowOpaque := true) | throwError "missing value for {n}"
+    let r ← reverseProof ci.type v (enableClosers := true)
+    unless r.method == "structural" && r.script.contains marker do
+      throwError "{n}: expected structural application peeling ({marker}), got {r.method}\n{r.script}"
+
+#eval show Lean.Elab.Command.CommandElabM Unit from
+  Lean.Elab.Command.liftTermElabM checkApplicationPeeling

@@ -26,11 +26,13 @@ rejected and falls back, never stored.
 Tiers:
   * Tier-1 backbone — `intro` spine, `rfl`, leaf `exact`.
   * Tier-2 structural — `cases … with` (from `T.casesOn`), `have` (from
-    `letFun`/`letE`), `by_cases`/`next` (from `dite`), each recursing into
-    branches/bodies. Emitted only when the head matches; verified like any
-    other candidate.
-  * Tier-3 (omega/simp/rw/decide residue) is deliberately NOT reversed — those
-    subterms are kept inside a verified `exact` (labeled `*_opaque`).
+    `letFun`/`letE`), `by_cases`/`next` (from `dite`), and bounded
+    `refine @f … ?_ …` peeling of proof-valued application arguments, each
+    recursing into branches/bodies/sub-proofs. Emitted only when the head
+    matches; verified like any other candidate.
+  * Tier-3 source tactic sequences are deliberately NOT reconstructed. With
+    closers enabled, opaque residue may instead be discharged at an exposed
+    proof subgoal; otherwise it stays inside a verified `exact`.
 
 All API used here is verified against Lean 4.14.0 core sources (ported to 4.31).
 
@@ -274,6 +276,12 @@ falls back to the Tier-1 ladder. -/
 /-- Maximum `cases` nesting depth, to bound recursion / output size. -/
 def structMaxDepth : Nat := 6
 
+/-- Bounds for generic application peeling. Large applications are usually
+compiler/automation residue; rebuilding them with many explicit arguments and
+subgoals costs more than it reveals. -/
+def appMaxArgs : Nat := 24
+def appMaxProofArgs : Nat := 6
+
 /-- Standard goal-closing tactics to try, in rough order of corpus likelihood,
 when a body is opaque automation residue. By proof irrelevance any of these that
 closes the goal yields an equally-valid proof — so when the original proof was
@@ -307,6 +315,17 @@ partial def peelIdAll (e : Expr) : Expr :=
   let e := e.consumeMData
   if e.isAppOf ``id && e.getAppNumArgs == 2 then peelIdAll e.appArg!
   else e
+
+/-- Peel cheap administrative wrappers: `id`, metadata, and head beta-redexes.
+This deliberately does NOT unfold definitions; it only exposes proof structure
+hidden behind anonymous lambdas introduced by elaboration. -/
+partial def peelCheap (e : Expr) : Expr :=
+  go 8 e
+where
+  go (fuel : Nat) (e : Expr) : Expr :=
+    let e₁ := peelIdAll e
+    let e₂ := e₁.headBeta.consumeMData
+    if fuel == 0 || e₂ == e₁ then e₂ else go (fuel - 1) e₂
 
 /-- Recognize a `letFun`-encoded `have`: the constant `letFun` applied as
 `@letFun α β v (fun x : α => b)` (the elaboration of `have x : α := v; b`).
@@ -417,6 +436,22 @@ def recognizeRec (e : Expr) :
       (Name.mkSimple rule.ctor.getString!, nbind, minor)
   return some (major, branches)
 
+/-- Recognize a `funext (fun x => body)` proof. Generic application peeling can
+also expose the proof argument of `funext`, but emitting the source-level
+`funext x` tactic is both clearer and avoids expensive explicit `@funext … ?_`
+verification in dependent function goals. -/
+def recognizeFunext (e : Expr) : Option (Name × Expr × Expr) :=
+  let e := e.consumeMData
+  if !e.isAppOf ``funext then none
+  else
+    let args := e.getAppArgs
+    match args.back? with
+    | some proof =>
+        match proof.consumeMData with
+        | .lam n d b _ => some (n, d, b)
+        | _            => none
+    | none => none
+
 /-- Parse a tactic string to `Syntax`; `none` if it does not parse. -/
 private def parseTactic? (tac : String) : MetaM (Option (TSyntax `tactic)) :=
   observing? (do
@@ -470,6 +505,30 @@ structure LeafConfig where
 /-- The argument-free leaf config (no source-harvested args). -/
 def LeafConfig.noArgs (closers : Bool) : LeafConfig := { closers }
 
+/-- Select proof-valued application arguments worth exposing as subgoals.
+Local proof references stay inline: replacing `h` with `?_` only turns a useful
+term into `assumption`. Non-local proofs (`rfl`, `by decide`, nested theorem
+applications, `Eq.mpr` residue) are peeled. The returned mask is aligned with
+`e.getAppArgs`; `none` means the application should remain a leaf.
+`includeLocal` is reserved for indexed constructors, where explicit application
+syntax is needed to preserve indices and `assumption` can recover local fields. -/
+def proofArgMask? (e : Expr) (includeLocal : Bool := false) :
+    MetaM (Option (Array Bool)) := do
+  let args := e.getAppArgs
+  if args.isEmpty || args.size > appMaxArgs then return none
+  let mut mask : Array Bool := #[]
+  let mut count := 0
+  for arg in args do
+    let localRef :=
+      match peelIdAll arg with
+      | .fvar _ | .bvar _ | .mvar _ => true
+      | _ => false
+    let peel := (includeLocal || !localRef) && (← Meta.isProof arg)
+    mask := mask.push peel
+    if peel then count := count + 1
+  if count == 0 || count > appMaxProofArgs then return none
+  return some mask
+
 mutual
 /-- Recursively build a structured tactic sequence for proof term `e` in the
 current local context, using `delabFn` for leaf terms. Emits `intro` for the
@@ -482,7 +541,7 @@ partial def buildStructured (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
     MetaM (TSyntax ``Lean.Parser.Tactic.tacticSeq) :=
   peelLambdas e #[] fun names body => do
     let introTacs ← names.mapM fun n => `(tactic| intro $(mkIdent n):ident)
-    let bodyC := peelIdAll body
+    let bodyC := peelCheap body
     let tail : Array (TSyntax `tactic) ← buildTail delabFn cfg depth bodyC
     `(tacticSeq| $[$(introTacs ++ tail)]*)
 
@@ -490,8 +549,10 @@ partial def buildStructured (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
 `id`-peeled, in scope). Dispatches on the head: `letFun`/`letE` → `have` then
 recurse; `dite` → `by_cases`; `casesOn` → `cases … with`; genuine `T.rec` →
 `induction … with`; a constructor with proof fields → `refine ⟨…⟩` + `next`;
-otherwise a LEAF — a no-arg closer if `enableClosers` and one closes the leaf
-goal, else `exact <term>`. Each recurses into sub-proofs. -/
+a bounded application with non-local proof arguments →
+`refine @f … ?_ …` + `next`; otherwise a LEAF — a no-arg closer if
+`enableClosers` and one closes the leaf goal, else `exact <term>`. Each
+recurses into sub-proofs. -/
 partial def buildTail (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
     (depth : Nat) (e : Expr) :
     MetaM (Array (TSyntax `tactic)) := do
@@ -503,7 +564,7 @@ partial def buildTail (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
       let tyStx ← delabFn ty
       let valSeq ← buildStructured delabFn cfg (depth - 1) val
       withLocalDeclD nm ty fun x => do
-        let rest ← buildTail delabFn cfg (depth - 1) (peelIdAll (body.instantiate1 x))
+        let rest ← buildTail delabFn cfg (depth - 1) (peelCheap (body.instantiate1 x))
         let haveTac ← `(tactic| have $(mkIdent nm):ident : $tyStx:term := by $valSeq)
         return #[haveTac] ++ rest
   | none =>
@@ -513,7 +574,7 @@ partial def buildTail (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
         let tyStx ← delabFn ty
         let valSeq ← buildStructured delabFn cfg (depth - 1) val
         withLocalDeclD nm ty fun x => do
-          let rest ← buildTail delabFn cfg (depth - 1) (peelIdAll (body.instantiate1 x))
+          let rest ← buildTail delabFn cfg (depth - 1) (peelCheap (body.instantiate1 x))
           let haveTac ← `(tactic| have $(mkIdent nm):ident : $tyStx:term := by $valSeq)
           return #[haveTac] ++ rest
     | _ =>
@@ -527,9 +588,9 @@ partial def buildTail (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
         let cStx ← delabFn args[1]!
         let hName ← peelLambdasN args[3]! 1 #[] fun ns _ => pure (ns.getD 0 `h)
         let posSeq ← peelLambdasN args[3]! 1 #[] fun _ t =>
-          buildStructured delabFn cfg (depth - 1) (peelIdAll t)
+          buildStructured delabFn cfg (depth - 1) (peelCheap t)
         let negSeq ← peelLambdasN args[4]! 1 #[] fun _ t =>
-          buildStructured delabFn cfg (depth - 1) (peelIdAll t)
+          buildStructured delabFn cfg (depth - 1) (peelCheap t)
         pure #[← `(tactic| by_cases $(mkIdent hName) : $cStx:term),
                ← `(tactic| next => $posSeq),
                ← `(tactic| next => $negSeq)]
@@ -552,6 +613,21 @@ partial def buildTail (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
             `(Lean.Parser.Tactic.inductionAlt|
                 | $(mkIdent ctor):ident $binderIds:ident* => $branchSeq)
         pure #[← `(tactic| induction $majorStx:term with $alts:inductionAlt*)]
+      -- `funext (fun x => body)` → `funext x` and continue in the pointwise
+      -- equality goal. This is a high-level expression peel, not a closer.
+      else if let some (n, d, body) := recognizeFunext e then
+        let nm ← freshBinder n
+        withLocalDeclD nm d fun x => do
+          let rest ← buildTail delabFn cfg (depth - 1) (peelCheap (body.instantiate1 x))
+          return #[← `(tactic| funext $(mkIdent nm):ident)] ++ rest
+      -- With closers, explicit application peeling gets first refusal. This is
+      -- required for indexed constructors, whose indices angle notation loses.
+      else if cfg.closers then
+        if let some tacs ← recognizeProofApp delabFn cfg depth e then
+          pure tacs
+        else if let some tacs ← recognizeCtor delabFn cfg depth e then
+          pure tacs
+        else pure #[← leafTac delabFn cfg e]
       -- Constructor application `C params… fields…` → `refine ⟨holes⟩` where
       -- proof fields become `?_` goals recursed via `next`, data fields are
       -- delaborated inline. Only when there is ≥1 proof field to decompose.
@@ -600,28 +676,86 @@ partial def recognizeCtor (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
   -- One `next => <seq>` per proof field, in order, matching the `?_` goals.
   let mut nexts : Array (TSyntax `tactic) := #[]
   for pf in proofFields do
-    let seq ← buildStructured delabFn cfg (depth - 1) (peelIdAll pf)
+    let seq ← buildStructured delabFn cfg (depth - 1) (peelCheap pf)
+    nexts := nexts.push (← `(tactic| next => $seq))
+  return some (#[refineTac] ++ nexts)
+
+/-- Generic application recognizer. Delaborating the bare function preserves
+the required explicitness marker (`@f` when it has implicit binders), so all
+arguments from the elaborated term remain positionally stable while selected
+proof arguments become `?_` goals. This handles
+administrative wrappers such as `Eq.mpr` and nested theorem applications
+without recognizing individual constants or source tactics. -/
+partial def recognizeProofApp (delabFn : Expr → MetaM Term) (cfg : LeafConfig)
+    (depth : Nat) (e : Expr) :
+    MetaM (Option (Array (TSyntax `tactic))) := do
+  let env ← getEnv
+  let includeLocal :=
+    match e.getAppFn with
+    | .const cname _ =>
+        match env.find? cname with
+        | some (.ctorInfo cval) =>
+            match env.find? cval.induct with
+            | some (.inductInfo ival) => ival.numIndices > 0
+            | _ => false
+        | _ => false
+    | _ => false
+  let some mask ← proofArgMask? e includeLocal | return none
+  let fnStx ← delabFn e.getAppFn
+  let args := e.getAppArgs
+  let mut argStxs : Array Term := #[]
+  let mut proofArgs : Array Expr := #[]
+  for i in [:args.size] do
+    let arg := args[i]!
+    if mask[i]! then
+      argStxs := argStxs.push (← `(?_))
+      proofArgs := proofArgs.push arg
+    else
+      argStxs := argStxs.push (← delabFn arg)
+  let appStx ← `(term| $fnStx:term $argStxs:term*)
+  let refineTac ← `(tactic| refine $appStx:term)
+  let mut nexts : Array (TSyntax `tactic) := #[]
+  for proofArg in proofArgs do
+    let isNonReflCtor :=
+      !isReflHeaded proofArg &&
+        match proofArg.getAppFn with
+        | .const cname _ =>
+            match env.find? cname with
+            | some (.ctorInfo _) => true
+            | _ => false
+        | _ => false
+    let seq ←
+      if isNonReflCtor then
+        buildStructured delabFn cfg (depth - 1) (peelCheap proofArg)
+      else
+        if let some closer ← tryLeafCloser cfg.extraClosers proofArg then
+          `(tacticSeq| $[$(#[closer])]*)
+        else
+          buildStructured delabFn cfg (depth - 1) (peelCheap proofArg)
     nexts := nexts.push (← `(tactic| next => $seq))
   return some (#[refineTac] ++ nexts)
 end
 
 /-- Whether the top of `v` (after the intro spine and `id` peeling) is a shape
-the structural builder decomposes — a `casesOn`, a `letFun`, or a `letE`.
+the structural builder decomposes — a recursor, binding wrapper, constructor,
+or bounded application with proof-valued arguments.
 Avoids emitting a structural candidate that would just duplicate the Tier-1
 `exact`. -/
-def topIsStructural (v : Expr) : MetaM Bool :=
+def topIsStructural (v : Expr) (includeProofApps : Bool := true) : MetaM Bool :=
   peelLambdas v #[] fun _ body => do
-    let b := peelIdAll body
+    let b := peelCheap body
     if (letFun? b).isSome then return true
     if b.consumeMData.isLet then return true
     if b.isAppOf ``dite && b.getAppNumArgs == 5 then return true
     if (← recognizeCasesOn b).isSome then return true
     if (← recognizeRec b).isSome then return true
+    if (recognizeFunext b).isSome then return true
     -- ctor-headed with a proof field: a `refine ⟨…⟩` candidate.
     if let .const cname _ := b.getAppFn then
       if let some (.ctorInfo cval) := (← getEnv).find? cname then
         if cval.numFields > 0 && b.getAppArgs.size == cval.numParams + cval.numFields then
           return true
+    if includeProofApps && (← proofArgMask? b).isSome then return true
     return false
 
 /-- Build candidate tactic sequences (pure syntax) in priority order: most
@@ -666,12 +800,24 @@ private def buildCandidates (v : Expr) (enableClosers : Bool) (extraClosers : Ar
     -- decomposition to `*_opaque`/`fail` — a regression vs. no closers. Emitting
     -- both lets the ranking keep the closer script when it holds and fall back to
     -- the working `exact` decomposition when it doesn't.
-    if ← topIsStructural v then
+    let structuralPlain ← topIsStructural v false
+    let structuralWithApps ←
+      if enableClosers then topIsStructural v true else pure structuralPlain
+    if structuralWithApps then
       for delabFn in #[delab, delabExplicit] do
-        if enableClosers then
-          if let some seq ← boundedConstruct (buildStructured delabFn cfgArgs structMaxDepth v) (← cBudget) then
-            out := out.push (seq, "structural")
-        if let some seq ← boundedConstruct (buildStructured delabFn cfgPlain structMaxDepth v) (← cBudget) then
+        let plain? ←
+          if structuralPlain then
+            boundedConstruct (buildStructured delabFn cfgPlain structMaxDepth v) (← cBudget)
+          else
+            pure none
+        let withClosers? ←
+          if enableClosers then
+            boundedConstruct (buildStructured delabFn cfgArgs structMaxDepth v) (← cBudget)
+          else
+            pure none
+        if let some seq := withClosers? then
+          out := out.push (seq, "structural_closers")
+        if let some seq := plain? then
           out := out.push (seq, "structural")
     -- 1. intro …; rfl  (only when the body is reflexivity-headed)
     if isReflHeaded body then
@@ -761,7 +907,7 @@ Two-stage verification: the cheap in-memory `tryElab` filters candidates, then
 that passes the first but fails the second (e.g. a script using inaccessible
 hygienic names that don't round-trip through the printer) is correctly
 rejected, so we never emit a string that isn't a real proof. -/
-def reverseProof (ty v : Expr) (enableClosers : Bool := false)
+private def reverseProofCore (ty v : Expr) (enableClosers : Bool := false)
     (extraClosers : Array String := #[]) : MetaM ScriptResult := do
   -- Closer candidates (`intro_simp`, `simp`, …) are bulk guesses, so verify
   -- them under the tight `closerHeartbeats` budget — a closer that needs the
@@ -770,7 +916,7 @@ def reverseProof (ty v : Expr) (enableClosers : Bool := false)
   -- `simp_args` (author-sourced `simp [lemmas]`) are closers too for budgeting.
   let closerNames : Std.HashSet String :=
     (Std.HashSet.emptyWithCapacity : Std.HashSet String).insertMany
-      ((closerTactics.map (·.1)).push "simp_args")
+      (((closerTactics.map (·.1)).push "simp_args").push "structural_closers")
   -- Capture the global heartbeat counter ONCE up front. Every per-step cap below
   -- is computed as "what's left of `reverseHeartbeats` since here", so the whole
   -- reverse-elaboration of this proof — all construction + all verification — is
@@ -794,7 +940,13 @@ def reverseProof (ty v : Expr) (enableClosers : Bool := false)
     if (← tryElab ty v seq.raw budget) then
       let script ← renderBy seq
       if (← verifyRendered ty v script (Nat.min stepCap (← budgetRemaining hbStart))) then
-        return { script, method := label }
+        let method := if label == "structural_closers" then "structural" else label
+        return { script, method }
   return { script := "", method := "fail" }
+
+/-- Reverse-elaborate the proof term `v : ty` into a verified tactic script. -/
+def reverseProof (ty v : Expr) (enableClosers : Bool := false)
+    (extraClosers : Array String := #[]) : MetaM ScriptResult := do
+  reverseProofCore ty v enableClosers extraClosers
 
 end Corpus.ReverseElab
