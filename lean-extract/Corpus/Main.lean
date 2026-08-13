@@ -77,6 +77,13 @@ structure CliArgs where
   seed               : Nat := 0
   datasetCardConfig  : Option System.FilePath := none
   listOrphans        : Bool := false
+  /-- Drop discovered files that are NOT in the import closure of the declared
+  roots ("orphans": test/scratch/codegen files no built module pulls in) before
+  extraction, instead of driving the frontend over them. Orphans routinely fail to
+  elaborate on their own (deliberately-failing test cases, unbuilt codegen), which
+  would otherwise abort the whole run. The closure is loaded once in the parent and
+  dropped before any child spawns, so peak memory stays at a single env load. -/
+  skipOrphans        : Bool := false
   /-- Emit the AlphaGrind grind manifest (`data/grind/train.jsonl`): re-prove
   every theorem with `grind`'s default strategy and record what it did. Uses the
   worker path only. When set, this REPLACES the corpus extraction (the tool runs
@@ -115,7 +122,7 @@ def CliArgs.opts (cli : CliArgs) : CollectOptions :=
 
 private def usage : String := "\
 Usage: corpus-extract --modules <Mod> [--modules <Mod> ...] --output <dir>
-                     [--list-orphans]
+                     [--list-orphans] [--skip-orphans]
                      [--config <path>] [--source-root <path>]
                      [--include-internal] [--no-private]
                      [--reverse-elab] [--closers] [--skip-reverse <decl>]
@@ -134,6 +141,12 @@ from that directory so LEAN_PATH resolves to the project's built .oleans.
 The tool drives Lean's frontend over the source files found on disk under the
 --modules roots (orphan-safe). --list-orphans prints the modules on disk that are
 not in the import closure of the declared roots, then exits.
+
+--skip-orphans drops those same orphan modules before extraction instead of
+driving the frontend over them. Orphans are files no built module imports — test
+fixtures (often deliberately-failing), codegen scratch, unbuilt experiments — and
+elaborating them standalone routinely errors, which would otherwise abort the run.
+The closure is loaded once in the parent and dropped before any child spawns.
 
 --grind-manifest re-proves every theorem with `grind`'s default strategy and
 writes data/grind/train.jsonl (the interactive script, the `grind only`
@@ -317,6 +330,8 @@ where
         go xs { acc with datasetCardConfig := some v }
     | "--list-orphans" :: xs, acc =>
         go xs { acc with listOrphans := true }
+    | "--skip-orphans" :: xs, acc =>
+        go xs { acc with skipOrphans := true }
     | "--grind-manifest" :: xs, acc =>
         go xs { acc with grindManifest := true }
     | "--grind-in-proof" :: xs, acc =>
@@ -394,6 +409,23 @@ valid. See `modeRules`. -/
 private def modeComplaint? (cli : CliArgs) : Option String :=
   (modeRules cli).findSome? fun (violated, complaint) =>
     if violated then some complaint else none
+
+/-- Remove orphan files — those under the `--modules` roots on disk but NOT in the
+import closure of those roots — from `files`. Returns the kept files and the
+orphan modules that were dropped. The env is loaded only to read the closure and
+goes out of scope before the caller starts extraction, so peak memory stays at one
+env load (the same load `--list-orphans` already performs). -/
+private unsafe def dropOrphanFiles (roots : Array Name)
+    (files : Array Corpus.Discover.DiscoveredFile)
+    : IO (Array Corpus.Discover.DiscoveredFile × Array Name) := do
+  Lean.enableInitializersExecution
+  Lean.initSearchPath (← Lean.findSysroot)
+  let imports : Array Lean.Import := roots.map (fun n => { module := n })
+  let env ← Lean.importModules imports {} (trustLevel := 1024) (loadExts := true)
+  let closure : Std.HashSet Name := env.allImportedModuleNames.foldl (·.insert ·) {}
+  let kept := files.filter (fun f => closure.contains f.module)
+  let dropped := Corpus.Discover.findOrphans (files.map (·.module)) env.allImportedModuleNames
+  return (kept, dropped)
 
 /-- Render the extractor's own `metadata.json` payload. -/
 private def renderStats (stats : Corpus.RunStats) (modulesIn : Array Name)
@@ -767,7 +799,17 @@ unsafe def runCli (args : List String) : IO UInt32 := do
     let cleanupShardsRef ← IO.mkRef false
     let records : Array ConstRecord ← do
       let projectRoot := cli.sourceRoot.getD (← IO.currentDir)
-      let files ← Corpus.Discover.discoverFiles projectRoot cli.modules
+      let discovered ← Corpus.Discover.discoverFiles projectRoot cli.modules
+      let files ← if cli.skipOrphans then do
+          let (kept, dropped) ← dropOrphanFiles cli.modules discovered
+          if dropped.isEmpty then
+            IO.println s!"corpus-extract: --skip-orphans: no orphans among {discovered.size} discovered file(s)"
+          else
+            IO.println s!"corpus-extract: --skip-orphans: dropping {dropped.size} orphan module(s) not in the import closure:"
+            for m in dropped do IO.println s!"  {m}"
+          pure kept
+        else
+          pure discovered
       let jobs := resolveJobs cli.jobs cli.isolateFiles
       let mode := if cli.isolateFiles then "isolated" else "in-process"
       IO.println s!"corpus-extract: discovered {files.size} source file(s); driving frontend ({mode}, jobs={jobs})…"
