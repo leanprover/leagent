@@ -20,6 +20,9 @@ end-to-end run documented in `docs/proof-state-extraction.md`, plus the
 open Lean
 open Corpus
 open Corpus.ProofStates
+-- `declarationNodes` moved to `Corpus.SourceSyntax` (now shared with the reassembler);
+-- this test still refers to it unqualified.
+open Corpus.SourceSyntax
 
 namespace ProofStatesTests
 

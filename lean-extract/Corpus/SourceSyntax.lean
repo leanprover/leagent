@@ -119,6 +119,59 @@ def proofRange? (cmdStx : Syntax) : Option (DeclValueKind × Lean.Syntax.Range) 
     | .equations | .whereBody => value.getRange?
   return (kind, range)
 
+/-- The source range a proof REPLACEMENT should overwrite when holing a declaration.
+
+This is deliberately WIDER than `proofRange?`. `declValSimple` parses as
+`":=" declBody Termination.suffix (whereDecls)?`, so `proofRange?` (index 1, the bare
+`declBody`) excludes two trailing siblings that exist ONLY to serve that proof:
+
+* a `termination_by` / `decreasing_by` `Termination.suffix`, and
+* `where` / `let rec` helper declarations.
+
+Overwriting only `declBody` with `by sorry` strands both: Lean warns the termination
+hints are unused and then runs the leftover `decreasing_by` against decreasing goals
+that no longer exist ("No goals" / "tactic failed on all goals"); and a `where` helper
+becomes dead (and, if itself recursive, drags its own termination proof along). So the
+`.simple` replacement range runs from the start of `declBody` to the END of the whole
+value node, swallowing the suffix and any `where` helpers together with the proof.
+
+`.equations` / `.whereBody` already return their whole value node (which contains any
+suffix and `where` helpers), so their replacement range equals `proofRange?`.
+
+Contrast `proofRange?`, which returns the bare body span the extractor records as
+`body`; callers verify the recorded `body` against THAT narrower range, then apply the
+edit over the wider range this returns. -/
+def proofReplacementRange? (cmdStx : Syntax) : Option (DeclValueKind × Lean.Syntax.Range) := do
+  let (kind, value) ← declarationValue? cmdStx
+  let whole ← value.getRange?
+  let range ← match kind with
+    | .simple =>
+      -- Start at the proof term (`declBody`, index 1), end at the whole value node's
+      -- end so the trailing `Termination.suffix` and `whereDecls` are included.
+      let body ← value[1].getRange?
+      pure { start := body.start, stop := whole.stop : Lean.Syntax.Range }
+    | .equations | .whereBody => pure whole
+  return (kind, range)
+
+/-- Every declaration node inside one top-level command, outermost first.
+
+A command usually holds one declaration, but `mutual … end` holds SEVERAL siblings,
+each its own `Command.declaration`. We descend to those nodes and stop AT each one
+rather than recursing into it: a declaration's own body may contain nested
+`where`/`let rec` declarations whose proof belongs to the enclosing decl, not to a
+sibling. (`where` auxiliaries still get matched separately — they are lifted to their
+own constants and filed under a distinct source key.)
+
+Recognition is by NODE KIND, not `declarationId?.isSome`: that test reports `some` for
+any ancestor holding a `declId` — including a `mutual` block and the anonymous `null`
+wrapper around its members — so a `declarationId?`-guarded walk would halt above the
+members and report one declaration where there are several. -/
+partial def declarationNodes (stx : Syntax) : Array Syntax :=
+  if stx.getKind == ``Lean.Parser.Command.declaration then #[stx]
+  else match stx with
+    | .node _ _ args => args.foldl (fun acc a => acc ++ declarationNodes a) #[]
+    | _              => #[]
+
 /-! ## `where` / `let rec` auxiliaries
 
 An auxiliary declared in a `where` clause or by `let rec` is lifted by Lean into
@@ -130,9 +183,9 @@ is a term-level `Term.letRecDecl` nested inside its parent's `whereDecls`:
 Command.declaration
   Command.theorem
     Command.declValSimple          ← `proofRange?` finds this: the PARENT's proof
-    Termination.suffix
-    null
-      Term.whereDecls
+      Term.byTactic                  (the parent's proof term — index 1)
+      Termination.suffix             (parent's termination hints — index 2)
+      Term.whereDecls                (index 3)
         Term.letRecDecl            ← the auxiliary
 ```
 

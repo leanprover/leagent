@@ -473,31 +473,6 @@ structure ProofStateEntry where
   isPrivate      : Bool
   deriving Inhabited
 
-/-- Every declaration node inside one top-level command, outermost first.
-
-A command usually holds one declaration, but `mutual … end` holds SEVERAL siblings,
-and each needs its own proof range. `SourceSyntax.proofRange?` is built on
-`findByKind`, which stops at the first match in pre-order, so applying it to a
-whole `mutual` command finds only the first theorem's proof — every later one then
-fails its `proofRanges` lookup and is dropped from the dataset entirely.
-
-So we descend to the declaration nodes first and range each separately. We stop at
-a `declaration` node rather than recursing into it, because its own body may
-contain nested `where`/`let rec` declarations whose proof belongs to the enclosing
-decl's range, not to a sibling. (`where` auxiliaries still get their own entry:
-they are lifted to their own constants with their own `findDeclarationRanges?`, and
-`declarationKeys` files them under a distinct key.)
-
-Recognition is by NODE KIND, deliberately not by `declarationId? .isSome`. That
-test reports `some` for any ancestor containing a `declId` — including a `mutual`
-block and the anonymous `null` wrapper holding its members — so a
-`declarationId?`-guarded walk halts above the members and finds one "declaration"
-where there are two. -/
-partial def declarationNodes (stx : Syntax) : Array Syntax :=
-  if stx.getKind == ``Lean.Parser.Command.declaration then #[stx]
-  else match stx with
-    | .node _ _ args => args.foldl (fun acc a => acc ++ declarationNodes a) #[]
-    | _              => #[]
 
 /-- Every `where` / `let rec` auxiliary node in one command.
 
