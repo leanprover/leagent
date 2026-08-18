@@ -30,7 +30,7 @@ inductive ProofMode where
   | keep
   /-- Erase the whole declaration from the source. -/
   | delete
-  deriving Inhabited, BEq
+  deriving Inhabited, BEq, ToJson, FromJson
 
 def ProofMode.toString : ProofMode → String
   | .replace => "sorry"
@@ -50,7 +50,7 @@ inductive FailurePolicy where
   | skip
   /-- Degrade the failing theorem to `delete`, record it in `failed`, and retry. -/
   | backoff
-  deriving Inhabited, BEq
+  deriving Inhabited, BEq, ToJson, FromJson
 
 def FailurePolicy.toString : FailurePolicy → String
   | .fail    => "fail"
@@ -149,8 +149,19 @@ private def declarationCandidates (frontendResult : Corpus.Frontend.ElabResult) 
 private def commandForKey? (source : String) (commands : Array Syntax)
     (key : Nat × Nat) : Option Syntax :=
   let fileMap := source.toFileMap
-  commands.find? fun command =>
-    Corpus.SourceSyntax.declarationKeys fileMap command |>.contains key
+  -- Descend into `mutual … end` (via `declarationNodes`) so each member matches its OWN
+  -- `Command.declaration` node, not the enclosing block. A `mutual` block's keys cover
+  -- only its first member, so a top-level-command search would match the first member to
+  -- the whole block and misclassify every later member as `auxiliary` — leaving them
+  -- un-holed. For a mutually recursive group with termination that is a correctness bug:
+  -- holing one member changes the group's recursion, so the survivors' `decreasing_by`
+  -- then runs against goals that no longer exist ("No goals to be solved"). A plain
+  -- top-level declaration is itself a `Command.declaration`, so `declarationNodes`
+  -- returns it unchanged.
+  let decls := commands.foldl
+    (fun acc c => acc ++ Corpus.SourceSyntax.declarationNodes c) #[]
+  decls.find? fun decl =>
+    Corpus.SourceSyntax.declarationKeys fileMap decl |>.contains key
 
 private def commandIndent (source : String) (command : Syntax) : String := Id.run do
   let some range := Corpus.SourceSyntax.commandRange? command | return ""
@@ -209,12 +220,24 @@ private def planEdit (source : String) (command : Syntax) (record : Corpus.Const
     let expected := String.Pos.Raw.extract source range.start range.stop
     return { declaration := record.name, range, expected, replacement := "" }
   | .keep | .replace =>
-    let some (kind, range) := Corpus.SourceSyntax.proofRange? command
+    let some (kind, proofRange) := Corpus.SourceSyntax.proofRange? command
+      | fail s!"proof syntax not found for {record.name}"
+    -- The recorded `body` is the bare proof span — exactly what the extractor slices
+    -- from `proofRange?` — so verify it against that narrow range BEFORE widening below.
+    let proofSlice := String.Pos.Raw.extract source proofRange.start proofRange.stop
+    if let some body := record.body then
+      if proofSlice.trimAsciiEnd.toString != body then
+        fail s!"record body does not match source proof for {record.name}"
+    -- Overwrite a WIDER range than the body span: for `.simple`, `proofReplacementRange?`
+    -- extends past the proof term over any `termination_by`/`decreasing_by` suffix AND
+    -- `where`/`let rec` helpers, which serve only this proof. Leaving them would strand
+    -- termination hints on a now-non-recursive `by sorry` (Lean: "unused termination
+    -- hints", then a leftover `decreasing_by` run against absent goals) and orphan dead
+    -- `where` helpers. Under `.keep` the replacement is that widened slice verbatim, so
+    -- the output stays byte-identical.
+    let some (_, range) := Corpus.SourceSyntax.proofReplacementRange? command
       | fail s!"proof syntax not found for {record.name}"
     let expected := String.Pos.Raw.extract source range.start range.stop
-    if let some body := record.body then
-      if expected.trimAsciiEnd.toString != body then
-        fail s!"record body does not match source proof for {record.name}"
     return {
       declaration := record.name
       range
@@ -235,14 +258,20 @@ structure PlanOutcome where
 /-- The outcome of planning one record against its file.
 
 `auxiliary` is the case the corpus surfaced: a record that matches a real elaborated
-constant, but whose declaration has NO standalone command syntax to edit — a
-`where`/`let rec` helper (lifted to its own constant but written inside its parent's
-`where` clause) or a member of a `mutual … end` block. The reassembler neither can
-nor needs to hole such a declaration on its own: under `keep` it rides along inside
-its parent's preserved proof, and under `sorry`/`delete` the parent's edit already
-erases the whole body it lives in. It is therefore **informational** — excluded from
-the target set, not reported as a failure. This is distinct from "did not match a
-declaration" (`failed`), which means the record disagrees with the source (drift). -/
+constant, but whose declaration has NO standalone declaration syntax to edit — a
+`where`/`let rec` helper, lifted to its own constant but written as a term-level
+`letRecDecl` inside its parent's proof. The reassembler neither can nor needs to hole
+such a constant on its own: under `keep` it rides along inside its parent's preserved
+proof, and under `sorry`/`delete` the parent's edit already erases the whole value it
+lives in (`proofReplacementRange?` extends over the parent's `where` clause). It is
+therefore **informational** — excluded from the target set, not reported as a failure.
+This is distinct from "did not match a declaration" (`failed`), which means the record
+disagrees with the source (drift).
+
+A `mutual … end` MEMBER is NOT auxiliary: `commandForKey?` descends into the block via
+`declarationNodes`, so each member matches its own `Command.declaration` node and is
+holed in its own right — required, because holing only some members of a mutually
+recursive group breaks the survivors' termination proofs. -/
 inductive RecordPlan where
   | planned (edit : Edit) (key : Nat × Nat)
   | auxiliary
@@ -257,7 +286,7 @@ structure FailureReport where
   name : String
   action : String
   reason : String
-  deriving Inhabited
+  deriving Inhabited, ToJson, FromJson
 
 /-- Render collected failures as a JSON array of `{theorem, action, reason}`. -/
 def failuresJson (failures : Array FailureReport) : Lean.Json :=
@@ -285,11 +314,12 @@ private def planOneRecord (frontendResult : Corpus.Frontend.ElabResult)
     let candidate := matchingCandidates[0]!
     if matchedKeys.contains candidate.key then
       fail s!"multiple records matched declaration {record.name}"
-    -- The record matched a real elaborated constant, but no top-level command covers
-    -- its position: it is a `where`/`let rec` auxiliary or a `mutual` member, written
-    -- inside another declaration's syntax. Such a constant has no proof to hole on its
-    -- own — its parent's edit already governs the text it lives in — so it is an
-    -- auxiliary, not a failure. (Contrast the zero-candidate case above: that is drift.)
+    -- The record matched a real elaborated constant, but no declaration node covers its
+    -- position: it is a `where`/`let rec` auxiliary, written as a term-level `letRecDecl`
+    -- inside another declaration's proof. Such a constant has no declaration syntax to
+    -- hole on its own — its parent's edit already governs the text it lives in — so it is
+    -- an auxiliary, not a failure. (`mutual` members DO get their own node here, via
+    -- `declarationNodes`. Contrast the zero-candidate case above: that is drift.)
     let some command :=
         commandForKey? frontendResult.source frontendResult.commands candidate.key
       | return .auxiliary

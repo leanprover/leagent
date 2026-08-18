@@ -310,6 +310,61 @@ private unsafe def testAuxiliaryRecords : IO Unit := do
   assertIO (driftOutcome.auxiliaries.isEmpty && driftOutcome.failures.size == 1)
     "a record matching no declaration is a failure, not an auxiliary"
 
+/-- A recursive `.simple` theorem (`:= by …`) carries its `termination_by` /
+`decreasing_by` in a `Termination.suffix` SIBLING of the proof term, which
+`SourceSyntax.proofRange?` excludes. Overwriting only the proof term with `by sorry`
+would strand those hints on a body that is no longer recursive — the exact break the
+Cedar corpus hit: an "unused termination hints" warning, then a leftover
+`decreasing_by` block run against decreasing goals that no longer exist ("No goals" /
+"tactic failed on all goals"). The `.replace` edit must therefore widen over the
+suffix, and the rewritten file must elaborate clean. `.keep` must stay byte-identical,
+suffix and all. -/
+private unsafe def testTerminationSuffix : IO Unit := do
+  let root ← IO.FS.realPath "."
+  let path ← IO.FS.realPath (root / "TestFixtures/TerminationFixture.lean")
+  Corpus.Frontend.initFrontend
+  let importLock : Corpus.Frontend.ImportLock ← Std.Mutex.new ()
+  let result ← Corpus.Frontend.elaborateFile importLock {
+    absPath := path, module := `TestFixtures.TerminationFixture
+    relPath := "TestFixtures/TerminationFixture.lean" }
+  assertIO (!result.hasErrors) "termination fixture frontend elaboration"
+  -- Build the records the way the extractor does, so `body` is the real proof slice.
+  let entries ← Corpus.corpusManifestCore result
+    { includeInternal := false, includePrivate := false, reverseElab := false,
+      reverseClosers := false, reverseSkip := #[] }
+  let records := (entries.map fun e =>
+    Corpus.entryToRecord e result.file.relPath Corpus.TagConfig.empty).filter
+    Corpus.Artifact.isTheoremRecord
+  -- Both the standalone recursive theorem and EVERY member of the `mutual` block must
+  -- be present as records — the mutual members are matched to their own declaration
+  -- nodes, not classified auxiliary.
+  for name in ["TerminationFixture.rec_le", "TerminationFixture.ping_nonneg",
+               "TerminationFixture.pong_nonneg"] do
+    assertIO (records.any (·.name == name)) s!"fixture yields a record for {name}"
+  -- Sorry mode: one edit per theorem (no mutual member left un-holed as auxiliary),
+  -- each edit's range covering that theorem's termination hints.
+  let sorryEdits ← LeanReassemble.planEdits result records .replace
+  assertIO (sorryEdits.size == records.size)
+    "one edit per theorem, including every mutual member"
+  for edit in sorryEdits do
+    assertIO (edit.expected.contains "termination_by" && edit.expected.contains "decreasing_by")
+      s!"the replaced range must cover the termination suffix for {edit.declaration}"
+  let sorried ← LeanReassemble.applyEdits result.source sorryEdits
+  assertIO (!sorried.contains "termination_by" && !sorried.contains "decreasing_by")
+    "sorry-mode rewrite must leave no dangling termination hints"
+  assertIO ((sorried.splitOn "sorry").length - 1 == 3)
+    "sorry-mode rewrite holed all three theorems"
+  -- The holed file must actually elaborate: no unused-termination-hint error, no
+  -- leftover `decreasing_by` run against absent goals, and — critically for the mutual
+  -- block — no "No goals to be solved" from a survivor whose group-mate was holed.
+  -- (A `sorry` warning is allowed; `validateWithWorker` rejects only errors.)
+  LeanReassemble.validateWithWorker result.file.absPath sorried
+  -- Keep mode preserves every proof AND its hints, byte-identically.
+  let keepEdits ← LeanReassemble.planEdits result records .keep
+  let kept ← LeanReassemble.applyEdits result.source keepEdits
+  assertIO (kept == result.source)
+    "keep mode must be byte-identical over termination suffixes and a mutual block"
+
 /-- `evalStripEdits` erases exactly the evaluation commands (`#eval`, `#eval!`,
 `#reduce`, `#guard`, `#guard_msgs`) — including a `#guard_msgs` block's leading
 docstring — and leaves every declaration (`def`, `theorem`) and `#check` untouched.
@@ -568,6 +623,7 @@ unsafe def run : IO Unit := do
   testManifestOverride result records
   testCollectingFailures result records
   testAuxiliaryRecords
+  testTerminationSuffix
   testEvalStrip
   testManifestParity result records
   testFailures result records
@@ -599,7 +655,17 @@ unsafe def run : IO Unit := do
 
 end ReassembleTests
 
-unsafe def main : IO UInt32 := do
+unsafe def main (args : List String) : IO UInt32 := do
+  -- `materialize-repo` defaults to isolated mode, spawning `<self> --internal-rewrite-one`
+  -- per file. Here `<self>` is this test binary, so it must handle that flag too — which
+  -- also gives the isolated child path real coverage from `testMaterializers`.
+  match args with
+  | flag :: payload :: _ =>
+    if flag == LeanReassemble.rewriteOneFlag then
+      match (Lean.Json.parse payload >>= Lean.fromJson? (α := LeanReassemble.RewriteOneRequest)) with
+      | .ok request => LeanReassemble.rewriteOneChild request; return 0
+      | .error error => IO.eprintln error; return 2
+  | _ => pure ()
   try
     ReassembleTests.run
     return 0

@@ -29,6 +29,14 @@ structure MaterializeConfig where
   or deletes at least one proof. Set to skip that strip and preserve them verbatim
   (the historical behavior, and correct when nothing is holed). -/
   keepEval : Bool := false
+  /-- Rewrite each source file in its own child process (the default). Each file's
+  Lean environment then dies with its child, bounding peak memory to a single file
+  rather than accumulating every module's imported environment in one long-lived
+  process — which, on a large project like Cedar, otherwise climbs past 20 GiB and
+  OOMs a swapless host. Set false (`--in-process`) to rewrite every file in this
+  process instead: faster per file, but only safe for small projects.
+  `materialize-units` is unaffected (it has its own per-target model). -/
+  isolated : Bool := true
 
 private def artifactPath (path : System.FilePath) : String :=
   path.toString.replace "\\" "/"
@@ -152,9 +160,9 @@ private def projectName (root : System.FilePath) : IO String :=
 so the buckets are counted from each theorem's resolved mode rather than derived
 from one global mode. `skipped`/`failed` come from the failure policy (Phase 3).
 `auxiliary` counts theorem records that are not reassembly targets at all — `where`/
-`let rec` helpers and `mutual` members with no standalone syntax (see
-`RecordPlan.auxiliary`); they are excluded rather than holed, and this bucket keeps
-the accounting total whole. -/
+`let rec` helpers with no standalone declaration syntax (see `RecordPlan.auxiliary`;
+`mutual` members are NOT auxiliary — they are holed in their own right); they are
+excluded rather than holed, and this bucket keeps the accounting total whole. -/
 structure RewriteCounts where
   replaced : Nat := 0
   preserved : Nat := 0
@@ -162,12 +170,22 @@ structure RewriteCounts where
   skipped : Nat := 0
   failed : Nat := 0
   auxiliary : Nat := 0
+  deriving ToJson, FromJson
 
 /-- Add one resolved action to the tally. -/
 def RewriteCounts.bump (counts : RewriteCounts) : ProofMode → RewriteCounts
   | .replace => { counts with replaced := counts.replaced + 1 }
   | .keep    => { counts with preserved := counts.preserved + 1 }
   | .delete  => { counts with deleted := counts.deleted + 1 }
+
+/-- Sum two tallies field-wise — folds a per-file child's counts into the run total. -/
+def RewriteCounts.add (a b : RewriteCounts) : RewriteCounts where
+  replaced := a.replaced + b.replaced
+  preserved := a.preserved + b.preserved
+  deleted := a.deleted + b.deleted
+  skipped := a.skipped + b.skipped
+  failed := a.failed + b.failed
+  auxiliary := a.auxiliary + b.auxiliary
 
 /-- The rewrite summary. `proof_mode` reports the run default; the buckets report
 the resolved action per theorem, so a manifest that mixes actions is reflected
@@ -197,6 +215,134 @@ private def loadManifest (path : Option System.FilePath)
     let manifest ← Manifest.read path
     manifest.validateKeys (Std.HashSet.ofArray (eligible.map (·.name)))
     return manifest
+
+/-- What rewriting ONE file into the artifact tree contributes to the run: the counts,
+the named failures, and the per-file report entry. Serializable so an isolated child
+can hand it back over stdout. -/
+structure FileRewriteResult where
+  relPath : String
+  module : String
+  edits : Nat
+  evalStripped : Nat
+  counts : RewriteCounts
+  failures : Array FailureReport
+  deriving ToJson, FromJson
+
+/-- Rewrite ONE source file's proofs into `repoRoot / file`, applying the failure
+policy and (when `stripEval`) erasing evaluation commands, and return the accumulation
+the run folds in. Writes the rewritten file as a side effect. This is the unit of work
+the isolated driver runs in a child process (see `rewriteOneFlag`); the in-process
+driver calls it directly.
+
+`prepareSourceFile` (frontend elaboration) sits OUTSIDE the failure policy: a module
+that no longer elaborates is a file-level failure, not attributable to any one
+theorem, so it aborts under every policy (as does the whole-tree build). skip/backoff
+recover per-theorem PLANNING failures only — `skip` leaves a failed theorem's proof
+untouched, `backoff` re-plans it as a delete. -/
+unsafe def rewriteFileIntoRepo (sourceRoot : System.FilePath)
+    (records : Array Corpus.ConstRecord) (file : String) (repoRoot : System.FilePath)
+    (proofMode : ProofMode) (modeFor : String → ProofMode)
+    (onFailure : FailurePolicy) (stripEval : Bool) : IO FileRewriteResult := do
+  let prepared ← prepareSourceFile sourceRoot file
+  let selected ← selectTheorems records prepared.relFile
+  -- Plan resiliently in every policy: `planEditsCollecting` classifies each record as
+  -- planned / auxiliary / failed. Auxiliaries (no standalone syntax) are counted and
+  -- excluded under all policies; only `fail` re-throws on a genuine failure.
+  let outcome ← planEditsCollecting prepared.frontendResult selected proofMode modeFor
+  let mut counts : RewriteCounts := {}
+  for edit in outcome.edits do
+    counts := counts.bump (modeFor edit.declaration)
+  counts := { counts with auxiliary := counts.auxiliary + outcome.auxiliaries.size }
+  let mut edits : Array Edit := outcome.edits
+  let mut failures : Array FailureReport := #[]
+  if onFailure == .fail then
+    if let some (_, reason) := outcome.failures[0]? then
+      fail reason
+  else if onFailure == .backoff then
+    -- `backoff` retries the failed records as deletes; any that still cannot be planned
+    -- fall through to a skip. `skip` records nothing further — the proof stays as-is.
+    let failedNames := Std.HashSet.ofArray (outcome.failures.map (·.1))
+    let failedRecords := selected.filter (failedNames.contains ·.name)
+    let retry ← planEditsCollecting prepared.frontendResult failedRecords .delete
+    edits := edits ++ retry.edits
+    let retried := Std.HashSet.ofArray (retry.edits.map (·.declaration))
+    counts := { counts with failed := counts.failed + retry.edits.size }
+    counts := { counts with
+      skipped := counts.skipped + (outcome.failures.size - retry.edits.size) }
+    for (name, reason) in outcome.failures do
+      let action := if retried.contains name then "failed" else "skipped"
+      IO.eprintln s!"lean-reassemble: {action} {name}: {reason}"
+      failures := failures.push { name, action, reason }
+  else
+    counts := { counts with skipped := counts.skipped + outcome.failures.size }
+    for (name, reason) in outcome.failures do
+      IO.eprintln s!"lean-reassemble: skipped {name}: {reason}"
+      failures := failures.push { name, action := "skipped", reason }
+  -- Merge eval-strip edits (if armed) into the proof edits: both come from the same
+  -- `prepared.frontendResult`, so they share one coordinate space and one `applyEdits`
+  -- pass (whose `validateEdits` still guards overlap).
+  let stripped := if stripEval then evalStripEdits prepared.frontendResult else #[]
+  let text ← applyEdits prepared.frontendResult.source (edits ++ stripped)
+  let outputPath := repoRoot / file
+  if let some parent := outputPath.parent then
+    IO.FS.createDirAll parent
+  IO.FS.writeFile outputPath text
+  return { relPath := prepared.relFile, module := prepared.moduleName.toString,
+           edits := edits.size, evalStripped := stripped.size, counts, failures }
+
+/-- The complete request for one isolated file-rewrite child. Serialized as ONE JSON
+argument so parent and child share a single encoding rather than a hand-written flag
+pair (mirrors the extractor's `--internal-extract-one`). Nothing unserializable
+crosses: the child re-derives `modeFor` from `records` + `manifestPath`. -/
+structure RewriteOneRequest where
+  sourceRoot : System.FilePath
+  records : System.FilePath
+  file : String
+  repoRoot : System.FilePath
+  proofMode : ProofMode
+  manifestPath : Option System.FilePath
+  onFailure : FailurePolicy
+  stripEval : Bool
+  deriving ToJson, FromJson
+
+/-- The flag that carries a `RewriteOneRequest` to a child process. -/
+def rewriteOneFlag : String := "--internal-rewrite-one"
+
+/-- Child entry: rewrite one file per a `RewriteOneRequest` and print its
+`FileRewriteResult` as compressed JSON on stdout. Runs in a fresh process so the
+file's Lean environment is reclaimed on exit — the whole point of isolated mode. -/
+unsafe def rewriteOneChild (request : RewriteOneRequest) : IO Unit := do
+  let records ← readRecords request.records
+  let theorems ← eligibleTheorems records
+  let manifest ← loadManifest request.manifestPath theorems
+  let modeFor := fun name => manifest.actionFor name request.proofMode
+  let result ← rewriteFileIntoRepo request.sourceRoot records request.file
+    request.repoRoot request.proofMode modeFor request.onFailure request.stripEval
+  IO.println (toJson result).compress
+
+/-- Run one file's rewrite in a child process and read back its `FileRewriteResult`.
+The child inherits this (already `lake env`-re-exec'd) process's environment, so its
+`prepareSourceFile` resolves imports from the same `LEAN_PATH`. A nonzero exit is a
+hard failure — the module no longer elaborates, or `--on-failure fail` hit a genuine
+per-theorem failure — and aborts the run, exactly as the in-process path would. -/
+unsafe def rewriteFileViaChild (exe : System.FilePath) (request : RewriteOneRequest)
+    : IO FileRewriteResult := do
+  let child ← IO.Process.spawn {
+    cmd := exe.toString
+    args := #[rewriteOneFlag, (toJson request).compress]
+    stdin := .null, stdout := .piped, stderr := .inherit
+    -- `setsid` so a kill reaches any nested work, mirroring the extractor's children.
+    setsid := true
+  }
+  -- Drain stdout on a task while waiting, so a child can never block on a full pipe.
+  let stdoutTask ← IO.asTask child.stdout.readToEnd Task.Priority.dedicated
+  let code ← child.wait
+  let out ← IO.ofExcept (← IO.wait stdoutTask)
+  if code != 0 then
+    fail s!"rewriting {request.file} failed (child exited {code})"
+  match Json.parse out >>= fromJson? (α := FileRewriteResult) with
+  | .ok result => return result
+  | .error e => fail s!"could not parse child result for {request.file}: {e}\n{out}"
 
 unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
   let (sourceRoot, artifact) ← prepareOutput config.sourceRoot config.output
@@ -228,68 +374,30 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
   -- eval-strip pass skips them (their eval edits are merged in here, in the SAME
   -- coordinate space as their proof edits) and only visits record-free modules.
   let mut rewrittenPaths : Std.HashSet String := {}
+  -- Each file is rewritten by `rewriteFileIntoRepo`. In isolated mode (the default)
+  -- that runs in a fresh child process per file, so the file's Lean environment dies
+  -- with the child — bounding peak memory to one file rather than accumulating every
+  -- module's imported environment in one long-lived process (which OOMs a large
+  -- project like Cedar). `--in-process` runs them all here instead.
+  let exe ← IO.appPath
   for file in theoremFiles theorems do
-    -- Under `fail` this is the historical strict path: any per-record planning
-    -- problem aborts. Under `skip`/`backoff` we plan resiliently and act on each
-    -- failure — `skip` leaves that theorem's proof untouched (its edit is simply
-    -- not applied), `backoff` re-plans it as a delete.
-    --
-    -- `prepareSourceFile` (frontend elaboration) is intentionally OUTSIDE that
-    -- resilience: a module that no longer elaborates is a file-level failure, not
-    -- attributable to any one theorem, so — like the whole-tree build below — it
-    -- aborts under every policy. skip/backoff recover per-theorem planning failures.
-    let prepared ← prepareSourceFile sourceRoot file
-    let selected ← selectTheorems records prepared.relFile
-    -- Plan resiliently in every policy: `planEditsCollecting` classifies each record
-    -- as planned / auxiliary / failed. Auxiliaries (no standalone syntax) are counted
-    -- and excluded under all policies; only `fail` re-throws on a genuine failure.
-    let outcome ← planEditsCollecting prepared.frontendResult selected
-      config.proofMode modeFor
-    for edit in outcome.edits do
-      counts := counts.bump (modeFor edit.declaration)
-    counts := { counts with auxiliary := counts.auxiliary + outcome.auxiliaries.size }
-    let mut edits : Array Edit := outcome.edits
-    if config.onFailure == .fail then
-      if let some (_, reason) := outcome.failures[0]? then
-        fail reason
-    else
-      -- `backoff` retries the failed records as deletes; any that still cannot be
-      -- planned (e.g. their declaration syntax is unrecoverable) fall through to a
-      -- skip. `skip` records nothing further — the theorem keeps its source proof.
-      if config.onFailure == .backoff then
-        let failedNames := Std.HashSet.ofArray (outcome.failures.map (·.1))
-        let failedRecords := selected.filter (failedNames.contains ·.name)
-        let retry ← planEditsCollecting prepared.frontendResult failedRecords .delete
-        edits := edits ++ retry.edits
-        let retried := Std.HashSet.ofArray (retry.edits.map (·.declaration))
-        counts := { counts with failed := counts.failed + retry.edits.size }
-        counts := { counts with
-          skipped := counts.skipped + (outcome.failures.size - retry.edits.size) }
-        for (name, reason) in outcome.failures do
-          let action := if retried.contains name then "failed" else "skipped"
-          IO.eprintln s!"lean-reassemble: {action} {name}: {reason}"
-          failures := failures.push { name, action, reason }
+    let result ←
+      if config.isolated then
+        rewriteFileViaChild exe {
+          sourceRoot, records := config.records, file, repoRoot,
+          proofMode := config.proofMode, manifestPath := config.manifestPath,
+          onFailure := config.onFailure, stripEval }
       else
-        counts := { counts with skipped := counts.skipped + outcome.failures.size }
-        for (name, reason) in outcome.failures do
-          IO.eprintln s!"lean-reassemble: skipped {name}: {reason}"
-          failures := failures.push { name, action := "skipped", reason }
-    -- Merge eval-strip edits (if armed) into the proof edits for this file. Both come
-    -- from `prepared.frontendResult`, so they share one coordinate space and one
-    -- `applyEdits` pass. `validateEdits` (inside `applyEdits`) still guards overlap.
-    let stripped := if stripEval then evalStripEdits prepared.frontendResult else #[]
-    let allEdits := edits ++ stripped
-    let text ← applyEdits prepared.frontendResult.source allEdits
-    let outputPath := repoRoot / file
-    if let some parent := outputPath.parent then
-      IO.FS.createDirAll parent
-    IO.FS.writeFile outputPath text
-    rewrittenPaths := rewrittenPaths.insert prepared.relFile
+        rewriteFileIntoRepo sourceRoot records file repoRoot
+          config.proofMode modeFor config.onFailure stripEval
+    counts := counts.add result.counts
+    failures := failures ++ result.failures
+    rewrittenPaths := rewrittenPaths.insert result.relPath
     rewrittenFiles := rewrittenFiles.push <| Json.mkObj [
       ("file", file),
-      ("module", prepared.moduleName.toString),
-      ("edits", edits.size),
-      ("eval_stripped", stripped.size)
+      ("module", result.module),
+      ("edits", result.edits),
+      ("eval_stripped", result.evalStripped)
     ]
   -- Second pass: record-free modules the theorem loop never touched can still hold
   -- `#eval`s that reach a holed proof through imports (e.g. an `Examples.lean` with
@@ -304,7 +412,21 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
       let mentionsEval := ["#eval", "#reduce", "#guard"].any fun tok =>
         (raw.splitOn tok).length > 1
       unless mentionsEval do continue
-      let prepared ← prepareSourceFile sourceRoot df.relPath
+      -- A record-free file that does not elaborate standalone (e.g. a `SymTest/`
+      -- harness whose modules the default `lake build` target never builds, so its
+      -- imports are not on `LEAN_PATH`) is not part of the build we verify below, so
+      -- its `#eval`s cannot reach a holed proof through it. We cannot strip what we
+      -- cannot elaborate, so skip it with a warning rather than aborting the whole
+      -- run — unlike a theorem file, whose elaboration failure IS fatal above. If such
+      -- a file really were in the build target, the final `lake build` would surface
+      -- the break as an attributable error.
+      let prepared ← try
+          pure (some (← prepareSourceFile sourceRoot df.relPath))
+        catch _ =>
+          IO.eprintln s!"lean-reassemble: skipped eval-strip for {df.relPath} \
+            (does not elaborate standalone; not in the build target)"
+          pure none
+      let some prepared := prepared | continue
       let stripped := evalStripEdits prepared.frontendResult
       if stripped.isEmpty then continue
       let text ← applyEdits prepared.frontendResult.source stripped

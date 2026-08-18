@@ -3,6 +3,8 @@ import Corpus.Reexec
 
 namespace LeanReassemble
 
+open Lean (Json fromJson?)
+
 private def usage : String := "\
 Usage:
   lean_reassemble rewrite-file --source-root <lake-project>
@@ -105,7 +107,7 @@ private def parseRewriteArgs (args : List String) : Except String RewriteConfig 
 private def parseMaterializeArgs (args : List String) : Except String MaterializeConfig := do
   let rec go (remaining : List String) (sourceRoot records output buildTarget : Option String)
       (manifest : Option String) (mode : ProofMode) (onFailure : FailurePolicy)
-      (keepEval : Bool)
+      (keepEval : Bool) (isolated : Bool)
       : Except String MaterializeConfig :=
     match remaining with
     | [] => return {
@@ -117,25 +119,28 @@ private def parseMaterializeArgs (args : List String) : Except String Materializ
         manifestPath := manifest.map System.FilePath.mk
         onFailure
         keepEval
+        isolated
       }
     | "--source-root" :: value :: tail =>
-        go tail (some value) records output buildTarget manifest mode onFailure keepEval
+        go tail (some value) records output buildTarget manifest mode onFailure keepEval isolated
     | "--records" :: value :: tail =>
-        go tail sourceRoot (some value) output buildTarget manifest mode onFailure keepEval
+        go tail sourceRoot (some value) output buildTarget manifest mode onFailure keepEval isolated
     | "--output" :: value :: tail =>
-        go tail sourceRoot records (some value) buildTarget manifest mode onFailure keepEval
+        go tail sourceRoot records (some value) buildTarget manifest mode onFailure keepEval isolated
     | "--build-target" :: value :: tail =>
-        go tail sourceRoot records output (some value) manifest mode onFailure keepEval
+        go tail sourceRoot records output (some value) manifest mode onFailure keepEval isolated
     | "--manifest" :: value :: tail =>
-        go tail sourceRoot records output buildTarget (some value) mode onFailure keepEval
+        go tail sourceRoot records output buildTarget (some value) mode onFailure keepEval isolated
     | "--proofs" :: value :: tail => do
-        go tail sourceRoot records output buildTarget manifest (← parseProofMode value) onFailure keepEval
+        go tail sourceRoot records output buildTarget manifest (← parseProofMode value) onFailure keepEval isolated
     | "--on-failure" :: value :: tail => do
-        go tail sourceRoot records output buildTarget manifest mode (← parseFailurePolicy value) keepEval
+        go tail sourceRoot records output buildTarget manifest mode (← parseFailurePolicy value) keepEval isolated
     | "--keep-eval" :: tail =>
-        go tail sourceRoot records output buildTarget manifest mode onFailure true
+        go tail sourceRoot records output buildTarget manifest mode onFailure true isolated
+    | "--in-process" :: tail =>
+        go tail sourceRoot records output buildTarget manifest mode onFailure keepEval false
     | flag :: _ => throw s!"unknown or incomplete argument: {flag}"
-  go args none none none none none .replace .fail false
+  go args none none none none none .replace .fail false true
 
 private def parseArgs : List String → Except String Command
   | "rewrite-file" :: rest => .rewriteFile <$> parseRewriteArgs rest
@@ -154,6 +159,29 @@ private unsafe def execute : Command → IO Unit
   | .materializeUnits config => LeanReassemble.materializeUnits config
 
 unsafe def runCli (args : List String) : IO UInt32 := do
+  -- Internal per-file worker for isolated `materialize-repo`: the parent spawns
+  -- `<self> --internal-rewrite-one <json>` once per source file so each file's Lean
+  -- environment dies with its child. Handled before help/parse/reexec: it is not a
+  -- user command, and it must NOT re-exec under `lake env` (the parent already did, and
+  -- this child inherits that environment). See `rewriteOneChild`.
+  match args with
+  | flag :: payload :: _ =>
+    if flag == rewriteOneFlag then
+      match (Json.parse payload >>= fromJson? (α := RewriteOneRequest)) with
+      | .ok request =>
+          try
+            rewriteOneChild request
+            return 0
+          catch error =>
+            -- A per-file failure (module no longer elaborates, or `--on-failure fail`
+            -- hit a genuine failure): exit nonzero so the parent aborts the run. The
+            -- message goes to the inherited stderr for the root cause.
+            IO.eprintln error.toString
+            return 1
+      | .error error =>
+          IO.eprintln s!"lean-reassemble: bad {rewriteOneFlag} payload: {error}"
+          return 2
+  | _ => pure ()
   if args.contains "--help" || args.contains "-h" then
     IO.println usage
     return 0
