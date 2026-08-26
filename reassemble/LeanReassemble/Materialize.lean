@@ -481,19 +481,6 @@ private def captureEnv (root : System.FilePath) (name : String) :
     return #[]
   fail s!"failed to capture {name}: {output.stdout}{output.stderr}"
 
-private def copySearchRoots (artifact sysroot : System.FilePath)
-    (roots : Array System.FilePath) : IO (Array String) := do
-  let mut copied := #[]
-  for root in roots do
-    if ← root.pathExists then
-      let absolute ← IO.FS.realPath root
-      if !isWithin sysroot absolute then
-        let relative : System.FilePath :=
-          ("cache" : System.FilePath) / "roots" / toString copied.size
-        copyCacheTree absolute (artifact / relative)
-        copied := copied.push (artifactPath relative)
-  return copied
-
 private def copyNativeRoots (artifact sysroot : System.FilePath)
     (roots : Array System.FilePath) : IO (Array String) := do
   let mut copied := #[]
@@ -511,6 +498,103 @@ private def copyNativeRoots (artifact sysroot : System.FilePath)
               destination.toString]
         copied := copied.push (artifactPath relative)
   return copied
+
+/-- Write a minimal Lake package whose `roots := #[]` `lean_lib` exposes a directory
+of PREBUILT oleans on any dependent's `LEAN_PATH` without compiling anything of its
+own. Because the lib schedules no work, Lake never writes back into its `libDir`
+(`.lake/build/lib/lean`) during a dependent's build — the oleans placed there are
+the only constants it serves, and a unit's build cannot corrupt the shared cache.
+`requires` are emitted as path-type `require`s in the given order, which Lake
+preserves as `LEAN_PATH` order (significant: two roots may expose the same module). -/
+private def writeStubPackage (dir : System.FilePath) (pkgName libName : String)
+    (requires : Array (String × String)) (toolchain : String) : IO Unit := do
+  IO.FS.createDirAll dir
+  let requireLines := String.intercalate "\n"
+    (requires.toList.map fun (name, path) => s!"require «{name}» from \"{path}\"")
+  IO.FS.writeFile (dir / "lakefile.lean")
+    s!"import Lake\nopen Lake DSL\n\npackage «{pkgName}»\n\n\
+      {requireLines}\n\nlean_lib «{libName}» where\n  roots := #[]\n"
+  IO.FS.writeFile (dir / "lean-toolchain") (toolchain ++ "\n")
+
+/-- Write a unit's lakefile: a standalone Lake project whose only source is the one
+holed target module (`moduleName`, resolved from `srcDir := "."`), building against
+the shared cache via a single `require` of `cache/siblings`. `cd <unit> && lake build`
+then compiles exactly that module — the consumer's primary entry point. -/
+private def writeUnitLakefile (dir : System.FilePath) (moduleName toolchain : String)
+    : IO Unit := do
+  IO.FS.writeFile (dir / "lakefile.lean")
+    s!"import Lake\nopen Lake DSL\n\npackage «task»\n\n\
+      require «siblings» from \"../../cache/siblings\"\n\n\
+      @[default_target]\nlean_lib «ProofTask» where\n  srcDir := \".\"\n  \
+      roots := #[`{moduleName}]\n"
+  IO.FS.writeFile (dir / "lean-toolchain") (toolchain ++ "\n")
+
+/-- Turn an absolute root-package libDir (`…/cache/roots/<n>/.lake/build/lib/lean`)
+into an artifact-relative path. Splits on the `/roots/<n>/` segment rather than
+stripping an artifact prefix, so it is robust to symlink differences between the
+artifact path we hold and the one Lake reports. -/
+private def relativeRootLibdir (n : Nat) (absLibdir : String) : String :=
+  match absLibdir.splitOn s!"/roots/{n}/" with
+  | [_, tail] => s!"cache/roots/{n}/{tail}"
+  | _         => s!"cache/roots/{n}"
+
+/-- Build the shared, immutable Lake cache under `<artifact>/cache/`, and return the
+artifact-relative olean libdirs and native-lib dirs for the direct-`lean` fallback.
+
+Each pristine `LEAN_PATH` root OUTSIDE the toolchain sysroot becomes a stub package
+`cache/roots/<n>` whose `.lake/build/lib/lean` holds that root's prebuilt oleans;
+`cache/siblings` is one stub package requiring all of them in the pristine order. A
+unit requires only `cache/siblings` and so inherits every root on its `LEAN_PATH`,
+in order, through Lake — no environment plumbing, and `lake build` from the unit
+resolves imports exactly as the pristine project did. The cache is written once here
+and never mutated by a unit build (the root libs schedule no work; see
+`writeStubPackage`), so all units can share it. -/
+private def generateSharedCache (artifact sysroot : System.FilePath)
+    (toolchain : String) (leanPath nativePath : Array System.FilePath)
+    : IO (Array String × Array String) := do
+  -- The roots we actually ship: those outside the toolchain sysroot (the toolchain
+  -- itself is restored by `elan`, not copied), mirroring `copySearchRoots`.
+  let mut sources : Array System.FilePath := #[]
+  for root in leanPath do
+    if ← root.pathExists then
+      let absolute ← IO.FS.realPath root
+      if !isWithin sysroot absolute then
+        sources := sources.push absolute
+  for n in [:sources.size] do
+    writeStubPackage (artifact / "cache" / "roots" / toString n)
+      s!"root{n}" s!"Root{n}" #[] toolchain
+  let requires := (Array.range sources.size).map fun n => (s!"root{n}", s!"../roots/{n}")
+  writeStubPackage (artifact / "cache" / "siblings") "siblings" "Siblings" requires toolchain
+  -- Pre-warm every package's manifest. A missing dependency manifest makes a unit's
+  -- `lake build` emit a `warning:` line — which the unit verifier rejects as an
+  -- unexpected diagnostic — and would otherwise be written lazily into the shared
+  -- cache on first use. Writing it now keeps unit builds clean and the cache frozen.
+  for n in [:sources.size] do
+    let _ ← runChecked (artifact / "cache" / "roots" / toString n)
+      "lake" #["update"] cleanLakeEnv
+  let _ ← runChecked (artifact / "cache" / "siblings") "lake" #["update"] cleanLakeEnv
+  -- Ask Lake where each root package's oleans belong (its libDir), then copy the
+  -- pristine root's contents there. `LEAN_PATH` from siblings lists the root libdirs
+  -- in require order, so they align with `sources` by index; the count guard catches
+  -- any drift. This tracks the toolchain's build layout without hard-coding it.
+  let siblingsLeanPath ← captureEnv (artifact / "cache" / "siblings") "LEAN_PATH"
+  let rootsDir := artifact / "cache" / "roots"
+  let libdirs := siblingsLeanPath.filter fun p => isWithin rootsDir p
+  if libdirs.size != sources.size then
+    fail s!"shared cache: Lake reported {libdirs.size} root libdirs for \
+      {sources.size} source roots"
+  let mut leanRoots : Array String := #[]
+  for n in [:sources.size] do
+    let destAbs := libdirs[n]!
+    IO.FS.createDirAll destAbs
+    copyCacheTree sources[n]! destAbs
+    leanRoots := leanRoots.push (relativeRootLibdir n destAbs.toString)
+  -- Native libs are copied as today into `cache/native/<n>`, recorded for the
+  -- direct-`lean` fallback and offered to a unit's `lake build` via LD_LIBRARY_PATH.
+  -- Wiring natives into Lake's own dynlib search (for projects with precompiled
+  -- modules) is future work; the tree/example fixtures carry none.
+  let nativeRoots ← copyNativeRoots artifact sysroot nativePath
+  return (leanRoots, nativeRoots)
 
 private def absoluteArtifactPaths (artifact : System.FilePath)
     (paths : Array String) : Array String :=
@@ -537,7 +621,6 @@ private def unitTaskJson (id sourceRel toolchain proofMode : String)
     (record : Corpus.ConstRecord)
     (span : Nat × Nat) (leanRoots nativeRoots : Array String)
     (diagnostics : String) : Json :=
-  let srcRoot := s!"units/{id}/src"
   Json.mkObj [
     ("format", "lean-corpus-task.v1"),
     ("id", id),
@@ -545,10 +628,14 @@ private def unitTaskJson (id sourceRel toolchain proofMode : String)
     ("module", record.module),
     ("source", sourceRel),
     ("toolchain", toolchain),
-    ("command", Json.arr #[
-      "elan", "run", toolchain, "lean", "-R", srcRoot, sourceRel
-    ]),
+    -- Primary contract: the unit is a standalone Lake project. Run from the unit
+    -- directory, `lake build` compiles the holed target against the shared cache.
+    ("command", Json.arr #["elan", "run", toolchain, "lake", "build"]),
     ("replacement", Json.mkObj [("start_byte", span.1), ("end_byte", span.2)]),
+    -- Fallback contract: a direct `lean` invocation with these ordered search paths
+    -- (relative to the artifact root) reproduces the same check without Lake:
+    --   LEAN_PATH=<lean_path> LD_LIBRARY_PATH=<ld_library_path> \
+    --     lean -R units/<id> units/<id>/<source>
     ("lean_path", Json.arr (leanRoots.map Json.str)),
     ("ld_library_path", Json.arr (nativeRoots.map Json.str)),
     ("proof_mode", proofMode),
@@ -581,8 +668,12 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     pure ""
   if toolchain.isEmpty then
     fail "lean-toolchain is missing or empty"
-  let leanRoots ← copySearchRoots artifact sysroot leanPath
-  let nativeRoots ← copyNativeRoots artifact sysroot nativePath
+  -- Build the shared, immutable Lake cache once: a stub package per pristine
+  -- `LEAN_PATH` root plus a `cache/siblings` package requiring them in order. Every
+  -- unit requires only `cache/siblings`, so `lake build` from a unit resolves imports
+  -- through Lake exactly as the pristine project did. `leanRoots`/`nativeRoots` are
+  -- the artifact-relative search paths recorded for the direct-`lean` fallback.
+  let (leanRoots, nativeRoots) ← generateSharedCache artifact sysroot toolchain leanPath nativePath
   let environment := Json.mkObj [
     ("toolchain", toolchain),
     ("lean_githash", githashOutput.stdout.trimAscii.copy),
@@ -591,11 +682,12 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
   ]
   IO.FS.createDirAll (artifact / "cache")
   writeJson (artifact / "cache" / "environment.json") environment
-  let leanExe := sysroot / "bin" / "lean"
-  let leanEnv := #[
-    ("LEAN_PATH", some (envValue (absoluteArtifactPaths artifact leanRoots))),
-    ("LD_LIBRARY_PATH", some (envValue (absoluteArtifactPaths artifact nativeRoots)))
-  ]
+  -- A unit's `lake build` gets a clean environment (no ambient `LEAN_PATH`); native
+  -- libraries, when the project has any, are offered via `LD_LIBRARY_PATH`.
+  let unitBuildEnv : Array (String × Option String) :=
+    if nativeRoots.isEmpty then cleanLakeEnv
+    else #[("LEAN_PATH", none),
+      ("LD_LIBRARY_PATH", some (envValue (absoluteArtifactPaths artifact nativeRoots)))]
   -- Elaborate each source file ONCE, then derive a per-target rewrite from it.
   -- Elaboration is the expensive step, so it is shared; the cheap byte-splice is
   -- what varies per task.
@@ -642,17 +734,25 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
         | fail s!"replacement span missing for {record.name}"
       let id := s!"{index}-{safeName record.name}"
       let taskRel : System.FilePath := ("units" : System.FilePath) / id
-      let srcRoot := artifact / taskRel / "src"
-      let sourcePath := srcRoot / file
-      if let some parent := sourcePath.parent then
+      let unitDir := artifact / taskRel
+      -- The unit is a standalone Lake project: the holed module at its module-derived
+      -- path (so `srcDir := "."` + `roots := #[module]` finds it), a generated
+      -- lakefile requiring the shared cache, and the pinned toolchain.
+      let modulePath := unitDir / file
+      if let some parent := modulePath.parent then
         IO.FS.createDirAll parent
-      IO.FS.writeFile sourcePath rewritten.text
-      let verification ← runOutput artifact leanExe.toString
-        #["-R", srcRoot.toString, sourcePath.toString] leanEnv
+      IO.FS.writeFile modulePath rewritten.text
+      writeUnitLakefile unitDir record.module toolchain
+      -- Verify by building the unit exactly as a consumer would — `lake build` from
+      -- the unit directory, resolving imports from the shared cache. This is the
+      -- correctness oracle for the generated lakefile, not just a metadata check.
+      -- No target: the unit's own `@[default_target]` builds just the holed module
+      -- (`config.buildTarget` selects a target in the SOURCE project, not the unit).
+      let verification ← runOutput unitDir "lake" #["build"] unitBuildEnv
       if verification.exitCode != 0 then
         fail s!"unit verification failed for {record.name}:\n\
           {verification.stdout}{verification.stderr}"
-      let sourceRel := artifactPath (taskRel / "src" / file)
+      let sourceRel := artifactPath (taskRel / file)
       let diagnostics := (verification.stdout ++ verification.stderr).replace
         artifact.toString "."
       -- `sorry` warnings are expected under `.replace` (we just created one) and,
@@ -683,7 +783,13 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
       for line in diagnostics.splitOn "\n" do
         if line.contains "warning:" && !line.contains "declaration uses `sorry`" then
           fail s!"unexpected warning while verifying {record.name}: {line}"
-      writeJson (artifact / taskRel / "task.json")
+      -- Ship a minimal, relocatable unit: drop the build outputs and resolved
+      -- manifest that `lake build` just produced. They are a pure function of the
+      -- lakefile + shared cache, so a consumer's first `lake build` regenerates them;
+      -- omitting them keeps units small and free of any path Lake may have cached.
+      removeIfExists (unitDir / ".lake")
+      removeIfExists (unitDir / "lake-manifest.json")
+      writeJson (unitDir / "task.json")
         (unitTaskJson id sourceRel toolchain (toString targetMode) record span
           leanRoots nativeRoots diagnostics)
       pure <| Except.ok <| Json.mkObj [
@@ -699,7 +805,7 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
       counts := counts.bump targetMode
       tasks := tasks.push task
     | .error reason =>
-      -- The task's src tree may have been partly written before the failure (the
+      -- The unit directory may have been partly written before the failure (the
       -- `id`/dir are a deterministic function of index+name, so recompute them here
       -- rather than threading them out of the try). Remove it so a skipped/backed-off
       -- theorem leaves no orphan directory in the artifact.

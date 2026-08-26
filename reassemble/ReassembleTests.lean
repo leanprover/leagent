@@ -507,8 +507,16 @@ private unsafe def testMaterializers : IO Unit := do
     }
     let firstTask := unitsOutput / "units" / "0-Fixture.first"
     let secondTask := unitsOutput / "units" / "1-Fixture.second"
-    let firstSource ← IO.FS.readFile (firstTask / "src" / "Fixture" / "Basic.lean")
-    let secondSource ← IO.FS.readFile (secondTask / "src" / "Fixture" / "Basic.lean")
+    -- Each unit is a standalone Lake project: its one holed module lives at the
+    -- module-derived path (NOT under a `src/` prefix), beside a generated lakefile
+    -- and the pinned toolchain. The build cache and resolved manifest are stripped,
+    -- so the shipped unit is minimal and relocatable.
+    let firstSource ← IO.FS.readFile (firstTask / "Fixture" / "Basic.lean")
+    let secondSource ← IO.FS.readFile (secondTask / "Fixture" / "Basic.lean")
+    assertIO (← (firstTask / "lakefile.lean").pathExists) "unit ships a lakefile"
+    assertIO (← (firstTask / "lean-toolchain").pathExists) "unit ships a toolchain pin"
+    assertIO (!(← (firstTask / ".lake").pathExists)) "unit build cache stripped"
+    assertIO (!(← (firstTask / "lake-manifest.json").pathExists)) "unit manifest stripped"
     -- A unit is a task for ONE theorem: exactly its own proof is holed out, and
     -- every neighbour in the module keeps its real proof. (The whole-file rewrite
     -- `rewritten` sorries BOTH, which is right for materialize-repo and wrong here.)
@@ -528,27 +536,45 @@ private unsafe def testMaterializers : IO Unit := do
     let taskJson ← IO.FS.readFile (firstTask / "task.json")
     assertIO (taskJson.contains "\"target\": \"Fixture.first\"")
       "unit target metadata"
-    assertIO (taskJson.contains "\"command\"") "unit replay command"
+    -- The primary contract is `lake build`; the direct-`lean` env is the fallback.
+    assertIO (taskJson.contains "\"lake\", \"build\"") "unit lake-build command"
     assertIO (!taskJson.contains unitsOutput.toString)
       "artifact-relative task metadata"
+    -- The shared cache is a pair of stub Lake packages the units require.
+    assertIO (← (unitsOutput / "cache" / "siblings" / "lakefile.lean").pathExists)
+      "cache siblings package"
+    assertIO (← (unitsOutput / "cache" / "roots" / "0" / ".lake" / "build" / "lib" / "lean"
+      ).pathExists) "cache root olean libdir"
     let environment ← IO.FS.readFile (unitsOutput / "cache" / "environment.json")
-    assertIO (environment.contains "\"cache/roots/0\"") "unit cache root"
+    assertIO (environment.contains "cache/roots/0/.lake/build/lib/lean") "unit cache root"
     assertIO (!environment.contains ".work") "artifact-relative cache metadata"
     assertIO (!(← (unitsOutput / ".work").pathExists)) "temporary build removal"
     IO.FS.rename unitsOutput movedOutput
-    let movedSrcRoot := movedOutput / "units" / "0-Fixture.first" / "src"
+    let movedUnit := movedOutput / "units" / "0-Fixture.first"
     let sysroot ← Lean.findSysroot
+    -- Primary contract: a moved unit builds as an ordinary Lake project. This is the
+    -- correctness oracle — Lake resolves imports from the (also-moved) shared cache
+    -- via the unit's `require`, with no external `LEAN_PATH`.
+    let lakeReplay ← IO.Process.output {
+      cmd := (sysroot / "bin" / "lake").toString
+      args := #["build"]
+      cwd := some movedUnit
+      env := #[("LEAN_PATH", none), ("LD_LIBRARY_PATH", none)]
+    }
+    assertIO (lakeReplay.exitCode == 0) "moved unit lake build"
+    -- Fallback contract: the recorded `lean_path` (relative to the artifact) drives a
+    -- direct `lean` invocation without Lake.
+    let cacheLibDir := movedOutput / "cache" / "roots" / "0" / ".lake" / "build" / "lib" / "lean"
     let replay ← IO.Process.output {
       cmd := (sysroot / "bin" / "lean").toString
-      args := #["-R", movedSrcRoot.toString,
-        (movedSrcRoot / "Fixture" / "Basic.lean").toString]
+      args := #["-R", movedUnit.toString, (movedUnit / "Fixture" / "Basic.lean").toString]
       cwd := some movedOutput
       env := #[
-        ("LEAN_PATH", some ((movedOutput / "cache" / "roots" / "0").toString)),
+        ("LEAN_PATH", some cacheLibDir.toString),
         ("LD_LIBRARY_PATH", some ((movedOutput / "cache" / "native" / "0").toString))
       ]
     }
-    assertIO (replay.exitCode == 0) "moved unit replay"
+    assertIO (replay.exitCode == 0) "moved unit direct-lean replay"
     assertIO ((← IO.FS.readFile sourcePath) == original) "source tree unchanged"
     assertIO (!(← (sourceRoot / ".lake").pathExists)) "source build cache unchanged"
   finally
@@ -614,6 +640,40 @@ private unsafe def testFailurePolicies : IO Unit := do
     removeDirIfExists failOut
     if ← recordsPath.pathExists then IO.FS.removeFile recordsPath
 
+/-- Failure policy for `materialize-units`. `Fixture.first`'s body is corrupted so its
+task cannot plan; `Fixture.second` is untouched. `fail` aborts; `skip`/`backoff` each
+omit `first`'s task (leaving NO orphan directory) while still emitting `second`, and
+name `first` in the units manifest. -/
+private unsafe def testUnitFailurePolicies : IO Unit := do
+  let pid ← IO.Process.getPID
+  let sourceRoot : System.FilePath := "TestProject"
+  let records ← LeanReassemble.readRecords (sourceRoot / "records.jsonl")
+  let corrupted := records.map fun r =>
+    if r.name == "Fixture.first" then { r with body := some "by\n  admit" } else r
+  let recordsPath : System.FilePath := s!"/tmp/lean-reassemble-unit-badrecords-{pid}.jsonl"
+  Corpus.Artifact.writeJsonl recordsPath corrupted
+  let skipOut : System.FilePath := s!"/tmp/lean-reassemble-unit-skip-{pid}"
+  let failOut : System.FilePath := s!"/tmp/lean-reassemble-unit-fail-{pid}"
+  removeDirIfExists skipOut
+  removeDirIfExists failOut
+  try
+    expectFailure "units on-failure fail aborts" do
+      LeanReassemble.materializeUnits { sourceRoot, records := recordsPath, output := failOut }
+    LeanReassemble.materializeUnits {
+      sourceRoot, records := recordsPath, output := skipOut, onFailure := .skip }
+    -- `first`'s task is omitted with no orphan directory left behind; `second` builds.
+    assertIO (!(← (skipOut / "units" / "0-Fixture.first").pathExists))
+      "skip leaves no orphan unit directory"
+    assertIO (← (skipOut / "units" / "1-Fixture.second" / "task.json").pathExists)
+      "skip still emits the good unit"
+    let manifest ← IO.FS.readFile (skipOut / "manifest.json")
+    assertIO (manifest.contains "\"Fixture.first\"" && manifest.contains "\"skipped\"")
+      "units skip manifest names the skipped theorem"
+  finally
+    removeDirIfExists skipOut
+    removeDirIfExists failOut
+    if ← recordsPath.pathExists then IO.FS.removeFile recordsPath
+
 unsafe def run : IO Unit := do
   let result ← fixtureResult
   let records ← LeanReassemble.readRecords "TestFixtures/records.jsonl"
@@ -651,6 +711,7 @@ unsafe def run : IO Unit := do
   assertIO (keptFile == original) "end-to-end keep output matches the source file"
   testMaterializers
   testFailurePolicies
+  testUnitFailurePolicies
   IO.println "reassemble tests passed"
 
 end ReassembleTests
