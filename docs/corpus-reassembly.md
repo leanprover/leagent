@@ -264,31 +264,45 @@ silently skip a theorem.
 
 ### Build Model
 
-For each source tree, first build the pristine pinned checkout with its pinned
-toolchain and Lake manifest. Capture the ordered import roots reported by:
+Each unit is a standalone **Lake project**, and all units share one immutable
+cache of prebuilt oleans. For each source tree, first build the pristine pinned
+checkout with its pinned toolchain and Lake manifest. Capture the ordered import
+roots reported by:
 
 ```bash
 lake env printenv LEAN_PATH
 ```
 
-Copy those roots into the artifact without flattening or changing their order.
-Include `.olean`, `.ilean`, and required shared libraries or setup data. The
-cache is built from pristine sources, not from sources containing `sorry`.
+Turn each root (outside the toolchain sysroot) into a stub Lake package under
+`cache/roots/<n>`: a `lakefile.lean` declaring a `lean_lib` with `roots := #[]`,
+plus that root's `.olean`/`.ilean` files placed in the package's build libdir
+(`.lake/build/lib/lean`). A `cache/siblings` package requires all of them, in the
+captured order. The `roots := #[]` lib compiles nothing of its own, so it only
+*exposes* its prebuilt oleans to a dependent's `LEAN_PATH` and can never be written
+to during a dependent's build — which is what lets every unit share the cache
+immutably. The cache is built from pristine sources, not from sources containing
+`sorry`.
 
-Each generated task contains a rewritten copy of its complete original source
-module. The task directory preserves the original relative path so `lean -R`
-assigns the same module name, which is required for private declarations:
+Each generated task is a Lake project whose only source is a rewritten copy of its
+complete original source module, at the original relative path (so Lake assigns the
+same module name, which is required for private declarations). Its `lakefile.lean`
+requires `cache/siblings`, so `lake build` reconstructs the pristine `LEAN_PATH`:
 
 ```text
 units/
   <task-id>/
-    src/<original/source/path>.lean
+    lakefile.lean                  # requires ../../cache/siblings
+    lean-toolchain
+    <original/source/path>.lean
     task.json
 cache/
-  <cache-id>/
-    roots/0/...
-    roots/1/...
-    environment.json
+  siblings/                        # stub package requiring every root, in order
+    lakefile.lean  lean-toolchain  lake-manifest.json
+  roots/
+    0/  { lakefile.lean, lean-toolchain, lake-manifest.json, .lake/build/lib/lean/... }
+    1/  ...
+  native/0/...                     # native libraries, for the direct-lean fallback
+  environment.json
 manifest.json
 ```
 
@@ -297,17 +311,21 @@ identifies one target theorem and its replacement span. Multiple theorem tasks
 from the same source module may use hard links, reflinks, or archive
 deduplication, but they are logically separate inputs.
 
-The direct check recorded in `task.json` is equivalent to:
+The primary check recorded in `task.json` is:
+
+```bash
+cd units/<task-id> && elan run <exact-toolchain> lake build
+```
+
+`task.json` also records `lean_path`/`ld_library_path` (artifact-relative) for an
+equivalent direct-`lean` fallback that does not go through Lake:
 
 ```bash
 LEAN_PATH=<ordered artifact roots> \
 LD_LIBRARY_PATH=<ordered native-library roots> \
 elan run <exact-toolchain> \
-lean -R units/<task-id>/src units/<task-id>/src/<original-path>
+lean -R units/<task-id> units/<task-id>/<original-path>
 ```
-
-This invokes Lean directly. Lake is only a materialization-time tool used to
-produce the cache.
 
 ### Cache Rules
 
@@ -319,25 +337,35 @@ The cache key includes:
 - selected Lake build target and relevant Lean options;
 - operating system and architecture when native artifacts are present.
 
-The cache keeps `LEAN_PATH` roots ordered. Roots must not be merged because two
-dependencies can expose the same module path and Lake's ordering determines
-which one wins.
+The cache keeps `LEAN_PATH` roots ordered, as one Lake package per root required in
+sequence. Roots must not be merged because two dependencies can expose the same
+module path and Lake's ordering determines which one wins; the per-root packages
+and their require order preserve that.
+
+Each package's Lake manifest is pre-warmed at materialization time (a `lake update`
+per package) so a unit's `lake build` neither warns about a missing dependency
+manifest nor lazily writes one into the shared cache. All generated lakefiles and
+manifests use relative paths, so the artifact is relocatable.
 
 The pristine cache may contain the original `.olean` for the task module. This
 is harmless because the input file does not import itself. Its transitive
-imports are necessarily acyclic.
+imports are necessarily acyclic, so a unit's own freshly built (holed) module —
+written to the unit's private `.lake` libdir, never the cache — is never loaded by
+anything else.
 
 ### Unit Verification
 
 The materializer must:
 
-- compile every baseline task with the direct command, outside any Lake
-  project directory;
-- allow only the expected `sorry` warnings;
+- build every baseline task with `lake build` from the unit directory;
+- allow only the expected `sorry` warnings, rejecting any other diagnostic;
 - verify the input's calculated module name equals the original `module`;
 - verify that no source path outside the task and no cache path outside the
   artifact is required;
-- record the Lean exit code and diagnostics summary in the manifest.
+- record the exit code and diagnostics summary in the task and manifest;
+- strip the unit's own `.lake` build directory and resolved `lake-manifest.json`
+  after a successful build, so the shipped unit is minimal and a consumer's first
+  `lake build` regenerates them.
 
 ## Mode 2: Restored Repositories
 

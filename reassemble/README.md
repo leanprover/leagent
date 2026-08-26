@@ -215,18 +215,25 @@ lake build
 
 ## Unit Artifacts
 
-`materialize-units` creates one standalone task per theorem record:
+`materialize-units` creates one standalone **Lake project** per theorem record,
+all sharing one immutable cache:
 
 ```text
 <artifact-dir>/
   manifest.json
-  cache/
-    environment.json
-    roots/<n>/...
-    native/<n>/...
+  cache/                                     # shared, immutable, required by every unit
+    environment.json                         # toolchain, git hash, ordered search paths
+    siblings/                                # a stub Lake package that requires every root
+      lakefile.lean  lean-toolchain  lake-manifest.json
+    roots/<n>/                               # one stub Lake package per LEAN_PATH root
+      lakefile.lean  lean-toolchain  lake-manifest.json
+      .lake/build/lib/lean/...               # that root's prebuilt oleans
+    native/<n>/...                           # native libraries (direct-lean fallback)
   units/
     <task-id>/
-      src/<original-relative-path>.lean
+      lakefile.lean                          # requires ../../cache/siblings
+      lean-toolchain
+      <original-relative-path>.lean          # the one holed module
       task.json
 ```
 
@@ -243,13 +250,33 @@ fresh file — see [`docs/corpus-reassembly.md`](../docs/corpus-reassembly.md).
 Under `--proofs keep` nothing is holed, so every task from a given module is the
 same (unmodified) file; keep mode is usually more useful with `materialize-repo`.
 
-The materializer builds a pristine copy of the source project first, copies the
-required `LEAN_PATH` and native library roots into `cache/`, and verifies each task
-with Lean directly.
+**The primary contract is `lake build`.** A unit is an ordinary Lake project: it
+resolves its imports from the shared cache through a single `require` of
+`cache/siblings`, which transitively requires every `cache/roots/<n>` package in
+the pristine `LEAN_PATH` order. To check or work on a task, just build it:
+
+```bash
+cd <artifact-dir>/units/<task-id>
+lake build          # compiles the holed module against the shared cache
+```
+
+Nothing else rebuilds, and a unit's build **cannot mutate the shared cache**: the
+root packages declare `roots := #[]`, so Lake schedules no work in them and only
+ever reads the prebuilt oleans placed there at materialization. Two units can build
+concurrently against the same cache. The whole artifact is relocatable — every path
+in the generated lakefiles and manifests is relative — so it can be moved or mounted
+as long as `units/` and `cache/` keep their relative positions.
+
+The materializer builds a pristine copy of the source project first, generates the
+cache packages (pre-warming their Lake manifests so unit builds are warning-free),
+copies each `LEAN_PATH` root's oleans into its stub package, then verifies each task
+by running `lake build` in it exactly as a consumer would. The unit's own
+`.lake/` build directory and resolved `lake-manifest.json` are stripped afterward so
+the shipped unit is minimal; a consumer's first `lake build` regenerates them.
 
 Each source file is elaborated once and reused across all of its targets, so the
-per-task cost is a byte-splice plus one Lean verification. Expect roughly a second
-per task: 104 theorems over 10 files took about two minutes.
+per-task cost is a byte-splice plus one `lake build`. Expect roughly a second per
+task: 104 theorems over 10 files took about two minutes.
 
 Example:
 
@@ -297,55 +324,58 @@ task you probably want. See
 
 ## Replaying A Unit
 
-`task.json` records the intended direct Lean command and cache metadata. A task
-can be run from any location as long as `LEAN_PATH` and `LD_LIBRARY_PATH` point
-at the artifact cache roots in order:
+The primary way to run a task is to build it as the Lake project it is:
 
 ```bash
 ARTIFACT=/tmp/project-units
 TASK="$(find "$ARTIFACT/units" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"
-SOURCE="$(find "$TASK/src" -type f -name '*.lean' | sort | head -n 1)"
 
-export LEAN_PATH="$(find "$ARTIFACT/cache/roots" -mindepth 1 -maxdepth 1 -type d | sort | paste -sd: -)"
-export LD_LIBRARY_PATH="$(find "$ARTIFACT/cache/native" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | paste -sd: -)"
-
-lean -R "$TASK/src" "$SOURCE"
+cd "$TASK" && lake build
 ```
 
-The `lean` on your `PATH` must be the toolchain the cache was built with, or the
-`.olean`s will be rejected with `incompatible header`. `task.json` records the
-exact pin, so the portable form is:
+`task.json` records the exact toolchain pin, so the portable form is:
 
 ```bash
 elan run "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["toolchain"])' "$TASK/task.json")" \
-  lean -R "$TASK/src" "$SOURCE"
+  lake build
 ```
+
+The unit's `lakefile.lean` requires `../../cache/siblings`, which transitively
+requires every `cache/roots/<n>` package in order — so Lake reconstructs the
+pristine `LEAN_PATH` itself. Every path is relative, so a unit builds wherever
+`units/` and `cache/` keep their relative positions.
+
+### Direct-`lean` fallback
+
+`task.json` also records `lean_path` and `ld_library_path` (relative to the
+artifact root) for consumers that would rather invoke `lean` directly, without
+Lake. Point `LEAN_PATH`/`LD_LIBRARY_PATH` at those cache roots, in order, and use
+the unit directory as the `-R` root:
+
+```bash
+SOURCE="$(python3 -c 'import json;print(json.load(open("'"$TASK"'/task.json"))["source"])')"
+
+export LEAN_PATH="$(python3 -c 'import json;print(":".join(json.load(open("'"$ARTIFACT"'/cache/environment.json"))["lean_path"]))')"
+export LD_LIBRARY_PATH="$(python3 -c 'import json;print(":".join(json.load(open("'"$ARTIFACT"'/cache/environment.json"))["ld_library_path"]))')"
+
+# LEAN_PATH/LD_LIBRARY_PATH entries are artifact-relative; resolve against $ARTIFACT.
+( cd "$ARTIFACT" && lean -R "$TASK" "$ARTIFACT/$SOURCE" )
+```
+
+The `lean` you use must be the toolchain the cache was built with, or the
+`.olean`s are rejected with `incompatible header`.
 
 For a dataset consumer, the durable contract is:
 
 - read `cache/environment.json` for the toolchain, Lean git hash, ordered
   `lean_path`, and ordered `ld_library_path`;
-- resolve those paths relative to the artifact root, or replace them with paths
-  to an equivalent external cache;
-- run `lean -R <task>/src <task>/src/<source>` with those environment variables.
-
-If the dataset stores cache separately from tasks, keep the same root order.
-For example, with a shared cache mounted at `/datasets/proofbench/cache`:
-
-```bash
-ARTIFACT=/datasets/lean-corpus/project-units
-CACHE=/datasets/lean-corpus/cache
-TASK="$(find "$ARTIFACT/units" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"
-SOURCE="$(find "$TASK/src" -type f -name '*.lean' | sort | head -n 1)"
-
-export LEAN_PATH="$CACHE/roots/0:$CACHE/roots/1"
-export LD_LIBRARY_PATH="$CACHE/native/0"
-
-lean -R "$TASK/src" "$SOURCE"
-```
+- either `lake build` the unit (which uses the in-tree cache via `require`), or
+  resolve those paths relative to the artifact root — or to an equivalent external
+  cache — and run `lean -R <task> <task>/<source>` with those variables.
 
 Do not merge cache roots. Lake order is significant; two dependencies may expose
-the same module path.
+the same module path — which is exactly why the cache keeps one package per root
+and requires them in order.
 
 ## Notes
 
@@ -353,7 +383,10 @@ the same module path.
   document with the Lean worker before writing output.
 - `materialize-repo` is the whole-project correctness oracle because it rebuilds
   the rewritten Lake project.
-- `materialize-units` is for training/evaluation datasets where each theorem is
-  consumed independently but imports are resolved from the copied pristine cache.
+- `materialize-units` produces one standalone Lake project per theorem for
+  training/evaluation datasets. Each is verified with `lake build` against a
+  shared, immutable cache of prebuilt oleans, so the per-task cost stays a
+  byte-splice plus one build.
 - For projects with external dependencies, network access may be needed the
-  first time Lake recreates `.lake/packages` in the materialized copy.
+  first time Lake recreates `.lake/packages` in the materialized pristine copy;
+  the shared cache is then built from that copy and needs no further network.
