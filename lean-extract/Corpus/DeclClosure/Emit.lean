@@ -199,11 +199,30 @@ def projectClosure (closure : Closure) (pool : Array ConstRecord)
   -- Annotate what resolved; collect what did not.
   let mut selected : Array ConstRecord := #[]
   let mut unresolved : Array String := #[]
+  -- Drop reasons decided HERE, at projection time, rather than in the import-only
+  -- `computeClosure`: a compiler-synthesized declaration with a stored range
+  -- (`brecOn.go`, a `deriving` instance) is indistinguishable from a user one in an
+  -- environment loaded from oleans, so it can only be caught once its record — and
+  -- thus its `decl_source` — exists. Merged into the closure's reasons before grouping.
+  let mut extraReasons : Std.HashMap String DropReason := {}
   for (name, role) in closure.roles.toList do
     match byName[name]? with
-    | some r => selected := selected.push { r with closureRole := some role.toString }
+    | some r =>
+      -- A closure member with no extracted `decl_source` is a Lean-synthesized
+      -- declaration (recursion helper, derived-instance shard) with no source command
+      -- to inline. It is regenerated from its owner's source — the `inductive`/
+      -- `deriving` declaration, which IS emitted — so exclude it like a recursor
+      -- rather than emit a record a consumer cannot wrap. The target is never dropped
+      -- (it is the hole, not an inlined premise) even if it somehow has no source.
+      if name != targetName && r.declSource.isNone then
+        unresolved := unresolved.push name
+        extraReasons := extraReasons.insert name compilerGeneratedDrop
+      else
+        selected := selected.push { r with closureRole := some role.toString }
     | none   => unresolved := unresolved.push name
   unresolved := unresolved.qsort (· < ·)
+  let closure := { closure with
+    dropReasons := extraReasons.fold (fun m k v => m.insert k v) closure.dropReasons }
   let dropped := groupDropped closure unresolved
   unless unresolved.isEmpty do
     -- `unexplained` first: everything else is machinery the corpus excludes on
@@ -303,7 +322,9 @@ def renderDropped (p : Projection) : Json :=
     ("note",     Json.str "Closure members with no emitted record. All categories \
 except `unexplained` are machinery the corpus excludes by design (constructors, \
 recursors, projections, generated companions, equation-compiler helpers, synthetic \
-theorems). `unexplained` means a member looked eligible but produced no record."),
+theorems, and `compiler_generated` declarations — recursion helpers and \
+derived-instance shards that have no source command and are regenerated from their \
+owner). `unexplained` means a member looked eligible but produced no record."),
     ("categories", Json.arr (p.dropped.map fun (reason, n, names) =>
         Json.mkObj [
           ("reason", Json.str reason),
