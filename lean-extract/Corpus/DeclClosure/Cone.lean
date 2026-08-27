@@ -90,6 +90,17 @@ abbrev DropReason := String
 /-- The category that signals a real gap rather than a deliberate exclusion. -/
 def unexplainedDrop : DropReason := "unexplained"
 
+/-- A closure member that resolved to a record but whose record has NO extracted
+`decl_source`: a Lean compiler-synthesized declaration (`<T>.brecOn.go` recursion
+helper, a `deriving`-generated instance and its `.decEq`/`noConfusionType` shards)
+that has no source command to inline. It is regenerated from its OWNER's source —
+the `inductive`/`structure`/`deriving` declaration, which IS emitted — so it is
+excluded from the closure like a recursor, not emitted as an unusable null-source
+record. Unlike the reasons in `dropReasonFor`, this one can only be decided AFTER
+elaboration (the import-only environment cannot tell a synthesized `def` with a
+stored range from a user one), so `Emit.projectClosure` assigns it. -/
+def compilerGeneratedDrop : DropReason := "compiler_generated"
+
 def dropIsUnexplained (r : DropReason) : Bool := r == unexplainedDrop
 
 /-- One target's computed closure: the role of every member, keyed by DISPLAY name

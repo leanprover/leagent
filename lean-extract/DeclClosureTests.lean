@@ -23,13 +23,17 @@ open Corpus Corpus.DeclClosure
 open Corpus.Artifact (safeName)
 open Corpus.TestAssert (assert)
 
-/-- A minimal record; tests override only the fields they exercise. -/
+/-- A minimal record; tests override only the fields they exercise. `declSource`
+defaults to a placeholder because a user-written declaration always has one — a
+`none` marks a compiler-synthesized member, which `projectClosure` now drops, so
+tests that want that behavior pass `declSource := none` explicitly. -/
 private def rec (name : String) (kind : String := "theorem")
     (deps : List String := []) (imports : List String := [])
+    (declSource : Option String := some "src")
     : ConstRecord :=
   { name, kind, module := "Fix.Base", file := some "Fix/Base.lean"
     startLine := none, startCol := none, endLine := none, endCol := none
-    signature := none, body := none, declSource := none, declNamespace := ""
+    signature := none, body := none, declSource, declNamespace := ""
     scopePrelude := [], fileImports := imports
     type := "True", value := none, proofScript := none, proofMethod := none
     doc := none, deps, premises := [], axioms := []
@@ -258,6 +262,48 @@ private def testDropClassification : IO Unit := do
   let firstReason ← IO.ofExcept ((cats[0]!).getObjVal? "reason" >>= Json.getStr?)
   assert (firstReason == "unexplained") "dropped.json should list unexplained first"
 
+/-- A closure member that resolved to a record but has no `decl_source` is a
+compiler-synthesized declaration (a `brecOn.go` recursion helper, a `deriving`
+instance): it must be DROPPED as `compiler_generated`, not emitted as an unusable
+null-source record. The target itself is exempt — it is the hole, never inlined. -/
+private def testCompilerGeneratedDrop : IO Unit := do
+  let closure := closureOf "Fix.thm"
+    [("Fix.AExp.brecOn.go", .proof), ("Fix.instLTFoo", .statement),
+     ("Fix.helper", .proof)]
+  let pool := #[
+    rec "Fix.thm",
+    rec "Fix.helper" (kind := "def"),
+    -- The two synthesized members resolve to records, but with no source.
+    rec "Fix.AExp.brecOn.go" (kind := "def") (declSource := none),
+    rec "Fix.instLTFoo" (kind := "def") (declSource := none)
+  ]
+  let p ← projectClosure closure pool writeOpts
+  -- The real def and the target are kept; both synthesized members are excluded.
+  assert ((p.ordered.map (·.name)).qsort (· < ·) == #["Fix.helper", "Fix.thm"])
+    s!"null-source members leaked into the selection: {p.ordered.map (·.name)}"
+  assert (p.unresolved == #["Fix.AExp.brecOn.go", "Fix.instLTFoo"])
+    s!"synthesized members not dropped: {p.unresolved}"
+  -- They are categorized, not left `unexplained` (which would warn / fail strict).
+  assert (p.dropped.size == 1 && p.dropped[0]!.1 == "compiler_generated")
+    s!"expected one compiler_generated category, got {p.dropped.map (·.1)}"
+  assert (p.dropped[0]!.2.1 == 2) "compiler_generated count wrong"
+  -- They are a genuine drop, so --strict-closure escalates exactly as it does for a
+  -- dropped constructor: zero unresolved members are tolerated in strict mode. The
+  -- point of classifying them is that in the DEFAULT lenient mode they are a benign,
+  -- categorized drop rather than an `unexplained` warning.
+  let failedStrict ← try
+    let _ ← projectClosure closure pool { writeOpts with strictClosure := true }
+    pure false
+  catch _ => pure true
+  assert failedStrict "--strict-closure accepted a compiler_generated drop"
+  assert (!p.dropped.any (fun (r, _, _) => dropIsUnexplained r))
+    "a compiler_generated member was misfiled as unexplained"
+  -- A target that itself has no source is NOT dropped: it is the hole.
+  let tc := closureOf "Fix.gen" []
+  let p2 ← projectClosure tc #[rec "Fix.gen" (kind := "def") (declSource := none)] writeOpts
+  assert (p2.ordered.size == 1 && p2.target.size == 1)
+    "a null-source target was wrongly dropped"
+
 /-- Two modules emitting the same record name make selection ambiguous. -/
 private def testAmbiguousPool : IO Unit := do
   let closure := closureOf "Fix.thm" [("Fix.dup", .proof)]
@@ -293,6 +339,7 @@ def run : IO UInt32 := do
   testRenderMetadata
   testUnresolved
   testDropClassification
+  testCompilerGeneratedDrop
   testAmbiguousPool
   IO.FS.withTempDir fun root => do
     testWriteTarget root
