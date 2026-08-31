@@ -48,7 +48,7 @@ of [step 3](#3-slice-one-theorems-dependency-closure).
 
 ## Setup
 
-Build the tools and the example project once. Everything pins Lean **4.31.0**.
+Build the tools and the example project once. Everything pins Lean **4.33.0**.
 
 ```bash
 cd leagent
@@ -501,7 +501,7 @@ SOURCE="$TASK/src/Trees/Mirror.lean"
 export LEAN_PATH="$(find "$ARTIFACT/cache/roots" -mindepth 1 -maxdepth 1 -type d | sort | paste -sd: -)"
 export LD_LIBRARY_PATH="$(find "$ARTIFACT/cache/native" -mindepth 1 -maxdepth 1 -type d | sort | paste -sd: -)"
 
-elan run leanprover/lean4:v4.31.0 lean -R "$TASK/src" "$SOURCE"
+elan run leanprover/lean4:v4.33.0 lean -R "$TASK/src" "$SOURCE"
 ```
 
 ```text

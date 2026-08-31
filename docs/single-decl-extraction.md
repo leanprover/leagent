@@ -475,7 +475,7 @@ Confirmed on that corpus:
   corpus excludes by design;
 - materializing `data/target.jsonl` for `church_rosser` and for `subst_subst`
   yields units whose only hole is the target, each verifying against the pristine
-  cache under the pinned toolchain (`elan run leanprover/lean4:v4.31.0 lean -R …`)
+  cache under the pinned toolchain (`elan run leanprover/lean4:v4.33.0 lean -R …`)
   with exit 0 and a single `declaration uses 'sorry'` warning. Neighbouring
   theorems in the same file keep their real proofs.
 

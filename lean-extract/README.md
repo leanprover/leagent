@@ -49,7 +49,7 @@ lake build
 The binary lands at `.lake/build/bin/lean_extract`. No plugin `.so`s or sibling
 package build are needed.
 
-Toolchain: the package pins Lean **4.31.0** via `lean-toolchain`.
+Toolchain: the package pins Lean **4.33.0** via `lean-toolchain`.
 
 ## Run
 
