@@ -35,7 +35,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 jobs:
-  # Resolve what we are publishing before spending four build jobs on it.
+  # Resolve what we are publishing before spending five build jobs on it.
   #
   #   kind=rolling   -> tag `latest`, prerelease, assets replaced
   #   kind=versioned -> tag vX.Y.Z, real release, refuse to overwrite
@@ -68,7 +68,7 @@ jobs:
           fi
 
           if [ "$kind" = versioned ]; then
-            # Semver-ish shape check. Cheap, and it catches a typo before four
+            # Semver-ish shape check. Cheap, and it catches a typo before five
             # build jobs and a public release.
             case "$tag" in
               v[0-9]*.[0-9]*.[0-9]*) ;;
@@ -102,6 +102,8 @@ jobs:
             slug: v4.31.0
           - toolchain: leanprover/lean4:v4.32.2
             slug: v4.32.2
+          - toolchain: leanprover/lean4:v4.33.0
+            slug: v4.33.0
 
     name: build (${{ matrix.slug }})
     runs-on: ubuntu-latest
@@ -175,13 +177,13 @@ jobs:
           merge-multiple: true
 
       # A release with a missing asset is worse than a failed workflow: consumers
-      # pin URLs against it. Four toolchains x two binaries.
+      # pin URLs against it. Five toolchains x two binaries.
       - name: Verify asset set
         run: |
           set -euo pipefail
           ls -lh dist/
           missing=0
-          for slug in v4.28.0 v4.29.1 v4.31.0 v4.32.2; do
+          for slug in v4.28.0 v4.29.1 v4.31.0 v4.32.2 v4.33.0; do
             for tool in lean_extract lean_reassemble; do
               if [ ! -s "dist/$tool-$slug" ]; then
                 echo "::error::missing or empty asset: $tool-$slug" >&2
@@ -191,7 +193,7 @@ jobs:
           done
           [ "$missing" = 0 ] || exit 1
           count=$(find dist -type f | wc -l)
-          [ "$count" = 8 ] || { echo "::error::expected 8 assets, found $count" >&2; exit 1; }
+          [ "$count" = 10 ] || { echo "::error::expected 10 assets, found $count" >&2; exit 1; }
 
       # Checksums let a consumer verify a download, and give the release notes a
       # stable record of exactly which bytes shipped under this tag.
@@ -224,7 +226,7 @@ jobs:
             echo
             echo "| Lean toolchain | Extractor | Reassembler |"
             echo "|---|---|---|"
-            for slug in v4.28.0 v4.29.1 v4.31.0 v4.32.2; do
+            for slug in v4.28.0 v4.29.1 v4.31.0 v4.32.2 v4.33.0; do
               echo "| $slug | \`lean_extract-$slug\` | \`lean_reassemble-$slug\` |"
             done
             echo

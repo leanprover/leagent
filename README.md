@@ -19,7 +19,7 @@ Output goes to `/tmp/leagent-artifacts` (override with `ARTIFACTS_DIR=`), never
 into the working tree. Because both `materialize-*` commands verify their own
 output, a clean exit means the generated Lean actually compiled.
 
-Everything pins Lean 4.31.0 (`make toolchain` installs it via elan). Each package
+Everything pins Lean 4.33.0 (`make toolchain` installs it via elan). Each package
 also builds on its own with `lake build`; the Makefile only names the targets and
 gives the binaries a stable path.
 
@@ -43,7 +43,7 @@ depend on a known build:
 curl -sSfLO https://github.com/leanprover/leagent/releases/download/v0.1.0/lean_extract-v4.31.0
 
 # whatever is on main right now
-curl -sSfLO https://github.com/leanprover/leagent/releases/download/latest/lean_extract-v4.31.0
+curl -sSfLO https://github.com/leanprover/leagent/releases/download/latest/lean_extract-v4.33.0
 ```
 
 Every release records the commit it was built from and a `SHA256SUMS` asset, so a
@@ -65,7 +65,7 @@ toolchain's library directory into the binary's `RUNPATH`, so it just runs. A
   installed, since the tools drive its Lean):
 
   ```bash
-  LD_LIBRARY_PATH=$(lean --print-libdir) ./lean_extract-v4.31.0 --help
+  LD_LIBRARY_PATH=$(lean --print-libdir) ./lean_extract-v4.33.0 --help
   ```
 
 The `RUNPATH` uses new dtags, so `LD_LIBRARY_PATH` always takes precedence over
@@ -87,10 +87,11 @@ version can never change underneath a consumer.
 |---|---|---|
 | v4.28.0 | yes | no — refused at startup |
 | v4.29.1 | yes | no — refused at startup |
-| v4.31.0 (pinned) | yes | yes |
+| v4.31.0 | yes | yes |
 | v4.32.2 | yes | yes |
+| v4.33.0 (pinned) | yes | yes |
 
-CI covers all four. The grind modes collect which lemmas a successful `grind` run
+CI covers all five. The grind modes collect which lemmas a successful `grind` run
 actually used, and that data (`Grind.State.instanceMap`, `Config.markInstances`)
 was only exposed in v4.31.0 — before that it lives in search-local state that is
 discarded before the collector can read it. On older toolchains those two modes

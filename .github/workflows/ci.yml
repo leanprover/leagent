@@ -53,6 +53,9 @@ jobs:
           - toolchain: leanprover/lean4:v4.32.2
             slug: v4.32.2
             grind: supported
+          - toolchain: leanprover/lean4:v4.33.0
+            slug: v4.33.0
+            grind: supported
 
     name: build (${{ matrix.toolchain }})
     runs-on: ubuntu-latest

@@ -232,7 +232,7 @@ SOURCE="$TASK/src/Trees/Mirror.lean"
 export LEAN_PATH="$(find "$ARTIFACT/cache/roots" -mindepth 1 -maxdepth 1 -type d | sort | paste -sd: -)"
 export LD_LIBRARY_PATH="$(find "$ARTIFACT/cache/native" -mindepth 1 -maxdepth 1 -type d | sort | paste -sd: -)"
 
-elan run leanprover/lean4:v4.31.0 lean -R "$TASK/src" "$SOURCE"
+elan run leanprover/lean4:v4.33.0 lean -R "$TASK/src" "$SOURCE"
 ```
 
 ```text
@@ -267,7 +267,7 @@ TASK="$ARTIFACT/units/0-Trees.Tree.total_mirror"
 export LEAN_PATH="$ARTIFACT/cache/roots/0"
 export LD_LIBRARY_PATH="$ARTIFACT/cache/native/0"
 
-elan run leanprover/lean4:v4.31.0 lean -R "$TASK/src" "$TASK/src/Trees/Mirror.lean"
+elan run leanprover/lean4:v4.33.0 lean -R "$TASK/src" "$TASK/src/Trees/Mirror.lean"
 ```
 
 ```text
@@ -280,7 +280,7 @@ Now close the loop — fill the hole with the real proof and the warning goes aw
 sed -i 's|^  sorry$|  rw [← sum_flatten, ← sum_flatten, flatten_mirror, sumList_reverse]|' \
     "$TASK/src/Trees/Mirror.lean"
 
-elan run leanprover/lean4:v4.31.0 lean -R "$TASK/src" "$TASK/src/Trees/Mirror.lean"
+elan run leanprover/lean4:v4.33.0 lean -R "$TASK/src" "$TASK/src/Trees/Mirror.lean"
 ```
 
 Silent, exit 0. That round trip — extract a theorem, hole it, fill it, check it —
