@@ -372,6 +372,57 @@ def planEdits (frontendResult : Corpus.Frontend.ElabResult)
     fail reason
   return outcome.edits
 
+/-- Full names the run resolves to `.delete`. Only theorem records are deletable —
+a `def`/`inductive`/`structure` is never holed or removed — so `modeFor` (which
+returns the default action for any name it does not override) is only consulted for
+theorem names here. `moduleFilter`, when set, restricts the set to one module:
+`materialize-units` removes only a target's SAME-module neighbours. -/
+def deletedNames (records : Array Corpus.ConstRecord)
+    (modeFor : String → ProofMode) (moduleFilter : Option String := none)
+    : Std.HashSet String := Id.run do
+  let mut result : Std.HashSet String := {}
+  for record in records do
+    if Corpus.Artifact.isTheoremRecord record && moduleFilter.all (· == record.module) then
+      if modeFor record.name == .delete then
+        result := result.insert record.name
+  return result
+
+/-- `(dependent, deleted)` pairs where a SURVIVING declaration's `deps` names a
+theorem the run deletes — the deletions that would break the build.
+
+A survivor is any non-theorem record (defs/inductives/structures are never removed)
+or a theorem resolved to `.keep`. A `.replace` (holed) theorem is deliberately NOT
+a survivor: its proof becomes `by sorry`, which drops the references it carried, so
+a holed dependent cannot dangle. Deleted names are always theorems, and theorems
+are referenced from proofs, so this direct-`deps` check is complete over transitive
+chains: every hop is itself a record we evaluate (S→M→D is caught as M→D if M
+survives, or as S→M if M is itself deleted).
+
+`moduleFilter` restricts BOTH the delete-set and the dependents to one module —
+units prunes same-module neighbours only, and cross-module references resolve from
+the prebuilt shared cache rather than the unit's file. -/
+def danglingReferences (records : Array Corpus.ConstRecord)
+    (modeFor : String → ProofMode) (moduleFilter : Option String := none)
+    : Array (String × String) := Id.run do
+  let deleted := deletedNames records modeFor moduleFilter
+  if deleted.isEmpty then return #[]
+  let mut pairs := #[]
+  for record in records do
+    unless moduleFilter.all (· == record.module) do continue
+    let survives :=
+      if Corpus.Artifact.isTheoremRecord record then modeFor record.name == .keep else true
+    if survives then
+      for dep in record.deps do
+        if deleted.contains dep then
+          pairs := pairs.push (record.name, dep)
+  return pairs
+
+/-- One fail-fast message naming every `dependent -> deleted` pair. -/
+def dependencyConflictMessage (pairs : Array (String × String)) : String :=
+  let lines := pairs.toList.map fun (dependent, deleted) => s!"  {dependent} -> {deleted}"
+  s!"dependency conflict: {pairs.size} surviving declaration(s) reference deleted \
+    theorem(s); deleting would break the build:\n{String.intercalate "\n" lines}"
+
 /-- Delete-edits that erase every evaluation command (`#eval`, `#eval!`, `#reduce`,
 `#guard`, `#guard_msgs`) in an elaborated file.
 

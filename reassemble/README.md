@@ -123,6 +123,15 @@ Keys are full theorem names (the same names the records carry); values are
 `keep | sorry | delete`. A key that matches no theorem in the records is a hard
 error, to catch typos.
 
+Deleting a theorem that a surviving declaration still references would break the
+build. `materialize-repo` and `materialize-units` detect this from the records'
+`deps` **before** building and fail with the offending `dependent -> deleted`
+pairs named, rather than deferring to an opaque `lake build` error (a
+`--proofs sorry` dependent is safe — its proof, and the references in it, are
+holed out). For the full account of which parameter combinations are supported,
+degenerate, or rejected — including the manifest's neighbour-pruning role in
+units mode — see [`docs/parameter-matrix.md`](../docs/parameter-matrix.md).
+
 ## Failure Policy
 
 `--on-failure` controls what happens when a theorem cannot be reassembled — it does

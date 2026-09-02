@@ -350,6 +350,14 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
   let theorems ← eligibleTheorems records
   let manifest ← loadManifest config.manifestPath theorems
   let modeFor := fun name => manifest.actionFor name config.proofMode
+  -- Fail fast on declared deletes that would strand a surviving reference, naming the
+  -- offending pairs — rather than letting the whole-tree `lake build` below report an
+  -- opaque break at a dependent with no attribution. Pure over the records, so it runs
+  -- before the expensive copy and leaves no half-written artifact behind. (`backoff`
+  -- deletes discovered during planning are not visible here; those still fall through
+  -- to the build, per the failure-policy contract.)
+  let conflicts := danglingReferences records modeFor
+  unless conflicts.isEmpty do fail (dependencyConflictMessage conflicts)
   let name ← projectName sourceRoot
   let repoRel : System.FilePath := ("repos" : System.FilePath) / name
   let repoRoot := artifact / repoRel
@@ -465,7 +473,11 @@ unsafe def materializeRepo (config : MaterializeConfig) : IO Unit := do
     ("repository", artifactPath repoRel),
     ("build_target", toJson config.buildTarget),
     ("rewrite_summary", rewriteSummary config.proofMode theorems.size counts failures),
-    ("verification", Json.mkObj [("status", "passed")])
+    -- Record the exact build command so a scoped `--build-target` verification is
+    -- never mistaken for a whole-project one: a break in a module outside the target
+    -- is not compiled, so "passed" means "passed for this command", not "for the tree".
+    ("verification", Json.mkObj [("status", "passed"), ("command",
+      String.intercalate " " (["lake", "build"] ++ config.buildTarget.toList))])
   ]
 
 private def splitSearchPath (value : String) : Array System.FilePath :=
@@ -702,10 +714,18 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
     let targetMode := manifest.actionFor record.name config.proofMode
     -- A unit is the problem "reconstruct THIS theorem", so a `delete` target has no
     -- task to emit: deleting the very theorem a unit would ask a solver to prove is
-    -- meaningless. Record it in the summary and move on. (`keep`/`sorry` neighbours
-    -- are irrelevant here — a unit only ever touches its own target.)
+    -- meaningless. Record it in the summary and move on.
     if targetMode == .delete then
       counts := counts.bump .delete
+      continue
+    -- A `keep` target holes nothing, so its "task" would be the unmodified module — a
+    -- prove-nothing unit. Exclude it (counted as preserved) with a warning rather than
+    -- ship a degenerate task; an all-keep run then trips the empty-artifact guard below
+    -- and fails honestly instead of reporting success over no tasks.
+    if targetMode == .keep then
+      counts := counts.bump .keep
+      IO.eprintln s!"lean-reassemble: skipping keep target {record.name} \
+        (a keep unit holes nothing — there is nothing to reconstruct)"
       continue
     -- A `where`/`let rec` helper or `mutual` member has no standalone declaration to
     -- reconstruct, so it is not a valid unit target ("prove this helper in isolation"
@@ -722,12 +742,30 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
       let file := normalizeRelativePath record.file.get!
       let some prepared := preparedByFile[file]?
         | fail s!"prepared source missing for {record.name}"
-      -- A unit is a task for ONE theorem: hole out only this record's proof and
-      -- leave every other declaration in the module intact. Rewriting the whole
-      -- file's records here would sorry the target's neighbours too — including
-      -- lemmas its own proof depends on — and would make every task from a given
-      -- file byte-identical.
-      let rewritten ← rewritePreparedFile prepared #[record] targetMode
+      -- A unit holes its own target and, when the manifest marks same-module
+      -- neighbours `delete`, removes those neighbour declarations too. Kept/unlisted
+      -- neighbours (default `keep`) stay proven and need no edit; a neighbour `sorry`
+      -- is treated as keep — a unit only ever holes its own target. Only SAME-module
+      -- neighbours are prunable: cross-module references resolve from the shared cache,
+      -- not this file. Holing the target's own proof (rather than the whole file) is
+      -- what keeps each task distinct and its depended-on lemmas intact.
+      let deleteNeighbour := fun (t : Corpus.ConstRecord) =>
+        t.name != record.name && t.module == record.module &&
+          manifest.actions.getD t.name .keep == .delete
+      let neighbours := theorems.filter deleteNeighbour
+      -- Before editing, reject a prune that would strand a surviving neighbour (or a
+      -- def) on a removed one, naming the pairs — the per-unit analogue of the repo
+      -- check, scoped to this module. The target is `.replace` here, so it is never a
+      -- flagged dependent. Inside the `try`, so `--on-failure` governs it: `fail`
+      -- aborts, `skip`/`backoff` omit this unit and record the reason.
+      let unitResolve := fun name =>
+        if name == record.name then targetMode
+        else if manifest.actions.getD name .keep == .delete then .delete else .keep
+      let conflicts := danglingReferences records unitResolve (moduleFilter := some record.module)
+      unless conflicts.isEmpty do fail (dependencyConflictMessage conflicts)
+      let selected := #[record] ++ neighbours
+      let unitModeFor := fun name => if name == record.name then targetMode else .delete
+      let rewritten ← rewritePreparedFile prepared selected targetMode (modeFor := unitModeFor)
       if rewritten.moduleName.toString != record.module then
         fail s!"module mismatch for {record.name}"
       let some span := replacementSpan? rewritten.edits record.name
@@ -767,14 +805,18 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
       let sorryWarnings := (diagnostics.splitOn "\n").filter
         (fun line => line.contains "warning:" && line.contains "declaration uses `sorry`")
       let sourceSorryCount := sourceSorryCountFor records file
+      -- Deleted neighbours that were ALREADY incomplete in the source no longer emit
+      -- their own `sorry` warning (we removed the whole declaration), so drop them from
+      -- the baseline the count is measured against.
+      let removedIncomplete := (neighbours.filter (·.axioms.contains "sorryAx")).size
+      let baseline := sourceSorryCount - removedIncomplete
       let expectedSorries :=
-        -- `.keep` adds nothing (delete emits no task, so it never reaches here). Only
-        -- `.replace` introduces a fresh sorry.
-        if targetMode == .keep then sourceSorryCount
+        -- Only `.replace` introduces a fresh sorry (the target is always `.replace`
+        -- here; `keep`/`delete` targets were excluded above).
         -- The target itself is holed out; if it was already incomplete it is counted
         -- in the baseline, so it must not be counted twice.
-        else if record.axioms.contains "sorryAx" then sourceSorryCount
-        else sourceSorryCount + 1
+        if record.axioms.contains "sorryAx" then baseline
+        else baseline + 1
       if sorryWarnings.length > expectedSorries then
         fail s!"{record.name}: {sorryWarnings.length} `sorry` warning(s) but at most \
           {expectedSorries} expected for proof mode {targetMode} \
@@ -822,6 +864,14 @@ unsafe def materializeUnits (config : MaterializeConfig) : IO Unit := do
       IO.eprintln s!"lean-reassemble: {action} {record.name}: {reason}"
       failures := failures.push { name := record.name, action, reason }
   removeIfExists (artifact / ".work")
+  -- An artifact with no tasks is not a success: every eligible theorem resolved to
+  -- delete/keep/auxiliary (e.g. a whole-run `--proofs delete`/`keep`), so there is
+  -- nothing to reconstruct. Fail rather than write a `manifest.json` reporting
+  -- `verification: passed` over zero tasks. (`skip`/`backoff` runs that legitimately
+  -- omit some units still succeed as long as at least one task remains.)
+  if tasks.isEmpty then
+    fail s!"materialize-units produced no tasks: all {theorems.size} eligible \
+      theorem(s) resolved to delete/keep/auxiliary — nothing to reconstruct"
   let name ← projectName sourceRoot
   writeJson (artifact / "manifest.json") <| Json.mkObj [
     ("format", "lean-corpus-reassembly.v1"),
