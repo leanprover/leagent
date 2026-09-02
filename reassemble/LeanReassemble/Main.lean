@@ -18,6 +18,7 @@ Usage:
   lean_reassemble materialize-units --source-root <lake-project>
     --records <declarations.jsonl> --output <artifact-dir>
     [--build-target <target>] [--proofs sorry|keep|delete]
+    [--manifest <manifest.json>] [--on-failure fail|skip|backoff]
 
 --proofs sorry (default) replaces each selected theorem's proof with `by sorry`.
 --proofs keep preserves the proofs verbatim, producing the compilable REFERENCE
@@ -25,11 +26,24 @@ state of the same records: every record is still matched to its declaration and
 its proof range validated, so the artifact is evidence that the extraction agrees
 with the source. Use it to get an intermediate, fully-compiling checkout from an
 extractor run, or as the oracle to diff a sorried artifact against.
---proofs delete erases each selected declaration outright. It does no dependency
-analysis: deleting a theorem others reference will break the build.
+--proofs delete erases each selected declaration outright. materialize-repo and
+materialize-units check the records' `deps` BEFORE building and fail — naming each
+`dependent -> deleted` pair — when a surviving declaration would be left referencing
+a deleted theorem, rather than deferring to an opaque build break. (A --proofs sorry
+dependent is safe: its proof, and the references in it, are holed out. Deletes
+introduced by --on-failure backoff are not covered by this pre-flight and still
+surface at the final build.)
 
 --manifest <path> is a sparse per-theorem override: a JSON object mapping theorem
 names to keep|sorry|delete. Theorems it does not name follow --proofs.
+
+In materialize-units the manifest does double duty: the action on a UNIT'S TARGET
+theorem selects whether that unit is emitted (sorry -> hole and emit; keep/delete ->
+excluded), while a `delete` on a SAME-MODULE neighbour removes that neighbour from
+the emitted unit's file. A run that emits no task at all (e.g. a whole-run
+--proofs delete or keep) is an error, not an empty success. --build-target in
+materialize-units scopes only the pristine warm-up build that fills the shared
+cache, not the per-unit builds.
 
 --on-failure fail (default) aborts on the first theorem that fails to reassemble.
 skip omits it (recorded as skipped); backoff deletes it (recorded as failed) and
@@ -104,7 +118,13 @@ private def parseRewriteArgs (args : List String) : Except String RewriteConfig 
     | flag :: _ => throw s!"unknown or incomplete argument: {flag}"
   go args none none none none none .replace .fail
 
-private def parseMaterializeArgs (args : List String) : Except String MaterializeConfig := do
+/-- Parse the shared `materialize-{repo,units}` arguments. `allowRepoFlags` gates the
+two flags that only `materialize-repo` honors: `--keep-eval` (eval-strip opt-out) and
+`--in-process` (isolation off). Both are inert in units mode — a unit is a single
+standalone module with its own build model — so they are rejected there as unknown
+arguments rather than silently accepted. -/
+private def parseMaterializeArgs (allowRepoFlags : Bool) (args : List String)
+    : Except String MaterializeConfig := do
   let rec go (remaining : List String) (sourceRoot records output buildTarget : Option String)
       (manifest : Option String) (mode : ProofMode) (onFailure : FailurePolicy)
       (keepEval : Bool) (isolated : Bool)
@@ -136,16 +156,22 @@ private def parseMaterializeArgs (args : List String) : Except String Materializ
     | "--on-failure" :: value :: tail => do
         go tail sourceRoot records output buildTarget manifest mode (← parseFailurePolicy value) keepEval isolated
     | "--keep-eval" :: tail =>
-        go tail sourceRoot records output buildTarget manifest mode onFailure true isolated
+        if allowRepoFlags then
+          go tail sourceRoot records output buildTarget manifest mode onFailure true isolated
+        else throw "--keep-eval is not valid for materialize-units (nothing to strip: a \
+          unit is a single standalone module); it applies to materialize-repo"
     | "--in-process" :: tail =>
-        go tail sourceRoot records output buildTarget manifest mode onFailure keepEval false
+        if allowRepoFlags then
+          go tail sourceRoot records output buildTarget manifest mode onFailure keepEval false
+        else throw "--in-process is not valid for materialize-units (units have their own \
+          per-target build model); it applies to materialize-repo"
     | flag :: _ => throw s!"unknown or incomplete argument: {flag}"
   go args none none none none none .replace .fail false true
 
 private def parseArgs : List String → Except String Command
   | "rewrite-file" :: rest => .rewriteFile <$> parseRewriteArgs rest
-  | "materialize-repo" :: rest => .materializeRepo <$> parseMaterializeArgs rest
-  | "materialize-units" :: rest => .materializeUnits <$> parseMaterializeArgs rest
+  | "materialize-repo" :: rest => .materializeRepo <$> parseMaterializeArgs (allowRepoFlags := true) rest
+  | "materialize-units" :: rest => .materializeUnits <$> parseMaterializeArgs (allowRepoFlags := false) rest
   | command :: _ => .error s!"unknown command: {command}"
   | [] => .error "command is required"
 

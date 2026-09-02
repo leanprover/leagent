@@ -674,6 +674,124 @@ private unsafe def testUnitFailurePolicies : IO Unit := do
     removeDirIfExists failOut
     if ← recordsPath.pathExists then IO.FS.removeFile recordsPath
 
+/-- The shared dependency-conflict detector `danglingReferences`, over records with a
+real theorem→theorem edge (`Fixture.Deps.mid` uses `Fixture.Deps.base`). It flags a
+SURVIVING declaration that references a deleted theorem — a kept theorem or any def —
+and nothing else: a holed (`sorry`) dependent drops its references, and a
+`moduleFilter` scopes the check. -/
+private def testDanglingReferences (deps : Array Corpus.ConstRecord) : IO Unit := do
+  let base := "Fixture.Deps.base"
+  let mid := "Fixture.Deps.mid"
+  -- Delete `base`, keep `mid`: mid → base is a dangling reference.
+  let deleteBaseKeepMid := fun name =>
+    if name == base then LeanReassemble.ProofMode.delete
+    else if name == mid then .keep else .replace
+  let conflicts := LeanReassemble.danglingReferences deps deleteBaseKeepMid
+  assertIO (conflicts.size == 1 && conflicts.any (fun (d, t) => d == mid && t == base))
+    "danglingReferences flags a kept theorem referencing a deleted one"
+  -- Same delete, but `mid` is holed: its `by sorry` body drops the reference.
+  let deleteBaseSorryMid := fun name =>
+    if name == base then LeanReassemble.ProofMode.delete else .replace
+  assertIO (LeanReassemble.danglingReferences deps deleteBaseSorryMid).isEmpty
+    "a holed (sorry) dependent does not dangle"
+  -- A surviving def (never holed) that references a deleted theorem IS flagged.
+  let midRec := (deps.filter (·.name == mid))[0]!
+  let defRec := { midRec with name := "Fixture.Deps.usesBase", kind := "def", deps := [base] }
+  let defConflicts := LeanReassemble.danglingReferences (deps.push defRec) deleteBaseSorryMid
+  assertIO (defConflicts.any (fun (d, t) => d == "Fixture.Deps.usesBase" && t == base))
+    "a surviving def referencing a deleted theorem is flagged"
+  -- `moduleFilter` restricts the check to one module.
+  assertIO (LeanReassemble.danglingReferences deps deleteBaseKeepMid
+      (moduleFilter := some "Other.Module")).isEmpty
+    "moduleFilter restricts the check to one module"
+  -- No deletes → no conflicts; the message names both members of each pair.
+  assertIO (LeanReassemble.danglingReferences deps (fun _ => .replace)).isEmpty
+    "no deletes means no conflicts"
+  let msg := LeanReassemble.dependencyConflictMessage #[(mid, base)]
+  assertIO (msg.contains mid && msg.contains base) "conflict message names both members"
+
+/-- End-to-end dependency-conflict handling over `TestProject` using the
+`records-deps.jsonl` fixture (a real `mid → base` edge). Covers the three regressions
+the audit found — repo delete-with-kept-dependent, units `--proofs delete`, units
+`--proofs keep` — plus the per-unit conflict. -/
+private unsafe def testDependencyConflicts : IO Unit := do
+  let pid ← IO.Process.getPID
+  let sourceRoot : System.FilePath := "TestProject"
+  let records : System.FilePath := sourceRoot / "records-deps.jsonl"
+  let out : System.FilePath := s!"/tmp/lean-reassemble-depconflict-{pid}"
+  let mp : System.FilePath := s!"/tmp/lean-reassemble-depmanifest-{pid}.json"
+  let deleteBaseKeepMid :=
+    "{\"theorems\":{\"Fixture.Deps.base\":\"delete\",\"Fixture.Deps.mid\":\"keep\"}}"
+  removeDirIfExists out
+  try
+    -- repo: delete `base` while keeping `mid` → fail fast, before any lake build, naming
+    -- the pair (not an opaque lake error).
+    IO.FS.writeFile mp deleteBaseKeepMid
+    let repoErr ← try
+        LeanReassemble.materializeRepo {
+          sourceRoot, records, output := out, manifestPath := some mp }
+        pure ""
+      catch e => pure e.toString
+    assertIO (repoErr.contains "dependency conflict" && repoErr.contains "Fixture.Deps.mid"
+        && repoErr.contains "Fixture.Deps.base")
+      "repo conflict names the dependent → deleted pair"
+    removeDirIfExists out
+    -- units: whole-run `--proofs delete` → every target deleted → no tasks (not a
+    -- silent empty artifact reported as passed).
+    expectFailure "units --proofs delete yields no tasks" do
+      LeanReassemble.materializeUnits {
+        sourceRoot, records, output := out, proofMode := .delete }
+    assertIO (!(← (out / "units").pathExists)) "no units directory for an all-delete run"
+    removeDirIfExists out
+    -- units: whole-run `--proofs keep` → every target excluded → no tasks.
+    expectFailure "units --proofs keep yields no tasks" do
+      LeanReassemble.materializeUnits {
+        sourceRoot, records, output := out, proofMode := .keep }
+    removeDirIfExists out
+    -- units: per-unit conflict. Deleting `base` while keeping `mid` poisons every unit
+    -- in the module; under `fail` the run aborts naming the pair.
+    IO.FS.writeFile mp deleteBaseKeepMid
+    let unitErr ← try
+        LeanReassemble.materializeUnits {
+          sourceRoot, records, output := out, manifestPath := some mp }
+        pure ""
+      catch e => pure e.toString
+    assertIO (unitErr.contains "dependency conflict" && unitErr.contains "Fixture.Deps.mid")
+      "per-unit conflict names the dependent → deleted pair"
+  finally
+    removeDirIfExists out
+    if ← mp.pathExists then IO.FS.removeFile mp
+
+/-- The new units capability: a manifest `delete` on a same-module NEIGHBOUR removes
+that declaration from every unit in the module, while the target stays holed and the
+other neighbours stay proven. Deleting the leaf `Fixture.Deps.leaf` (nothing depends
+on it) must succeed, and each emitted unit must still build. -/
+private unsafe def testUnitNeighbourPruning : IO Unit := do
+  let pid ← IO.Process.getPID
+  let sourceRoot : System.FilePath := "TestProject"
+  let records : System.FilePath := sourceRoot / "records-deps.jsonl"
+  let out : System.FilePath := s!"/tmp/lean-reassemble-prune-{pid}"
+  let mp : System.FilePath := s!"/tmp/lean-reassemble-prunemanifest-{pid}.json"
+  removeDirIfExists out
+  try
+    IO.FS.writeFile mp "{\"theorems\":{\"Fixture.Deps.leaf\":\"delete\"}}"
+    LeanReassemble.materializeUnits {
+      sourceRoot, records, output := out, manifestPath := some mp }
+    -- `leaf` is a delete target → no task; `base` (0) and `mid` (2) each get a unit.
+    assertIO (!(← (out / "units" / "1-Fixture.Deps.leaf").pathExists))
+      "no unit for the deleted leaf target"
+    let midUnit := out / "units" / "2-Fixture.Deps.mid"
+    let midSrc ← IO.FS.readFile (midUnit / "Fixture" / "Deps.lean")
+    assertIO (!midSrc.contains "theorem leaf") "neighbour leaf pruned from mid's unit"
+    assertIO (midSrc.contains "theorem base") "kept neighbour base survives in mid's unit"
+    assertIO ((midSrc.splitOn "sorry").length == 2) "mid's proof is holed exactly once"
+    -- `task.json` exists only if the unit was emitted, which happens only after its own
+    -- `lake build` verification passed — so the pruned unit genuinely builds.
+    assertIO (← (midUnit / "task.json").pathExists) "mid's unit was emitted and verified"
+  finally
+    removeDirIfExists out
+    if ← mp.pathExists then IO.FS.removeFile mp
+
 unsafe def run : IO Unit := do
   let result ← fixtureResult
   let records ← LeanReassemble.readRecords "TestFixtures/records.jsonl"
@@ -712,6 +830,10 @@ unsafe def run : IO Unit := do
   testMaterializers
   testFailurePolicies
   testUnitFailurePolicies
+  let depsRecords ← LeanReassemble.readRecords "TestProject/records-deps.jsonl"
+  testDanglingReferences depsRecords
+  testDependencyConflicts
+  testUnitNeighbourPruning
   IO.println "reassemble tests passed"
 
 end ReassembleTests
